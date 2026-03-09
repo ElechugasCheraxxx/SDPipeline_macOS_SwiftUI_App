@@ -7,6 +7,8 @@ struct ContentView: View {
     @StateObject private var sdService = SDService()
     @State private var jsonInput: String = """
 {
+  // NOTESE QUE ESTO ES UN EJEMPLO DE UN JSON //
+
   "subject": "a lone astronaut",
   "environment": "floating in deep space",
   "style": "cinematic, ultra-detailed, 8k",
@@ -18,7 +20,11 @@ struct ContentView: View {
     @State private var parseError: String?
     @State private var settings = GenerationSettings()
     @State private var showLog: Bool = false
-    @State private var showModelBuilder: Bool = false   // ← NEW
+    @State private var showModelBuilder: Bool = false
+    @StateObject private var assetStore = AssetStore.shared
+    @StateObject private var loraManager = LoRAManager.shared
+    @StateObject private var characterEngine = CharacterEngine.shared
+    @StateObject private var sceneEngine = SceneEngine.shared
 
     // MARK: - Body
     var body: some View {
@@ -27,12 +33,31 @@ struct ContentView: View {
             HSplitView {
                 leftPanel.frame(minWidth: 280, idealWidth: 340, maxWidth: 440)
                 centerPanel.frame(minWidth: 260, idealWidth: 320, maxWidth: 400)
-                rightPanel.frame(minWidth: 360, maxWidth: .infinity)
+                RightPanelView(
+                    sdService:       sdService,
+                    settings:        $settings,
+                    parsedPrompt:    $parsedPrompt,
+                    onGenerate:      { generate() },
+                    onSaveImage:     { saveImage($0) },
+                    onReuseSettings: { applyReusable($0) }
+                )
+                .frame(minWidth: 360, maxWidth: CGFloat.infinity)
             }
         }
         .task {
-            sdService.launchWebUI(scriptPath: settings.webuiScriptPath,
-                                  baseURL: settings.sdBaseURL)
+            sdService.launchWebUI(
+                scriptPath: settings.webuiScriptPath,
+                baseURL: settings.sdBaseURL
+            )
+
+            GPUMonitor.shared.configure(baseURL: settings.sdBaseURL)
+            LoRAManager.shared.configure(baseURL: settings.sdBaseURL)
+        }
+        .onChange(of: sdService.webuiState) { _, state in
+            if case .online = state {
+                GPUMonitor.shared.startPolling(interval: 6)
+                Task { await LoRAManager.shared.fetchLoRAs() }
+            }
         }
         .sheet(isPresented: $showLog) { logSheet }
         .sheet(isPresented: $showModelBuilder) {           // ← NEW
@@ -146,6 +171,8 @@ struct ContentView: View {
                 .background(Color(red: 0.2, green: 0.22, blue: 0.28))
                 .foregroundColor(.secondary).cornerRadius(5)
             }.buttonStyle(.plain).help("Kill and re-launch webui.sh --api")
+            Divider().frame(height: 14).background(Color.white.opacity(0.15))
+            GPUMonitorBar()
         }
         .padding(.horizontal, 16).padding(.vertical, 8)
     }
@@ -179,6 +206,11 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 0) {
             panelHeader("Prompt & Settings", icon: "slider.horizontal.3")
             ScrollView {
+                CharacterPickerView()
+                    .padding(.horizontal, 4)
+                ScenePickerView()
+                    .padding(.horizontal, 4)
+                Divider().background(Color.white.opacity(0.07))
                 VStack(alignment: .leading, spacing: 16) {
                     VStack(alignment: .leading, spacing: 6) {
                         label("Prompt")
@@ -313,6 +345,8 @@ struct ContentView: View {
                 }.padding(16)
             }
             Divider().background(Color.white.opacity(0.07))
+            LoRAManagerView()
+                .padding(.horizontal, 4)
             Button(action: generate) {
                 HStack(spacing: 8) {
                     if sdService.isGenerating { ProgressView().scaleEffect(0.7).progressViewStyle(.circular) }
@@ -328,53 +362,14 @@ struct ContentView: View {
             .buttonStyle(.plain).disabled(sdService.isGenerating || parsedPrompt.isEmpty).padding(14)
         }
         .background(Color(red: 0.1, green: 0.1, blue: 0.13))
-    }
-
-    // MARK: - Right Panel
-    var rightPanel: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Image(systemName: "photo.artframe").foregroundColor(.secondary)
-                Text("Output").font(.system(size: 13, weight: .semibold)).foregroundColor(.white.opacity(0.7))
-                Spacer()
-                stageBadge
-            }
-            .padding(.horizontal, 20).padding(.vertical, 14).background(Color.white.opacity(0.03))
-            Divider().background(Color.white.opacity(0.07))
-            ZStack {
-                Color(red: 0.07, green: 0.07, blue: 0.09)
-                if let image = sdService.generatedImage {
-                    Image(nsImage: image).resizable().aspectRatio(contentMode: .fit).padding(24)
-                        .transition(.opacity.combined(with: .scale(scale: 0.97)))
-                } else if sdService.isGenerating { generatingView }
-                else if let err = sdService.errorMessage { errorView(err) }
-                else { emptyStateView }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            if sdService.stage == .done, let image = sdService.generatedImage {
-                Divider().background(Color.white.opacity(0.07))
-                HStack(spacing: 16) {
-                    if let seed = sdService.lastSeed {
-                        Label("Seed: \(seed)", systemImage: "number")
-                            .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
-                    }
-                    Text("\(settings.width)×\(settings.height)")
-                        .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
-                    Spacer()
-                    Button(action: { saveImage(image) }) {
-                        Label("Save PNG", systemImage: "square.and.arrow.down").font(.system(size: 12, weight: .medium))
-                    }
-                    .buttonStyle(.plain).foregroundColor(Color(red: 0.55, green: 0.8, blue: 1.0))
-                    .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(Color(red: 0.15, green: 0.25, blue: 0.4)).cornerRadius(6)
-                }
-                .padding(.horizontal, 20).padding(.vertical, 10).background(Color(red: 0.09, green: 0.09, blue: 0.12))
-            }
+        .onChange(of: settings.sdBaseURL) { _, newURL in
+            GPUMonitor.shared.configure(baseURL: newURL)
+            LoRAManager.shared.configure(baseURL: newURL)
         }
-        .background(Color(red: 0.08, green: 0.08, blue: 0.1))
     }
 
     // MARK: - Sub-views
+    // NOTE: rightPanel ha sido reemplazado por RightPanelView (Output + Galería tabs)
 
     @ViewBuilder var stageBadge: some View {
         let (color, text): (Color, String) = {
@@ -441,6 +436,22 @@ struct ContentView: View {
 
     // MARK: - Actions
 
+    /// Aplica ReusableSettings desde la galería al pipeline activo.
+    func applyReusable(_ r: ReusableSettings) {
+        settings.seed          = r.seed
+        settings.steps         = r.steps
+        settings.cfgScale      = r.cfgScale
+        settings.samplerName   = r.samplerName
+        settings.width         = r.width
+        settings.height        = r.height
+        settings.negativePrompt = r.promptNegative
+        if !r.promptPositive.isEmpty {
+            parsedPrompt = r.promptPositive
+        }
+        // Registrar uso del seed en SeedManager
+        SeedManager.shared.incrementUsage(seed: r.seed)
+    }
+
     func parseJSON() {
         guard let data = jsonInput.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8) else {
             parseError = "Invalid string encoding"; return
@@ -467,10 +478,29 @@ struct ContentView: View {
     }
 
     func generate() {
+
         guard !parsedPrompt.isEmpty else { return }
+
+        GPUMonitor.shared.runPreCheck(
+            requestedWidth:  settings.width,
+            requestedHeight: settings.height
+        )
+
+        // Inyectar personaje activo + LoRAs seleccionados
+        let withCharacter = CharacterEngine.shared.injectActiveCharacter(into: parsedPrompt)
+        let finalPrompt   = LoRAManager.shared.inject(into: withCharacter)
+
+        // Combinar negativos
+        let finalNegative = [
+            settings.negativePrompt,
+            CharacterEngine.shared.activeCharacterNegative
+        ]
+        .filter { !$0.isEmpty }
+        .joined(separator: ", ")
+
         let req = SDRequest(
-            prompt:           parsedPrompt,
-            negativePrompt:   settings.negativePrompt,
+            prompt:           finalPrompt,
+            negativePrompt:   finalNegative,
             seed:             settings.seed,
             steps:            settings.steps,
             cfgScale:         settings.cfgScale,
@@ -484,7 +514,10 @@ struct ContentView: View {
             denoisingStrength: settings.denoisingStrength,
             restoreFaces:     settings.restoreFaces
         )
-        Task { await sdService.generate(request: req, baseURL: settings.sdBaseURL) }
+
+        Task {
+            await sdService.generate(request: req, baseURL: settings.sdBaseURL)
+        }
     }
 
     func relaunchWebUI() {

@@ -107,6 +107,7 @@ struct GenerationSettings {
     var height: Int             = 768
     var samplerName: String     = "DPM++ 2M Karras"
     var seed: Int               = -1
+    var checkpoint: String      = ""  // ← nuevo campo para el checkpoint del modelo
     var sdBaseURL: String       = "http://127.0.0.1:7860"
 
     // Hires fix
