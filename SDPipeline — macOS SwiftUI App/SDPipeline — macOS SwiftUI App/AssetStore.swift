@@ -3,10 +3,12 @@ import CoreData
 import AppKit
 import Combine
 import CryptoKit
+import SwiftUI
 
 // MARK: - AssetStore
 // Core Data stack para persistencia de todas las generaciones.
-// Cada GeneratedAsset representa una imagen con su linaje completo.
+// FIX v2: NSPersistentContainer ahora usa .sdPipelineStudioModel (programático).
+//         saveAsset es ahora async para permitir llamadas con await desde PipelineConnector.
 
 @MainActor
 final class AssetStore: ObservableObject {
@@ -20,9 +22,12 @@ final class AssetStore: ObservableObject {
     @Published var recentAssets: [GeneratedAsset] = []
 
     private init() {
-        container = NSPersistentContainer(name: "SDPipelineStudio")
+        // FIX: pasar modelo programático para evitar búsqueda de .xcdatamodeld inexistente
+        container = NSPersistentContainer(
+            name: "SDPipelineStudio",
+            managedObjectModel: .sdPipelineStudioModel
+        )
 
-        // Configurar store en el vault si está disponible, o en Application Support como fallback
         let storeURL = AssetStore.resolveStoreURL()
         let description = NSPersistentStoreDescription(url: storeURL)
         description.shouldMigrateStoreAutomatically = true
@@ -31,8 +36,6 @@ final class AssetStore: ObservableObject {
 
         container.loadPersistentStores { _, error in
             if let error {
-                // En producción personal no hay usuarios que perder datos —
-                // loguear y continuar con store en memoria como fallback
                 print("⚠️ AssetStore: error cargando persistent store: \(error)")
             }
         }
@@ -45,6 +48,7 @@ final class AssetStore: ObservableObject {
     // MARK: - Public API
 
     /// Guardar una nueva generación completa en Core Data + sidecar JSON.
+    /// FIX: ahora es `async` para permitir `await` desde PipelineConnector y otros callers.
     @discardableResult
     func saveAsset(
         image:       NSImage,
@@ -55,32 +59,23 @@ final class AssetStore: ObservableObject {
         vaeUsed:     String   = "",
         loraWeights: [String: Double] = [:],
         sessionTag:  String?  = nil
-    ) -> GeneratedAsset? {
+    ) async -> GeneratedAsset? {
 
         guard let vaultDir = VaultManager.shared.todayGeneracionesURL else {
             print("⚠️ AssetStore: Vault no configurado")
             return nil
         }
 
-        // Crear directorio de fecha si no existe
         try? FileManager.default.createDirectory(at: vaultDir, withIntermediateDirectories: true)
 
-        // Generar nombre base único
         let timestamp = Int(Date().timeIntervalSince1970)
         let baseName  = "gen_\(timestamp)"
+        let assetID   = UUID()
 
-        // Generar UUID del asset antes de cualquier escritura (lo necesitan Steg + CoreData)
-        let assetID = UUID()
-
-        // Guardar PNG original (imagen raw de SD, nunca modificada)
         guard let pngData = image.pngData() else { return nil }
-
-        // Calcular hash SHA-256 del PNG original para integridad y payload steganográfico
         let sha256 = pngData.sha256Hex
 
-        // ── Esteganografía ─────────────────────────────────────────────────────────
-        // Incrusta firma invisible AES-GCM+HMAC en los bits LSB del PNG.
-        // Si falla (imagen muy pequeña, etc.) se escribe el PNG original sin firma.
+        // ── Esteganografía (SteganographyEngine es @MainActor — llamar en MainActor) ──────
         let finalPNGData: Data = SteganographyEngine.shared.embed(
             image:      image,
             assetID:    assetID,
@@ -91,7 +86,7 @@ final class AssetStore: ObservableObject {
         let origURL = vaultDir.appending(path: "\(baseName)_v001.orig.png")
         try? finalPNGData.write(to: origURL)
 
-        // ── Sidecar JSON ───────────────────────────────────────────────────────────
+        // ── Sidecar JSON ───────────────────────────────────────────────────────
         let sidecar = SidecarJSON(
             baseName:    baseName,
             version:     1,
@@ -105,43 +100,35 @@ final class AssetStore: ObservableObject {
             sha256:      sha256,
             sessionTag:  sessionTag
         )
-
         let sidecarURL = VaultManager.shared.sidecarURL(for: origURL)
         if let sidecarData = try? JSONEncoder.pretty.encode(sidecar) {
             try? sidecarData.write(to: sidecarURL)
         }
 
-        // ── LicenseVault: registrar checkpoint en primer uso ───────────────────────
-        // Usa Task { @MainActor in } para mantenerse en el actor correcto.
-        // isRegistered + registerModel acceden a VaultManager (también @MainActor),
-        // por lo que deben ejecutarse en el MainActor — no en un contexto detached.
-        if !checkpoint.isEmpty {
-            Task { @MainActor in
-                let vault = LicenseVault.shared
-                guard !vault.isRegistered(checkpoint: checkpoint) else { return }
-                let card = LicenseVault.ModelCard(
-                    checkpointName:      checkpoint,
-                    modelVersion:        "desconocida",
-                    baseModel:           "desconocido",
-                    source:              .other,
-                    sourceURL:           nil,
-                    licenseType:         .unknown,
-                    licenseURL:          nil,
-                    commercialUse:       .unknown,
-                    creditRequired:      true,
-                    modificationsOK:     false,
-                    sharingOK:           false,
-                    nsfw:                false,
-                    notes:               "Auto-registrado en primer uso — revisar y actualizar manualmente."
-                )
-                vault.registerModel(card)
-            }
+        // ── LicenseVault: registro automático de checkpoint en primer uso ──────
+        if !checkpoint.isEmpty && !LicenseVault.shared.isRegistered(checkpoint: checkpoint) {
+            let card = LicenseVault.ModelCard(
+                checkpointName:    checkpoint,
+                modelVersion:      "desconocida",
+                baseModel:         "desconocido",
+                source:            .other,
+                sourceURL:         nil,
+                licenseType:       .unknown,
+                licenseURL:        nil,
+                commercialUse:     .unknown,
+                creditRequired:    true,
+                modificationsOK:   false,
+                sharingOK:         false,
+                nsfw:              false,
+                notes:             "Auto-registrado en primer uso — revisar y actualizar manualmente."
+            )
+            LicenseVault.shared.registerModel(card)
         }
 
-        // ── Thumbnail para galería ─────────────────────────────────────────────────
+        // ── Thumbnail ──────────────────────────────────────────────────────────
         let thumbnailData = image.resized(maxDimension: 400)?.pngData()
 
-        // ── Core Data ─────────────────────────────────────────────────────────────
+        // ── Core Data ──────────────────────────────────────────────────────────
         let ctx = container.viewContext
         let asset = GeneratedAsset(context: ctx)
         asset.id             = assetID
@@ -163,7 +150,7 @@ final class AssetStore: ObservableObject {
         asset.vaeUsed        = vaeUsed
         asset.sha256         = sha256
         asset.sessionTag     = sessionTag
-        asset.rating         = 0   // Sin calificar
+        asset.rating         = 0
         asset.status         = AssetStatus.draft.rawValue
         asset.thumbnailData  = thumbnailData
 
@@ -183,7 +170,7 @@ final class AssetStore: ObservableObject {
         }
     }
 
-    /// Actualizar rating de un asset (1-5 estrellas, 0 = sin calificar).
+    /// Actualizar rating de un asset (0 = sin calificar, 1-5 estrellas).
     func updateRating(_ asset: GeneratedAsset, rating: Int) {
         asset.rating = Int32(max(0, min(5, rating)))
         try? container.viewContext.save()
@@ -197,21 +184,42 @@ final class AssetStore: ObservableObject {
         fetchRecentAssets()
     }
 
-    /// Buscar assets por términos en prompt, tag de sesión o nombre.
-    func search(query: String) -> [GeneratedAsset] {
+    /// Buscar assets por prompt, tag de sesión o nombre.
+    func search(query: String, sessionTag: String? = nil, minRating: Int = 0) -> [GeneratedAsset] {
         let request = GeneratedAsset.fetchRequest()
+        var predicates: [NSPredicate] = []
+
         if !query.isEmpty {
-            request.predicate = NSPredicate(
+            predicates.append(NSPredicate(
                 format: "promptPositive CONTAINS[cd] %@ OR sessionTag CONTAINS[cd] %@ OR baseName CONTAINS[cd] %@",
                 query, query, query
-            )
+            ))
+        }
+        if let tag = sessionTag {
+            predicates.append(NSPredicate(format: "sessionTag == %@", tag))
+        }
+        if minRating > 0 {
+            predicates.append(NSPredicate(format: "rating >= %d", minRating))
+        }
+
+        if !predicates.isEmpty {
+            request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)
         }
         request.sortDescriptors = [NSSortDescriptor(keyPath: \GeneratedAsset.createdAt, ascending: false)]
         request.fetchLimit = 200
         return (try? container.viewContext.fetch(request)) ?? []
     }
 
-    /// Fetch de assets recientes (últimas 50 generaciones).
+    /// Todos los assets con un status dado.
+    func assets(withStatus status: AssetStatus, limit: Int = 100) -> [GeneratedAsset] {
+        let request = GeneratedAsset.fetchRequest()
+        request.predicate = NSPredicate(format: "status == %@", status.rawValue)
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \GeneratedAsset.createdAt, ascending: false)]
+        request.fetchLimit = limit
+        return (try? container.viewContext.fetch(request)) ?? []
+    }
+
+    /// Fetch reciente (50 últimos).
     func fetchRecentAssets() {
         let request = GeneratedAsset.fetchRequest()
         request.sortDescriptors = [NSSortDescriptor(keyPath: \GeneratedAsset.createdAt, ascending: false)]
@@ -219,14 +227,52 @@ final class AssetStore: ObservableObject {
         recentAssets = (try? container.viewContext.fetch(request)) ?? []
     }
 
+    /// Fetch extendido para galería (hasta 500).
+    func fetchAllAssets(limit: Int = 500) -> [GeneratedAsset] {
+        let request = GeneratedAsset.fetchRequest()
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \GeneratedAsset.createdAt, ascending: false)]
+        request.fetchLimit = limit
+        return (try? container.viewContext.fetch(request)) ?? []
+    }
+
+    /// Verificar integridad SHA-256 de un asset.
+    func verifyIntegrity(_ asset: GeneratedAsset) -> Bool {
+        guard let path = asset.imagePath,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let storedHash = asset.sha256
+        else { return false }
+        return data.sha256Hex == storedHash
+    }
+
+    /// Eliminar asset de Core Data y disco.
+    func delete(_ asset: GeneratedAsset) {
+        [asset.imagePath, asset.sidecarPath, asset.cleanPath, asset.previewPath]
+            .compactMap { $0 }
+            .map    { URL(fileURLWithPath: $0) }
+            .forEach { try? FileManager.default.removeItem(at: $0) }
+        container.viewContext.delete(asset)
+        try? container.viewContext.save()
+        fetchRecentAssets()
+    }
+
+    // MARK: - Statistics
+
+    var totalCount: Int {
+        (try? container.viewContext.count(for: GeneratedAsset.fetchRequest())) ?? 0
+    }
+
+    var approvedCount: Int {
+        let r = GeneratedAsset.fetchRequest()
+        r.predicate = NSPredicate(format: "status == %@", AssetStatus.approved.rawValue)
+        return (try? container.viewContext.count(for: r)) ?? 0
+    }
+
     // MARK: - Store URL
 
     private static func resolveStoreURL() -> URL {
-        // Preferir guardar el store dentro del Vault si está configurado
         if let vaultMeta = VaultManager.shared.vaultMetaURL {
             return vaultMeta.appending(path: "SDPipelineStudio.sqlite")
         }
-        // Fallback: Application Support
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let appDir = appSupport.appending(path: "SDPipeline")
         try? FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
@@ -251,20 +297,26 @@ enum AssetStatus: String, CaseIterable {
         }
     }
 
-    var color: String {
+    var icon: String {
         switch self {
-        case .draft:     return "gray"
-        case .approved:  return "green"
-        case .published: return "blue"
-        case .rejected:  return "red"
+        case .draft:     return "pencil.circle"
+        case .approved:  return "checkmark.circle.fill"
+        case .published: return "arrow.up.circle.fill"
+        case .rejected:  return "xmark.circle.fill"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .draft:     return .gray
+        case .approved:  return Color(hex: "#34d399")
+        case .published: return Color(hex: "#60a5fa")
+        case .rejected:  return Color(hex: "#ef4444")
         }
     }
 }
 
 // MARK: - GeneratedAsset (NSManagedObject)
-// NOTA: Este archivo define la subclase manualmente para no depender de
-// archivos de modelo .xcdatamodeld generados por Xcode que varían por versión.
-// Alternativamente, crear SDPipelineStudio.xcdatamodeld con estas entidades.
 
 @objc(GeneratedAsset)
 public class GeneratedAsset: NSManagedObject {
@@ -277,8 +329,8 @@ public class GeneratedAsset: NSManagedObject {
 
     // Rutas de archivo
     @NSManaged public var imagePath:      String?
-    @NSManaged public var cleanPath:      String?   // Export limpio (sin metadatos)
-    @NSManaged public var previewPath:    String?   // Preview con watermark
+    @NSManaged public var cleanPath:      String?
+    @NSManaged public var previewPath:    String?
     @NSManaged public var sidecarPath:    String?
 
     // Prompt
@@ -303,8 +355,8 @@ public class GeneratedAsset: NSManagedObject {
     @NSManaged public var sha256:         String?
 
     // Curaduría
-    @NSManaged public var rating:         Int32      // 0 = sin calificar, 1-5 estrellas
-    @NSManaged public var status:         String?    // AssetStatus.rawValue
+    @NSManaged public var rating:         Int32
+    @NSManaged public var status:         String?
     @NSManaged public var sessionTag:     String?
     @NSManaged public var notes:          String?
 
@@ -338,8 +390,7 @@ public class GeneratedAsset: NSManagedObject {
     }
 }
 
-// MARK: - NSManagedObjectModel (programático)
-// Evita depender de .xcdatamodeld — el modelo se define en código.
+// MARK: - NSManagedObjectModel programático
 
 extension NSManagedObjectModel {
 
@@ -389,22 +440,6 @@ extension NSManagedObjectModel {
         model.entities = [entity]
         return model
     }()
-}
-
-// MARK: - NSPersistentContainer override para usar modelo programático
-
-extension AssetStore {
-    static func buildContainer(storeURL: URL) -> NSPersistentContainer {
-        let container = NSPersistentContainer(
-            name: "SDPipelineStudio",
-            managedObjectModel: .sdPipelineStudioModel
-        )
-        let desc = NSPersistentStoreDescription(url: storeURL)
-        desc.shouldMigrateStoreAutomatically = true
-        desc.shouldInferMappingModelAutomatically = true
-        container.persistentStoreDescriptions = [desc]
-        return container
-    }
 }
 
 // Extensions movidas a archivos dedicados:

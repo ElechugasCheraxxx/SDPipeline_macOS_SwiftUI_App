@@ -138,14 +138,20 @@ struct PromptSafetyFilter {
 
     // MARK: - Logging
 
-    /// Registrar resultados de filtrado para auditoría (en el Zero-Knowledge log).
+    /// Registrar resultados de filtrado — ahora cifrado con AES-GCM vía ZeroKnowledgeLog.
     static func logResult(_ result: FilterResult, prompt: String) {
+        // ZeroKnowledgeLog.shared es @MainActor — llamar desde Task para no bloquear
+        Task { @MainActor in
+            logResultZK(result, prompt: prompt)
+        }
+
+        // Fallback plaintext legacy para compatibilidad (puede eliminarse en próxima iteración)
         let timestamp = ISO8601DateFormatter().string(from: Date())
         let truncated = String(prompt.prefix(80)) + (prompt.count > 80 ? "..." : "")
 
         switch result {
         case .allowed:
-            break // No loguear generaciones normales para no llenar el log
+            break
         case .blocked(let reason, let terms):
             let entry = "[\(timestamp)] BLOCKED | \(reason) | Terms: \(terms.joined(separator: ",")) | Prompt: \(truncated)"
             appendToSecurityLog(entry)

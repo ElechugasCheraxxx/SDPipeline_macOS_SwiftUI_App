@@ -3,575 +3,487 @@ import AppKit
 import CoreData
 import Combine
 
-// MARK: - GalleryView
-// Panel de galería completo: grid de thumbnails, búsqueda, filtros,
-// inspector de metadatos, rating curator y seed reuse.
+// MARK: - GalleryView v4
+// Fixes sobre v3:
+//   - TagCloudView usa firma real de TaggingEngine.swift
+//   - Removed referencias a métodos inexistentes
+//   - RatingCuratorView inline y funcional
+//   - Inspector completo sin dependencias externas rotas
 
 struct GalleryView: View {
 
-    // Callback para reutilizar seed/prompt en el pipeline principal
     var onReuseSettings: (ReusableSettings) -> Void
 
-    @StateObject private var store = AssetStore.shared
-    @State private var searchQuery:    String = ""
-    @State private var selectedStatus: AssetStatus? = nil
-    @State private var selectedRating: Int = 0              // 0 = todos
-    @State private var selectedAsset:  GeneratedAsset? = nil
-    @State private var showInspector:  Bool = false
-    @State private var gridColumns:    Int = 3
-    @State private var sortNewest:     Bool = true
+    @StateObject private var store   = AssetStore.shared
+    @StateObject private var tagging = TaggingEngine.shared
 
-    // Configuración de columnas dinámica
-    private var columns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 8), count: gridColumns)
+    // Filters
+    @State private var searchQuery:    String       = ""
+    @State private var selectedStatus: AssetStatus? = nil
+    @State private var selectedRating: Int          = 0
+    @State private var activeTags:     [String]     = []
+    @State private var tagLogicAND:    Bool         = true
+    @State private var sortMode:       SortMode     = .newest
+    @State private var showTagBar:     Bool         = true
+
+    // Bulk
+    @State private var bulkMode:       Bool         = false
+    @State private var selectedIDs:    Set<UUID>    = []
+
+    // Inspector
+    @State private var inspectedAsset: GeneratedAsset? = nil
+
+    // Grid
+    @State private var gridColumns: Int = 3
+
+    enum SortMode: String, CaseIterable {
+        case newest = "Reciente"; case oldest = "Antiguo"
+        case rating = "Rating";   case status = "Estado"
     }
 
-    var filteredAssets: [GeneratedAsset] {
-        var assets = store.recentAssets
+    private var columns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: 6), count: gridColumns)
+    }
 
+    // MARK: - Filtered Assets
+
+    var filteredAssets: [GeneratedAsset] {
+        var assets = store.fetchAllAssets(limit: 500)
         if !searchQuery.isEmpty {
             assets = assets.filter {
                 ($0.promptPositive ?? "").localizedCaseInsensitiveContains(searchQuery) ||
-                ($0.sessionTag ?? "").localizedCaseInsensitiveContains(searchQuery) ||
-                ($0.baseName ?? "").localizedCaseInsensitiveContains(searchQuery)
+                ($0.sessionTag    ?? "").localizedCaseInsensitiveContains(searchQuery) ||
+                ($0.baseName      ?? "").localizedCaseInsensitiveContains(searchQuery)
             }
         }
-        if let status = selectedStatus {
-            assets = assets.filter { $0.statusEnum == status }
+        if let status = selectedStatus { assets = assets.filter { $0.statusEnum == status } }
+        if selectedRating > 0 { assets = assets.filter { $0.rating >= Int32(selectedRating) } }
+        if !activeTags.isEmpty {
+            let matchIDs = tagLogicAND
+                ? tagging.assetIDs(matchingAll: activeTags)
+                : tagging.assetIDs(matchingAny: activeTags)
+            assets = assets.filter {
+                guard let id = $0.id?.uuidString else { return false }
+                return matchIDs.contains(id)
+            }
         }
-        if selectedRating > 0 {
-            assets = assets.filter { $0.rating >= Int32(selectedRating) }
+        switch sortMode {
+        case .newest: return assets.sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+        case .oldest: return assets.sorted { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
+        case .rating: return assets.sorted { $0.rating > $1.rating }
+        case .status: return assets.sorted { ($0.status ?? "") < ($1.status ?? "") }
         }
-        return sortNewest ? assets : assets.reversed()
     }
+
+    // MARK: - Body
 
     var body: some View {
         VStack(spacing: 0) {
             toolbar
-            Divider().background(Color.white.opacity(0.07))
-            filterBar
-            Divider().background(Color.white.opacity(0.07))
-
-            if filteredAssets.isEmpty {
-                emptyState
-            } else {
-                HSplitView {
-                    gridPanel
-                    if showInspector, let asset = selectedAsset {
-                        MetadataInspector(
-                            asset: asset,
-                            onReuse: { settings in
-                                onReuseSettings(settings)
-                            },
-                            onClose: { showInspector = false }
-                        )
-                        .frame(minWidth: 260, maxWidth: 300)
-                    }
+            Divider().background(Color.white.opacity(0.06))
+            if showTagBar { tagBar; Divider().background(Color.white.opacity(0.06)) }
+            if bulkMode && !selectedIDs.isEmpty { bulkBar; Divider().background(Color.white.opacity(0.06)) }
+            HStack(spacing: 0) {
+                gridPane
+                if let asset = inspectedAsset {
+                    Divider().background(Color.white.opacity(0.06))
+                    AssetInspectorView(
+                        asset: asset,
+                        onClose: { inspectedAsset = nil },
+                        onReuseSettings: { r in onReuseSettings(r); inspectedAsset = nil }
+                    )
+                    .frame(width: 272)
+                    .transition(.move(edge: .trailing))
+                    .animation(.easeInOut(duration: 0.18), value: inspectedAsset != nil)
                 }
             }
         }
         .background(Color(red: 0.08, green: 0.08, blue: 0.10))
-        .onAppear { store.fetchRecentAssets() }
     }
 
     // MARK: - Toolbar
 
     var toolbar: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "photo.stack")
-                .foregroundColor(.secondary).font(.system(size: 13))
-            Text("Galería")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(.white.opacity(0.7))
-            Text("\(filteredAssets.count)")
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 6).padding(.vertical, 2)
-                .background(Color.white.opacity(0.06))
-                .cornerRadius(4)
-            Spacer()
-
-            // Grid size control
-            HStack(spacing: 4) {
-                ForEach([2, 3, 4], id: \.self) { cols in
-                    Button(action: { gridColumns = cols }) {
-                        Image(systemName: cols == 2 ? "square.grid.2x2" :
-                              cols == 3 ? "square.grid.3x3" : "square.grid.4x3.fill")
-                            .font(.system(size: 11))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(gridColumns == cols ? Color(hex: "#7c6af7") : .secondary)
-                }
-            }
-
-            Button(action: { sortNewest.toggle() }) {
-                Image(systemName: sortNewest ? "arrow.down.circle" : "arrow.up.circle")
-                    .font(.system(size: 13))
-            }
-            .buttonStyle(.plain).foregroundColor(.secondary)
-            .help(sortNewest ? "Más recientes primero" : "Más antiguos primero")
-
-            Button(action: { showInspector.toggle() }) {
-                Image(systemName: "sidebar.right")
-                    .font(.system(size: 13))
-            }
-            .buttonStyle(.plain)
-            .foregroundColor(showInspector ? Color(hex: "#7c6af7") : .secondary)
-            .help("Inspector de metadatos")
-        }
-        .padding(.horizontal, 16).padding(.vertical, 10)
-        .background(Color.white.opacity(0.03))
-    }
-
-    // MARK: - Filter Bar
-
-    var filterBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             // Search
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 11)).foregroundColor(.secondary)
-                TextField("Buscar por prompt, sesión…", text: $searchQuery)
-                    .font(.system(size: 12))
-                    .textFieldStyle(.plain)
-                    .foregroundColor(.white)
+            HStack(spacing: 5) {
+                Image(systemName: "magnifyingglass").font(.system(size: 10)).foregroundColor(.secondary)
+                TextField("Buscar…", text: $searchQuery)
+                    .textFieldStyle(.plain).font(.system(size: 11)).foregroundColor(.white)
                 if !searchQuery.isEmpty {
                     Button(action: { searchQuery = "" }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 10)).foregroundColor(.secondary)
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 10)).foregroundColor(.secondary)
                     }.buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(Color.white.opacity(0.05))
-            .cornerRadius(6)
+            .padding(.horizontal, 7).padding(.vertical, 4)
+            .background(Color.white.opacity(0.05)).cornerRadius(6).frame(maxWidth: 200)
 
-            Divider().frame(height: 16).background(Color.white.opacity(0.1))
+            // Status pills
+            statusPills
 
-            // Status filter
-            Menu {
-                Button("Todos") { selectedStatus = nil }
-                Divider()
-                ForEach(AssetStatus.allCases, id: \.self) { s in
-                    Button(s.label) { selectedStatus = s }
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Circle().fill(statusColor(selectedStatus))
-                        .frame(width: 6, height: 6)
-                    Text(selectedStatus?.label ?? "Estado")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 9)).foregroundColor(.secondary)
-                }
-                .padding(.horizontal, 8).padding(.vertical, 5)
-                .background(Color.white.opacity(0.05)).cornerRadius(5)
-            }
-            .buttonStyle(.plain)
+            Spacer()
 
             // Rating filter
+            HStack(spacing: 2) {
+                ForEach(1...5, id: \.self) { star in
+                    Button(action: { selectedRating = selectedRating == star ? 0 : star }) {
+                        Image(systemName: star <= selectedRating ? "star.fill" : "star")
+                            .font(.system(size: 9))
+                            .foregroundColor(star <= selectedRating ? .yellow : .secondary)
+                    }.buttonStyle(.plain)
+                }
+            }
+
+            // Sort
             Menu {
-                Button("Todos") { selectedRating = 0 }
-                Divider()
-                ForEach(1...5, id: \.self) { r in
-                    Button(String(repeating: "★", count: r)) { selectedRating = r }
+                ForEach(SortMode.allCases, id: \.self) { mode in
+                    Button(action: { sortMode = mode }) {
+                        HStack { Text(mode.rawValue); if sortMode == mode { Image(systemName: "checkmark") } }
+                    }
                 }
             } label: {
+                Image(systemName: "arrow.up.arrow.down").font(.system(size: 11)).foregroundColor(.secondary)
+            }.buttonStyle(.plain)
+
+            // Tag toggle
+            Button(action: { withAnimation(.easeInOut(duration: 0.15)) { showTagBar.toggle() } }) {
+                Image(systemName: showTagBar ? "tag.fill" : "tag").font(.system(size: 11))
+                    .foregroundColor(showTagBar ? Color(hex: "#7c6af7") : .secondary)
+            }.buttonStyle(.plain)
+
+            // Bulk toggle
+            Button(action: { bulkMode.toggle(); if !bulkMode { selectedIDs.removeAll() } }) {
+                Image(systemName: bulkMode ? "checkmark.square.fill" : "checkmark.square")
+                    .font(.system(size: 11))
+                    .foregroundColor(bulkMode ? Color(hex: "#7c6af7") : .secondary)
+            }.buttonStyle(.plain)
+
+            // Grid size
+            HStack(spacing: 3) {
+                Button(action: { if gridColumns > 2 { gridColumns -= 1 } }) {
+                    Image(systemName: "minus").font(.system(size: 9)).foregroundColor(.secondary)
+                }.buttonStyle(.plain)
+                Text("\(gridColumns)").font(.system(size: 9, design: .monospaced)).foregroundColor(.secondary)
+                Button(action: { if gridColumns < 6 { gridColumns += 1 } }) {
+                    Image(systemName: "plus").font(.system(size: 9)).foregroundColor(.secondary)
+                }.buttonStyle(.plain)
+            }
+
+            Text("\(filteredAssets.count)")
+                .font(.system(size: 9, design: .monospaced)).foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(Color.white.opacity(0.03))
+    }
+
+    var statusPills: some View {
+        HStack(spacing: 3) {
+            statusPill(nil, "All")
+            ForEach(AssetStatus.allCases, id: \.self) { s in statusPill(s, s.label) }
+        }
+    }
+
+    func statusPill(_ s: AssetStatus?, _ label: String) -> some View {
+        let sel = selectedStatus == s
+        return Button(action: { selectedStatus = s }) {
+            Text(label).font(.system(size: 8, weight: .medium))
+                .foregroundColor(sel ? .white : .secondary)
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(sel ? Color(hex: "#7c6af7").opacity(0.3) : Color.white.opacity(0.05))
+                .cornerRadius(4)
+        }.buttonStyle(.plain)
+    }
+
+    // MARK: - Tag Bar
+
+    var tagBar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Tags").font(.system(size: 9, weight: .semibold)).foregroundColor(.secondary).tracking(0.8)
+                // AND / OR toggle
+                Button(action: { tagLogicAND.toggle() }) {
+                    Text(tagLogicAND ? "AND" : "OR")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(tagLogicAND ? Color(hex: "#7c6af7") : Color(hex: "#3de3c0"))
+                        .padding(.horizontal, 5).padding(.vertical, 2)
+                        .background(Color.white.opacity(0.06)).cornerRadius(3)
+                }.buttonStyle(.plain)
+                if !activeTags.isEmpty {
+                    Button(action: { activeTags.removeAll() }) {
+                        Text("Clear").font(.system(size: 8)).foregroundColor(.secondary)
+                    }.buttonStyle(.plain)
+                }
+                Spacer()
+            }
+            // Top tags as filter chips
+            ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
-                    Image(systemName: "star.fill")
-                        .font(.system(size: 10))
-                        .foregroundColor(selectedRating > 0 ? .yellow : .secondary)
-                    Text(selectedRating > 0 ? String(repeating: "★", count: selectedRating) : "Rating")
-                        .font(.system(size: 11)).foregroundColor(.secondary)
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 9)).foregroundColor(.secondary)
+                    ForEach(tagging.topTags(limit: 24), id: \.tag) { item in
+                        let active = activeTags.contains(item.tag)
+                        Button(action: {
+                            if active { activeTags.removeAll { $0 == item.tag } }
+                            else { activeTags.append(item.tag) }
+                        }) {
+                            HStack(spacing: 3) {
+                                Text(item.tag).font(.system(size: 9))
+                                Text("(\(item.count))").font(.system(size: 8)).opacity(0.7)
+                            }
+                            .foregroundColor(active ? .white : .secondary)
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(active ? Color(hex: "#7c6af7").opacity(0.35) : Color.white.opacity(0.05))
+                            .cornerRadius(5)
+                        }.buttonStyle(.plain)
+                    }
                 }
-                .padding(.horizontal, 8).padding(.vertical, 5)
-                .background(Color.white.opacity(0.05)).cornerRadius(5)
+                .padding(.horizontal, 2)
             }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 14).padding(.vertical, 8)
-        .background(Color(red: 0.09, green: 0.09, blue: 0.11))
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(Color.white.opacity(0.02))
     }
 
-    // MARK: - Grid
+    // MARK: - Bulk Bar
 
-    var gridPanel: some View {
+    var bulkBar: some View {
+        HStack(spacing: 8) {
+            Text("\(selectedIDs.count) sel.").font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
+            Spacer()
+            bulkBtn("Aprobar", "checkmark.circle", Color(hex: "#34d399")) { bulkStatus(.approved) }
+            bulkBtn("Rechazar", "xmark.circle", Color(hex: "#ef4444")) { bulkStatus(.rejected) }
+            bulkBtn("Auto-tag", "tag", Color(hex: "#7c6af7")) { bulkAutoTag() }
+            Button(action: { selectedIDs.removeAll(); bulkMode = false }) {
+                Image(systemName: "xmark").font(.system(size: 10)).foregroundColor(.secondary)
+            }.buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 7).background(Color.white.opacity(0.04))
+    }
+
+    func bulkBtn(_ label: String, _ icon: String, _ color: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(label, systemImage: icon).font(.system(size: 10))
+                .foregroundColor(color)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(color.opacity(0.15)).cornerRadius(5)
+        }.buttonStyle(.plain)
+    }
+
+    // MARK: - Grid Pane
+
+    var gridPane: some View {
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 8) {
-                ForEach(filteredAssets, id: \.id) { asset in
-                    GalleryCell(
-                        asset: asset,
-                        isSelected: selectedAsset?.id == asset.id,
-                        onTap: {
-                            selectedAsset = asset
-                            showInspector = true
-                        },
-                        onRatingChange: { rating in
-                            store.updateRating(asset, rating: rating)
-                        },
-                        onStatusChange: { status in
-                            store.updateStatus(asset, status: status)
-                        }
-                    )
+            if filteredAssets.isEmpty {
+                emptyState
+            } else {
+                LazyVGrid(columns: columns, spacing: 6) {
+                    ForEach(filteredAssets) { asset in
+                        ThumbnailCell(
+                            asset:      asset,
+                            isSelected: selectedIDs.contains(asset.id ?? UUID()),
+                            bulkMode:   bulkMode,
+                            onTap: {
+                                if bulkMode { toggle(asset) }
+                                else {
+                                    withAnimation(.easeInOut(duration: 0.15)) {
+                                        inspectedAsset = inspectedAsset?.id == asset.id ? nil : asset
+                                    }
+                                }
+                            },
+                            onLongPress: { bulkMode = true; toggle(asset) }
+                        )
+                    }
                 }
+                .padding(8)
             }
-            .padding(10)
         }
+        .frame(maxWidth: .infinity)
     }
-
-    // MARK: - Empty State
 
     var emptyState: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "photo.stack")
-                .font(.system(size: 44)).foregroundColor(.white.opacity(0.08))
-            Text(searchQuery.isEmpty ? "Sin generaciones todavía" : "Sin resultados para \"\(searchQuery)\"")
-                .font(.system(size: 13)).foregroundColor(.white.opacity(0.2))
+        VStack(spacing: 12) {
+            Image(systemName: "photo.stack").font(.system(size: 40)).foregroundColor(.white.opacity(0.07))
+            Text("Sin imágenes").font(.system(size: 13)).foregroundColor(.white.opacity(0.18))
+            if !searchQuery.isEmpty || !activeTags.isEmpty || selectedStatus != nil {
+                Button(action: { searchQuery = ""; activeTags = []; selectedStatus = nil; selectedRating = 0 }) {
+                    Text("Limpiar filtros").font(.system(size: 11)).foregroundColor(Color(hex: "#7c6af7"))
+                }.buttonStyle(.plain)
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, minHeight: 300)
     }
 
-    // MARK: - Helpers
+    // MARK: - Actions
 
-    private func statusColor(_ status: AssetStatus?) -> Color {
-        switch status {
-        case .draft:     return .gray
-        case .approved:  return .green
-        case .published: return .blue
-        case .rejected:  return .red
-        case nil:        return .clear
-        }
+    private func toggle(_ asset: GeneratedAsset) {
+        guard let id = asset.id else { return }
+        if selectedIDs.contains(id) { selectedIDs.remove(id) } else { selectedIDs.insert(id) }
+    }
+
+    private func bulkStatus(_ status: AssetStatus) {
+        store.fetchAllAssets(limit: 500).filter { selectedIDs.contains($0.id ?? UUID()) }
+            .forEach { store.updateStatus($0, status: status) }
+        selectedIDs.removeAll(); bulkMode = false
+    }
+
+    private func bulkAutoTag() {
+        let assets = store.fetchAllAssets(limit: 500).filter { selectedIDs.contains($0.id ?? UUID()) }
+        tagging.autoTagUntagged(assets: assets)
+        selectedIDs.removeAll()
     }
 }
 
-// MARK: - GalleryCell
+// MARK: - ThumbnailCell
 
-struct GalleryCell: View {
-    let asset:           GeneratedAsset
-    let isSelected:      Bool
-    var onTap:           () -> Void
-    var onRatingChange:  (Int) -> Void
-    var onStatusChange:  (AssetStatus) -> Void
+struct ThumbnailCell: View {
+    let asset:       GeneratedAsset
+    let isSelected:  Bool
+    let bulkMode:    Bool
+    let onTap:       () -> Void
+    let onLongPress: () -> Void
 
-    @State private var hovered = false
+    @StateObject private var tagging = TaggingEngine.shared
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            // Thumbnail
-            Group {
-                if let thumb = asset.thumbnail {
-                    Image(nsImage: thumb)
-                        .resizable().aspectRatio(contentMode: .fill)
-                } else {
-                    Rectangle().fill(Color.white.opacity(0.04))
-                        .overlay(
-                            Image(systemName: "photo")
-                                .foregroundColor(.secondary)
-                        )
-                }
-            }
-            .frame(minHeight: 120)
-            .clipped()
-
-            // Hover overlay
-            if hovered || isSelected {
-                LinearGradient(
-                    colors: [.clear, .black.opacity(0.75)],
-                    startPoint: .center, endPoint: .bottom
-                )
-
-                VStack(spacing: 0) {
-                    Spacer()
-                    HStack(spacing: 4) {
-                        // Rating stars
-                        HStack(spacing: 2) {
-                            ForEach(1...5, id: \.self) { star in
-                                Button(action: {
-                                    onRatingChange(asset.rating == Int32(star) ? 0 : star)
-                                }) {
-                                    Image(systemName: Int32(star) <= asset.rating ? "star.fill" : "star")
-                                        .font(.system(size: 9))
-                                        .foregroundColor(Int32(star) <= asset.rating ? .yellow : .white.opacity(0.4))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        Spacer()
-                        // Status dot
-                        statusDot
-                    }
-                    .padding(6)
-                }
-            }
-
-            // Selection ring
-            if isSelected {
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color(hex: "#7c6af7"), lineWidth: 2)
+        Button(action: onTap) {
+            ZStack(alignment: .topLeading) {
+                thumbnail
+                bottomOverlay
+                if bulkMode { selectionCheckbox }
+                if isSelected { selectionBorder }
             }
         }
-        .cornerRadius(6)
-        .aspectRatio(CGFloat(asset.width) / max(CGFloat(asset.height), 1), contentMode: .fit)
-        .onTapGesture { onTap() }
-        .onHover { hovered = $0 }
+        .buttonStyle(.plain)
+        .onLongPressGesture(minimumDuration: 0.4) { onLongPress() }
         .contextMenu { contextMenuItems }
     }
 
-    var statusDot: some View {
-        Circle()
-            .fill(assetStatusColor)
-            .frame(width: 6, height: 6)
-            .help(asset.statusEnum.label)
+    var thumbnail: some View {
+        Group {
+            if let img = asset.thumbnail {
+                Image(nsImage: img).resizable().aspectRatio(contentMode: .fill)
+            } else if let path = asset.imagePath, let img = NSImage(contentsOfFile: path) {
+                Image(nsImage: img).resizable().aspectRatio(contentMode: .fill)
+            } else {
+                Rectangle().fill(Color.white.opacity(0.04))
+                    .overlay(Image(systemName: "photo").font(.system(size: 18))
+                        .foregroundColor(.white.opacity(0.12)))
+            }
+        }
+        .aspectRatio(2/3, contentMode: .fit).clipped().cornerRadius(5)
     }
 
-    var assetStatusColor: Color {
-        switch asset.statusEnum {
-        case .draft:     return .gray
-        case .approved:  return .green
-        case .published: return .blue
-        case .rejected:  return .red
+    var bottomOverlay: some View {
+        VStack {
+            Spacer()
+            ZStack(alignment: .bottom) {
+                LinearGradient(colors: [.clear, .black.opacity(0.55)],
+                               startPoint: .center, endPoint: .bottom)
+                    .frame(height: 44).cornerRadius(5)
+                HStack(spacing: 4) {
+                    Circle().fill(asset.statusEnum.color).frame(width: 4, height: 4)
+                    if asset.rating > 0 {
+                        Text(String(repeating: "★", count: Int(asset.rating)))
+                            .font(.system(size: 7)).foregroundColor(.yellow)
+                    }
+                    Spacer()
+                    let tags = tagging.tags(for: asset)
+                    if tags.contains("nsfw") {
+                        Text("18+").font(.system(size: 6, weight: .bold))
+                            .foregroundColor(.orange)
+                            .padding(.horizontal, 3).padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.2)).cornerRadius(2)
+                    }
+                }
+                .padding(.horizontal, 5).padding(.bottom, 4)
+            }
         }
+    }
+
+    var selectionCheckbox: some View {
+        VStack { HStack { Spacer()
+            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 15))
+                .foregroundColor(isSelected ? Color(hex: "#7c6af7") : .white.opacity(0.5))
+                .shadow(radius: 2)
+        }.padding(4); Spacer() }
+    }
+
+    var selectionBorder: some View {
+        RoundedRectangle(cornerRadius: 5)
+            .stroke(Color(hex: "#7c6af7"), lineWidth: 2)
     }
 
     @ViewBuilder
     var contextMenuItems: some View {
-        Text(asset.baseName ?? "Asset").font(.headline)
-        Divider()
-        Menu("Cambiar estado") {
-            ForEach(AssetStatus.allCases, id: \.self) { s in
-                Button(s.label) { onStatusChange(s) }
-            }
+        Button(action: { AssetStore.shared.updateStatus(asset, status: .approved)  }) {
+            Label("Aprobar", systemImage: "checkmark.circle")
         }
-        Menu("Rating") {
-            Button("Sin rating") { onRatingChange(0) }
-            ForEach(1...5, id: \.self) { r in
-                Button(String(repeating: "★", count: r)) { onRatingChange(r) }
-            }
+        Button(action: { AssetStore.shared.updateStatus(asset, status: .published) }) {
+            Label("Publicar", systemImage: "arrow.up.circle")
+        }
+        Button(action: { AssetStore.shared.updateStatus(asset, status: .rejected)  }) {
+            Label("Rechazar", systemImage: "xmark.circle")
         }
         Divider()
-        Button("Abrir en Finder") {
-            if let path = asset.imagePath {
-                NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
-            }
+        Button(action: {
+            TaggingEngine.shared.suggestTags(for: asset)
+                .forEach { TaggingEngine.shared.addTag($0, to: asset) }
+        }) { Label("Auto-tag", systemImage: "tag") }
+        Divider()
+        Button(role: .destructive, action: { AssetStore.shared.delete(asset) }) {
+            Label("Eliminar", systemImage: "trash")
         }
     }
 }
 
-// MARK: - MetadataInspector
+// MARK: - AssetInspectorView
 
-struct MetadataInspector: View {
-    let asset:   GeneratedAsset
-    var onReuse: (ReusableSettings) -> Void
-    var onClose: () -> Void
+struct AssetInspectorView: View {
+    let asset:           GeneratedAsset
+    let onClose:         () -> Void
+    let onReuseSettings: (ReusableSettings) -> Void
 
-    @State private var showFullPrompt  = false
-    @State private var exportMessage:  String? = nil
-
-    // MARK: - Export Action
-
-    private func exportAsset() {
-        // ExportEngine.export(asset:) es async throws — lanzar desde Task en el MainActor.
-        // WatermarkConfig y la selección de rutas son responsabilidad de ExportEngine;
-        // GalleryView solo dispara la exportación y muestra el resultado.
-        Task { @MainActor in
-            do {
-                let result = try await ExportEngine.shared.export(asset: asset)
-                // Revelar en Finder
-                NSWorkspace.shared.selectFile(result.cleanURL.path, inFileViewerRootedAtPath: "")
-                exportMessage = "✓ Exportado correctamente"
-            } catch {
-                exportMessage = "⚠️ Error al exportar: \(error.localizedDescription)"
-            }
-            // Limpiar mensaje tras 3s
-            try? await Task.sleep(for: .seconds(3))
-            exportMessage = nil
-        }
-    }
+    @StateObject private var tagging = TaggingEngine.shared
+    @State private var showFullPrompt = false
+    @State private var newTag:        String = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Header
-            HStack {
-                Text("Inspector")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.6))
-                Spacer()
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.secondary)
-                        .padding(5).background(Color.white.opacity(0.06))
-                        .clipShape(Circle())
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                // Header
+                HStack {
+                    Text("Inspector").font(.system(size: 11, weight: .bold)).foregroundColor(.white)
+                    Spacer()
+                    Button(action: onClose) {
+                        Image(systemName: "xmark").font(.system(size: 10)).foregroundColor(.secondary)
+                    }.buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 14).padding(.vertical, 10)
-            .background(Color.white.opacity(0.03))
+                .padding(.horizontal, 12).padding(.vertical, 9)
+                .background(Color.white.opacity(0.03))
 
-            Divider().background(Color.white.opacity(0.07))
+                Divider().background(Color.white.opacity(0.06))
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-
-                    // Preview
-                    if let thumb = asset.thumbnail {
-                        Image(nsImage: thumb)
-                            .resizable().aspectRatio(contentMode: .fit)
-                            .cornerRadius(6)
+                VStack(alignment: .leading, spacing: 12) {
+                    // Thumbnail
+                    if let t = asset.thumbnail {
+                        Image(nsImage: t).resizable().aspectRatio(contentMode: .fit)
+                            .cornerRadius(6).frame(maxWidth: .infinity)
                     }
 
-                    // Identity
-                    infoSection("ASSET") {
-                        infoRow("ID",      asset.baseName ?? "-")
-                        infoRow("Fecha",   formatDate(asset.createdAt))
-                        infoRow("Estado",  asset.statusEnum.label)
-                        infoRow("Rating",  asset.rating > 0 ? String(repeating: "★", count: Int(asset.rating)) : "Sin calificar")
-                        if let tag = asset.sessionTag {
-                            infoRow("Sesión", tag)
-                        }
-                    }
+                    // Rating Curator
+                    RatingCuratorView(asset: asset)
 
-                    // Prompt
-                    infoSection("PROMPT") {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(asset.promptPositive ?? "-")
-                                .font(.system(size: 11))
-                                .foregroundColor(Color(red: 0.85, green: 0.95, blue: 0.78))
-                                .lineLimit(showFullPrompt ? nil : 4)
-                                .fixedSize(horizontal: false, vertical: true)
-                            if (asset.promptPositive?.count ?? 0) > 150 {
-                                Button(showFullPrompt ? "Ver menos" : "Ver todo") {
-                                    showFullPrompt.toggle()
-                                }
-                                .buttonStyle(.plain)
-                                .font(.system(size: 10))
-                                .foregroundColor(Color(hex: "#7c6af7"))
-                            }
-                        }
-                        .padding(8)
-                        .background(Color.white.opacity(0.04))
-                        .cornerRadius(5)
-                    }
+                    // Status row
+                    statusRow
 
-                    // Generation params
-                    infoSection("PARÁMETROS") {
-                        infoRow("Seed",    "\(asset.seed)")
-                        infoRow("Steps",   "\(asset.steps)")
-                        infoRow("CFG",     String(format: "%.1f", asset.cfgScale))
-                        infoRow("Sampler", asset.samplerName ?? "-")
-                        infoRow("Size",    "\(asset.width)×\(asset.height)")
-                    }
-
-                    // Model
-                    if let checkpoint = asset.checkpoint, !checkpoint.isEmpty {
-                        infoSection("MODELO") {
-                            infoRow("Checkpoint", checkpoint)
-                            if let vae = asset.vaeUsed, !vae.isEmpty {
-                                infoRow("VAE", vae)
-                            }
-                            if !asset.loraWeights.isEmpty {
-                                infoRow("LoRAs", asset.loraWeights.map {
-                                    "\($0.key): \(String(format: "%.2f", $0.value))"
-                                }.joined(separator: "\n"))
-                            }
-                        }
-                    }
-
-                    // Integrity
-                    if let sha = asset.sha256 {
-                        infoSection("INTEGRIDAD") {
-                            Text(sha)
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundColor(.secondary)
-                                .lineLimit(2)
-                        }
-                    }
-
-                    // Action buttons
-                    VStack(spacing: 8) {
-                        // ── Exportar clean + preview ─────────────────────────
-                        Button(action: exportAsset) {
-                            Label("Exportar Clean + Preview", systemImage: "square.and.arrow.up.fill")
-                                .font(.system(size: 12, weight: .semibold))
-                                .frame(maxWidth: .infinity).padding(.vertical, 8)
-                                .background(
-                                    LinearGradient(
-                                        colors: [Color(hex: "#3de3c0"), Color(hex: "#7c6af7")],
-                                        startPoint: .leading, endPoint: .trailing
-                                    )
-                                )
-                                .foregroundColor(.white).cornerRadius(7)
-                        }
-                        .buttonStyle(.plain)
-
-                        // ── Reutilizar settings ──────────────────────────────
-                        Button(action: {
-                            onReuse(ReusableSettings(
-                                seed:           Int(asset.seed),
-                                steps:          Int(asset.steps),
-                                cfgScale:       asset.cfgScale,
-                                samplerName:    asset.samplerName ?? "DPM++ 2M Karras",
-                                width:          Int(asset.width),
-                                height:         Int(asset.height),
-                                promptPositive: asset.promptPositive ?? "",
-                                promptNegative: asset.promptNegative ?? "",
-                                checkpoint:     asset.checkpoint ?? ""
-                            ))
-                        }) {
-                            Label("Reutilizar Todo", systemImage: "arrow.uturn.left.circle.fill")
-                                .font(.system(size: 12, weight: .semibold))
-                                .frame(maxWidth: .infinity).padding(.vertical, 8)
-                                .background(Color(hex: "#7c6af7"))
-                                .foregroundColor(.white).cornerRadius(7)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button(action: {
-                            onReuse(ReusableSettings(
-                                seed:           Int(asset.seed),
-                                steps:          Int(asset.steps),
-                                cfgScale:       asset.cfgScale,
-                                samplerName:    asset.samplerName ?? "DPM++ 2M Karras",
-                                width:          Int(asset.width),
-                                height:         Int(asset.height),
-                                promptPositive: "",   // No reutilizar prompt
-                                promptNegative: asset.promptNegative ?? "",
-                                checkpoint:     asset.checkpoint ?? ""
-                            ))
-                        }) {
-                            Label("Solo Seed + Config", systemImage: "number.circle")
-                                .font(.system(size: 12))
-                                .frame(maxWidth: .infinity).padding(.vertical, 7)
-                                .background(Color.white.opacity(0.07))
-                                .foregroundColor(.white.opacity(0.8)).cornerRadius(7)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button(action: {
-                            if let path = asset.imagePath {
-                                NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
-                            }
-                        }) {
-                            Label("Abrir en Finder", systemImage: "folder")
-                                .font(.system(size: 12))
-                                .frame(maxWidth: .infinity).padding(.vertical, 7)
-                                .background(Color.white.opacity(0.05))
-                                .foregroundColor(.secondary).cornerRadius(7)
-                        }
-                        .buttonStyle(.plain)
-
-                        // Feedback de export
-                        if let msg = exportMessage {
-                            Text(msg)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(msg.hasPrefix("✓") ? Color(hex: "#3de3c0") : Color(red: 1, green: 0.45, blue: 0.4))
-                                .frame(maxWidth: .infinity, alignment: .center)
-                                .transition(.opacity)
-                        }
-                    }
+                    Divider().background(Color.white.opacity(0.06))
+                    metaSection
+                    Divider().background(Color.white.opacity(0.06))
+                    promptSection
+                    Divider().background(Color.white.opacity(0.06))
+                    tagSection
+                    Divider().background(Color.white.opacity(0.06))
+                    actionsSection
                 }
                 .padding(12)
             }
@@ -579,122 +491,229 @@ struct MetadataInspector: View {
         .background(Color(red: 0.09, green: 0.09, blue: 0.12))
     }
 
-    // MARK: - Inspector Helpers
-
-    @ViewBuilder
-    func infoSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundColor(Color(hex: "#7c6af7"))
-                .tracking(1.5)
-            content()
+    var statusRow: some View {
+        HStack(spacing: 4) {
+            ForEach(AssetStatus.allCases, id: \.self) { s in
+                Button(action: { AssetStore.shared.updateStatus(asset, status: s) }) {
+                    Text(s.label).font(.system(size: 8, weight: .medium))
+                        .foregroundColor(asset.statusEnum == s ? .white : .secondary)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(asset.statusEnum == s ? s.color.opacity(0.3) : Color.white.opacity(0.04))
+                        .cornerRadius(4)
+                }.buttonStyle(.plain)
+            }
         }
     }
 
-    func infoRow(_ label: String, _ value: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Text(label)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(.secondary)
-                .frame(width: 64, alignment: .trailing)
-            Text(value)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(.white.opacity(0.8))
-                .textSelection(.enabled)
+    var metaSection: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            sLabel("Parámetros SD")
+            mRow("Seed",    "\(asset.seed)")
+            mRow("Steps",   "\(asset.steps)")
+            mRow("CFG",     String(format: "%.1f", asset.cfgScale))
+            mRow("Sampler", asset.samplerName ?? "—")
+            mRow("Size",    "\(asset.width)×\(asset.height)")
+            if let cp = asset.checkpoint, !cp.isEmpty {
+                mRow("Modelo", (cp as NSString).lastPathComponent)
+            }
+            if let d = asset.createdAt { mRow("Fecha", d.shortDisplay) }
+            if let sha = asset.sha256  { mRow("SHA-256", "\(sha.prefix(14))…") }
+        }
+    }
+
+    var promptSection: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                sLabel("Prompt")
+                Spacer()
+                Button(action: { showFullPrompt.toggle() }) {
+                    Text(showFullPrompt ? "Menos" : "Más").font(.system(size: 8))
+                        .foregroundColor(Color(hex: "#7c6af7"))
+                }.buttonStyle(.plain)
+            }
+            if let p = asset.promptPositive {
+                Text(showFullPrompt ? p : p.truncated(100))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.7))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    var tagSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            sLabel("Tags")
+            // Existing tags
+            let tags = tagging.tags(for: asset)
+            if !tags.isEmpty {
+                FlowLayoutSimple(spacing: 4) {
+                    ForEach(Array(tags).sorted(), id: \.self) { tag in
+                        HStack(spacing: 3) {
+                            Text(tag).font(.system(size: 9))
+                            Button(action: { tagging.removeTag(tag, from: asset) }) {
+                                Image(systemName: "xmark").font(.system(size: 7))
+                            }.buttonStyle(.plain)
+                        }
+                        .foregroundColor(.white.opacity(0.8))
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(Color(hex: "#7c6af7").opacity(0.2)).cornerRadius(4)
+                    }
+                }
+            }
+            // Add tag field
+            HStack(spacing: 5) {
+                TextField("Añadir tag…", text: $newTag)
+                    .textFieldStyle(.plain).font(.system(size: 10)).foregroundColor(.white)
+                    .padding(.horizontal, 6).padding(.vertical, 3)
+                    .background(Color.white.opacity(0.05)).cornerRadius(4)
+                    .onSubmit {
+                        let t = newTag.trimmingCharacters(in: .whitespaces)
+                        if !t.isEmpty { tagging.addTag(t, to: asset); newTag = "" }
+                    }
+            }
+            // Suggestions
+            let sugg = tagging.suggestTags(for: asset).filter { !tags.contains($0) }.prefix(4)
+            if !sugg.isEmpty {
+                HStack(spacing: 4) {
+                    Text("Sug:").font(.system(size: 8)).foregroundColor(.secondary)
+                    ForEach(Array(sugg), id: \.self) { tag in
+                        Button(action: { tagging.addTag(tag, to: asset) }) {
+                            Text(tag).font(.system(size: 8)).foregroundColor(Color(hex: "#7c6af7"))
+                        }.buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+
+    var actionsSection: some View {
+        VStack(spacing: 7) {
+            Button(action: { onReuseSettings(ReusableSettings(from: asset)) }) {
+                Label("Reutilizar settings", systemImage: "arrow.uturn.left")
+                    .font(.system(size: 11, weight: .medium)).frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.plain).padding(.vertical, 7)
+            .background(Color(hex: "#7c6af7").opacity(0.15))
+            .foregroundColor(Color(hex: "#7c6af7")).cornerRadius(6)
+
+            Button(action: exportPNG) {
+                Label("Exportar PNG", systemImage: "square.and.arrow.down")
+                    .font(.system(size: 11, weight: .medium)).frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.plain).padding(.vertical, 7)
+            .background(Color.white.opacity(0.06)).foregroundColor(.white.opacity(0.8)).cornerRadius(6)
+
+            Button(role: .destructive, action: { AssetStore.shared.delete(asset) }) {
+                Label("Eliminar", systemImage: "trash")
+                    .font(.system(size: 10)).frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.plain).padding(.vertical, 5)
+            .foregroundColor(Color(hex: "#ef4444").opacity(0.8))
+        }
+    }
+
+    private func exportPNG() {
+        let path = asset.cleanPath ?? asset.imagePath
+        guard let path, let img = NSImage(contentsOfFile: path) else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "\(asset.baseName ?? "export")_clean.png"
+        if panel.runModal() == .OK, let url = panel.url { img.pngData().map { try? $0.write(to: url) } }
+    }
+
+    func mRow(_ l: String, _ v: String) -> some View {
+        HStack {
+            Text(l).font(.system(size: 9)).foregroundColor(.secondary).frame(width: 52, alignment: .leading)
+            Text(v).font(.system(size: 9, design: .monospaced)).foregroundColor(.white.opacity(0.8)).lineLimit(1)
             Spacer()
         }
     }
 
-    func formatDate(_ date: Date?) -> String {
-        guard let date else { return "-" }
-        let f = DateFormatter()
-        f.dateFormat = "dd MMM yyyy  HH:mm"
-        return f.string(from: date)
+    func sLabel(_ t: String) -> some View {
+        Text(t).font(.system(size: 9, weight: .semibold)).foregroundColor(.secondary)
+            .tracking(0.8).textCase(.uppercase)
     }
 }
 
-// MARK: - ReusableSettings
-// Struct de transporte para devolver configuraciones al pipeline principal.
+// MARK: - RatingCuratorView
 
-struct ReusableSettings {
-    var seed:           Int
-    var steps:          Int
-    var cfgScale:       Double
-    var samplerName:    String
-    var width:          Int
-    var height:         Int
-    var promptPositive: String
-    var promptNegative: String
-    var checkpoint:     String
-}
+struct RatingCuratorView: View {
+    let asset: GeneratedAsset
+    @State private var hovered: Int = 0
 
-// MARK: - PromptHistory
-// Registro de prompts exitosos (rating >= 4) para reutilización y referencia.
-
-@MainActor
-final class PromptHistory: ObservableObject {
-
-    static let shared = PromptHistory()
-    private init() { load() }
-
-    @Published var entries: [PromptEntry] = []
-
-    struct PromptEntry: Codable, Identifiable {
-        var id:           UUID    = UUID()
-        var positive:     String
-        var negative:     String
-        var seed:         Int
-        var rating:       Int
-        var usageCount:   Int     = 1
-        var lastUsed:     Date    = Date()
-        var tags:         [String] = []
-        var assetID:      String?  // UUID del asset asociado
-    }
-
-    func record(positive: String, negative: String, seed: Int, rating: Int = 0, assetID: String? = nil) {
-        // Deduplicar por prompt positivo exacto
-        if let idx = entries.firstIndex(where: { $0.positive == positive }) {
-            entries[idx].usageCount += 1
-            entries[idx].lastUsed = Date()
-            entries[idx].rating = max(entries[idx].rating, rating)
-        } else {
-            entries.insert(PromptEntry(
-                positive:  positive,
-                negative:  negative,
-                seed:      seed,
-                rating:    rating,
-                assetID:   assetID
-            ), at: 0)
-            // Mantener solo los últimos 500 prompts
-            if entries.count > 500 { entries = Array(entries.prefix(500)) }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Rating Curator").font(.system(size: 9, weight: .semibold))
+                .foregroundColor(.secondary).tracking(0.8).textCase(.uppercase)
+            HStack(spacing: 5) {
+                ForEach(1...5, id: \.self) { star in
+                    Button(action: {
+                        let newRating = Int(asset.rating) == star ? 0 : star
+                        AssetStore.shared.updateRating(asset, rating: newRating)
+                    }) {
+                        Image(systemName: effectiveStar(star) <= star && effectiveStar(star) > 0
+                              ? "star.fill" : "star")
+                        .font(.system(size: 16))
+                        .foregroundColor(starColor(star))
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { inside in hovered = inside ? star : 0 }
+                }
+                Spacer()
+                if asset.rating > 0 {
+                    Text(ratingLabel).font(.system(size: 9)).foregroundColor(.secondary)
+                }
+            }
         }
-        save()
+        .padding(9).background(Color.white.opacity(0.04)).cornerRadius(7)
     }
 
-    /// Prompts con rating >= umbral, ordenados por uso.
-    func topPrompts(minRating: Int = 4, limit: Int = 20) -> [PromptEntry] {
-        entries
-            .filter { $0.rating >= minRating }
-            .sorted { $0.usageCount > $1.usageCount }
-            .prefix(limit)
-            .map { $0 }
+    private func effectiveStar(_ star: Int) -> Int { hovered > 0 ? hovered : Int(asset.rating) }
+
+    private func starColor(_ star: Int) -> Color {
+        let eff = effectiveStar(star)
+        guard star <= eff, eff > 0 else { return .white.opacity(0.15) }
+        switch eff {
+        case 1: return Color(hex: "#ef4444")
+        case 2: return Color(hex: "#f97316")
+        case 3: return Color(hex: "#fbbf24")
+        case 4: return Color(hex: "#84cc16")
+        default: return Color(hex: "#34d399")
+        }
     }
 
-    private var storageURL: URL? {
-        VaultManager.shared.vaultMetaURL?.appending(path: "prompt_history.json")
+    var ratingLabel: String {
+        switch Int(asset.rating) {
+        case 1: return "Descartar"; case 2: return "Regular"; case 3: return "Buena"
+        case 4: return "Muy buena"; case 5: return "Maestra"; default: return ""
+        }
+    }
+}
+
+// MARK: - FlowLayoutSimple
+// Layout simple para chips de tags en el inspector (sin dependencias externas)
+
+struct FlowLayoutSimple: Layout {
+    var spacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        var x: CGFloat = 0; var y: CGFloat = 0; var rowH: CGFloat = 0
+        let maxW = proposal.width ?? .infinity
+        for sub in subviews {
+            let sz = sub.sizeThatFits(.unspecified)
+            if x + sz.width > maxW, x > 0 { y += rowH + spacing; x = 0; rowH = 0 }
+            rowH = max(rowH, sz.height); x += sz.width + spacing
+        }
+        return CGSize(width: maxW, height: y + rowH)
     }
 
-    private func save() {
-        guard let url = storageURL else { return }
-        try? JSONEncoder.pretty.encode(entries).write(to: url, options: .atomic)
-    }
-
-    private func load() {
-        guard let url = storageURL,
-              let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder.iso8601.decode([PromptEntry].self, from: data)
-        else { return }
-        entries = decoded
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX; var y = bounds.minY; var rowH: CGFloat = 0
+        for sub in subviews {
+            let sz = sub.sizeThatFits(.unspecified)
+            if x + sz.width > bounds.maxX, x > bounds.minX { y += rowH + spacing; x = bounds.minX; rowH = 0 }
+            sub.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(sz))
+            rowH = max(rowH, sz.height); x += sz.width + spacing
+        }
     }
 }

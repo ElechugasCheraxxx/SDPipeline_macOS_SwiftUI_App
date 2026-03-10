@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import ImageIO
 import UniformTypeIdentifiers
+import Combine
 
 // MARK: - ExportEngine
 // Responsable de producir las DOS versiones de cada imagen aprobada:
@@ -12,25 +13,27 @@ import UniformTypeIdentifiers
 // versiones procesadas. El sidecar JSON tampoco se incluye en ningún export.
 
 @MainActor
-final class ExportEngine {
+final class ExportEngine: ObservableObject {
 
     static let shared = ExportEngine()
     private init() {}
 
     // MARK: - Configuración de Watermark
-    // Ajustable desde Settings en la app.
+    // Ajustable desde SettingsView (Cmd+,).
+
+    @Published var watermarkConfig = WatermarkConfig()
+
+    // MARK: - Configuración de Watermark (struct)
 
     struct WatermarkConfig {
-        var text:      String  = "@tuusuario"       // Marca visible
-        var opacity:   Double  = 0.35
+        var text:      String   = "@tuusuario"
+        var opacity:   Double   = 0.35
         var position:  Position = .bottomRight
         var fontSize:  CGFloat  = 18
         var textColor: NSColor  = .white
 
         enum Position { case topLeft, topRight, bottomLeft, bottomRight, center }
     }
-
-    var watermarkConfig = WatermarkConfig()
 
     // MARK: - Export principal
 
@@ -95,6 +98,11 @@ final class ExportEngine {
         asset.cleanPath   = cleanURL.path
         asset.previewPath = previewURL.path
         try? AssetStore.shared.container.viewContext.save()
+
+        // 6. Incrustar metadatos IPTC/XMP en versión limpia (auditoría + DAM)
+        //    El preview con watermark NO recibe metadatos de autoría.
+        let tags = TaggingEngine.shared.tags(for: asset)
+        try? IPTCMetadataWriter.embed(in: cleanURL, asset: asset, tags: tags)
 
         return ExportResult(
             cleanURL:    cleanURL,
