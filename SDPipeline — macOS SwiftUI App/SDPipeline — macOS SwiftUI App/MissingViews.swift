@@ -19,6 +19,7 @@ import AppKit
 // MARK: - BatchRatingView
 
 struct BatchRatingView: View {
+    
     @StateObject private var store = AssetStore.shared
     @State private var assets:     [GeneratedAsset] = []
     @State private var currentIdx: Int = 0

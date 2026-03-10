@@ -171,7 +171,8 @@ final class IntegrityManager: ObservableObject {
         // Compute actual hash in background
         let actualHash: String = await Task.detached(priority: .utility) {
             guard let data = try? Data(contentsOf: url) else { return "" }
-            return data.sha256Hex
+            let digest = SHA256.hash(data: data)
+            return digest.map { String(format: "%02hhx", $0) }.joined()
         }.value
 
         guard !actualHash.isEmpty else {
