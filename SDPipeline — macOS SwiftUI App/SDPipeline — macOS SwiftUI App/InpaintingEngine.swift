@@ -768,12 +768,18 @@ struct InpaintingView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 9)
-                        .background(engine.isRunning
-                            ? Color.white.opacity(0.08)
-                            : LinearGradient(
-                                colors: [Color(hex: "#7c6af7"), Color(hex: "#5b4ecf")],
-                                startPoint: .leading, endPoint: .trailing
-                            ))
+                        .background(
+                            Group {
+                                if engine.isRunning {
+                                    Color.white.opacity(0.08)
+                                } else {
+                                    LinearGradient(
+                                        colors: [Color(hex: "#7c6af7"), Color(hex: "#5b4ecf")],
+                                        startPoint: .leading, endPoint: .trailing
+                                    )
+                                }
+                            }
+                        )
                         .foregroundColor(.white)
                         .cornerRadius(7)
                     }
@@ -890,8 +896,9 @@ struct MaskCanvasView: NSViewRepresentable {
 
             // Draw current stroke preview
             if let s = stroke, s.points.count > 1 {
+                // CORRECCIÓN: Quitamos el force unwrap en NSColor(hex:) ya que no devuelve opcional
                 let color = s.isErase ? NSColor.black.withAlphaComponent(0.6)
-                                      : NSColor(hex: "#7c6af7")!.withAlphaComponent(0.8)
+                                      : NSColor(hex: "#7c6af7").withAlphaComponent(0.8)
                 color.setStroke()
                 let path = NSBezierPath()
                 path.lineWidth = s.brushSize

@@ -193,7 +193,7 @@ struct PromptBuilder {
         (["subject_system", "identity", "gender"],              nil),
         (["subject_system", "biometrics", "body_type"],         nil),
         (["subject_system", "expression_engine", "default_expression"], nil),
-        (["subject_system", "expression_engine", "smile_type"],         nil),
+        (["subject_system", "expression_engine", "smile_type"],          nil),
         (["subject_system", "expression_engine", "editorial_emotion"],  nil),
         (["editorial_style_system", "style_category"],          nil),
         (["editorial_style_system", "visual_tone"],             nil),

@@ -80,7 +80,8 @@ final class JobQueueManager: ObservableObject {
         var autoNSFWCheck:  Bool
         var postProcessing: Bool
 
-        static let `default` = JobSettings(
+        // CORRECCIÓN: Agregado nonisolated a default para el acceso cross-context en Task
+        nonisolated static let `default` = JobSettings(
             baseURL:        "http://127.0.0.1:7860",
             autoExport:     true,
             autoNSFWCheck:  true,
@@ -149,7 +150,7 @@ final class JobQueueManager: ObservableObject {
 
     // MARK: - State
 
-    @Published var jobs:             [GenerationJob] = []
+    @Published var jobs:            [GenerationJob] = []
     @Published var isProcessing:     Bool = false
     @Published var maxConcurrent:    Int  = 1         // 1–4 workers
     @Published var activeJobCount:   Int  = 0
@@ -191,7 +192,6 @@ final class JobQueueManager: ObservableObject {
 
     // MARK: - Public API
 
-    /// Enqueue a single job.
     @discardableResult
     func enqueue(_ job: GenerationJob) -> UUID {
         jobs.append(job)
@@ -201,18 +201,16 @@ final class JobQueueManager: ObservableObject {
         return job.id
     }
 
-    /// Enqueue multiple jobs from a batch (assigns same batchID).
     func enqueueBatch(_ requests: [(name: String, request: SDRequest)], settings: JobSettings = .default, priority: JobPriority = .normal, sessionTag: String? = nil) {
         let batchID = UUID()
         for (name, req) in requests {
-            var job = GenerationJob(name: name, request: req, settings: settings, priority: priority, sessionTag: sessionTag, batchID: batchID)
+            let job = GenerationJob(name: name, request: req, settings: settings, priority: priority, sessionTag: sessionTag, batchID: batchID)
             jobs.append(job)
         }
         persistQueue()
         processQueueIfNeeded()
     }
 
-    /// Cancel a specific job.
     func cancel(jobID: UUID) {
         guard let idx = jobs.firstIndex(where: { $0.id == jobID }) else { return }
         if jobs[idx].status == .running {
@@ -226,7 +224,6 @@ final class JobQueueManager: ObservableObject {
         processQueueIfNeeded()
     }
 
-    /// Cancel all queued (not yet running) jobs.
     func cancelAllQueued() {
         for i in jobs.indices where jobs[i].status == .queued {
             jobs[i].status = .cancelled
@@ -235,7 +232,6 @@ final class JobQueueManager: ObservableObject {
         persistQueue()
     }
 
-    /// Retry a failed job.
     func retry(jobID: UUID) {
         guard let idx = jobs.firstIndex(where: { $0.id == jobID }),
               jobs[idx].status == .failed
@@ -249,19 +245,16 @@ final class JobQueueManager: ObservableObject {
         processQueueIfNeeded()
     }
 
-    /// Remove completed/cancelled/failed jobs from history.
     func clearHistory() {
         jobs.removeAll { $0.status == .done || $0.status == .cancelled || $0.status == .failed }
         persistQueue()
     }
 
-    /// Start processing the queue.
     func startQueue() {
         isProcessing = true
         processQueueIfNeeded()
     }
 
-    /// Pause — lets current jobs finish but doesn't start new ones.
     func pauseQueue() {
         isProcessing = false
     }
@@ -271,7 +264,7 @@ final class JobQueueManager: ObservableObject {
     private func processQueueIfNeeded() {
         guard isProcessing else { return }
         guard activeJobCount < maxConcurrent else { return }
-        guard let nextJob = queuedJobs.first else { return }
+        guard !queuedJobs.isEmpty else { return }
 
         let slotsAvailable = maxConcurrent - activeJobCount
         let toStart = queuedJobs.prefix(slotsAvailable)
@@ -323,7 +316,12 @@ final class JobQueueManager: ObservableObject {
             // Post-process if enabled
             if job.settings.autoNSFWCheck, let asset {
                 let detector = NSFWDetector.shared
-                await detector.analyze(image: image, asset: asset)
+                _ = await detector.detect(
+                    prompt: job.request.prompt,
+                    image: image,
+                    imagePath: asset.imagePath,
+                    baseURL: job.settings.baseURL
+                )
             }
 
             ZeroKnowledgeLog.shared.write(
@@ -365,7 +363,6 @@ final class JobQueueManager: ObservableObject {
     private let persistenceKey = "sdpipeline.jobQueue.v2"
 
     private func persistQueue() {
-        // Only persist non-running jobs (running jobs are transient)
         let persistable = jobs.filter { $0.status != .running && $0.status != .retrying }
         guard let data = try? JSONEncoder().encode(persistable) else { return }
         UserDefaults.standard.set(data, forKey: persistenceKey)
@@ -376,7 +373,6 @@ final class JobQueueManager: ObservableObject {
               let loaded = try? JSONDecoder().decode([GenerationJob].self, from: data)
         else { return }
 
-        // Reset any previously-running jobs back to queued
         jobs = loaded.map { job in
             var j = job
             if j.status == .running || j.status == .retrying {
@@ -423,10 +419,4 @@ final class JobQueueManager: ObservableObject {
             successRate:  rate
         )
     }
-}
-
-// MARK: - SDRequest Codable support for job persistence
-
-extension SDRequest: Codable {
-    // Already Codable from Models.swift — no additional implementation needed
 }

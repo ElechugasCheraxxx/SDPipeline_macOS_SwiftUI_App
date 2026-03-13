@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Combine
+import UniformTypeIdentifiers // Soluciona: missing import of defining module 'UniformTypeIdentifiers'
 
 // MARK: - PromptDatabase
 //
@@ -25,7 +26,8 @@ import Combine
 
 // MARK: - Models
 
-struct PromptEntry: Codable, Identifiable {
+// Soluciona: requires that 'PromptEntry' conform to 'Hashable'
+struct PromptEntry: Codable, Identifiable, Hashable {
     var id:             UUID    = UUID()
     var createdAt:      Date    = Date()
     var lastUsedAt:     Date?   = nil
@@ -114,6 +116,10 @@ struct PromptEntry: Codable, Identifiable {
         let preview = positive.prefix(50)
         return String(preview) + (positive.count > 50 ? "…" : "")
     }
+    
+    // Conformidad a Hashable
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    static func == (lhs: PromptEntry, rhs: PromptEntry) -> Bool { lhs.id == rhs.id }
 }
 
 // MARK: - Search & Filter

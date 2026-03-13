@@ -2,6 +2,8 @@ import Foundation
 import AppKit
 import CoreGraphics
 import CryptoKit
+import Combine
+import SwiftUI
 
 // MARK: - SteganographyEngine
 //
@@ -9,22 +11,9 @@ import CryptoKit
 // La firma es un payload JSON cifrado con AES-GCM incrustado en los bits menos
 // significativos de los canales de color — imperceptible al ojo humano y a
 // herramientas básicas de compresión JPEG moderada.
-//
-// CAPACIDAD: ~1 bit por canal por píxel. En 512x768 = ~294KB de payload máximo.
-// Nuestro payload JSON es ~500 bytes — margen de sobra.
-//
-// RESISTENCIA:
-//   ✅ Capturas de pantalla (screen recording)
-//   ✅ Reposteo sin recompresión
-//   ✅ JPEG q>85 (degradación parcial pero recuperable con ECC)
-//   ⚠️  JPEG q<70 destruye LSB — usar para PNG/WebP siempre que sea posible
-//   ⚠️  Redimensionado agresivo — payload se degrada
-//
-// Para OnlyFans (que sirve imágenes en JPEG) se recomienda subir PNG y dejar
-// que la plataforma comprima, manteniendo calidad alta.
 
 @MainActor
-final class SteganographyEngine {
+final class SteganographyEngine: ObservableObject {
 
     static let shared = SteganographyEngine()
     private init() {}
@@ -32,34 +21,35 @@ final class SteganographyEngine {
     // MARK: - Payload
 
     struct StegPayload: Codable {
-        let version:    String = "SDPipeline.Steg.v1"
-        let artistID:   String          // Identificador del artista (configurable)
-        let assetID:    String          // UUID del asset
-        let sessionTag: String?         // Tag de sesión
-        let timestamp:  TimeInterval    // Unix timestamp de generación
-        let sha256:     String          // Hash del original para cruce con vault
-        let checksum:   String          // HMAC del payload para verificar autenticidad
+        var version:    String = "SDPipeline.Steg.v1"
+        let artistID:   String
+        let assetID:    String
+        let sessionTag: String?
+        let timestamp:  TimeInterval
+        let sha256:     String
+        let checksum:   String
     }
 
     // MARK: - Configuración
 
     struct StegConfig {
-        /// Identificador único del artista. Guardar en Keychain, no en UserDefaults.
         var artistID: String = SteganographyEngine.loadOrCreateArtistID()
-        /// Clave HMAC para firmar el payload (256 bits).
         var hmacKey:  SymmetricKey = SteganographyEngine.loadOrCreateHMACKey()
-        /// Canales en los que incrustar (0=R, 1=G, 2=B). Evitar Alpha para compatibilidad.
         var channels: [Int] = [0, 1, 2]
-        /// Bits por canal a usar (1 = mínimo impacto visual, máximo seguridad).
         var bitsPerChannel: Int = 1
     }
 
-    var config = StegConfig()
+    @Published var config = StegConfig()
 
     // MARK: - Public API
+    
+    private func safePNGData(for image: NSImage) -> Data? {
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff) else { return nil }
+        return rep.representation(using: .png, properties: [:])
+    }
 
     /// Incrustar firma invisible en una imagen PNG.
-    /// Devuelve los Data del PNG firmado, o los datos originales si falla (sin crash).
     func embed(
         image:      NSImage,
         assetID:    UUID,
@@ -67,7 +57,7 @@ final class SteganographyEngine {
         sha256:     String
     ) -> Data? {
         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            return image.pngData()
+            return safePNGData(for: image)
         }
 
         // 1. Construir payload
@@ -75,19 +65,17 @@ final class SteganographyEngine {
             assetID:    assetID.uuidString,
             sessionTag: sessionTag,
             sha256:     sha256
-        ) else { return image.pngData() }
+        ) else { return safePNGData(for: image) }
 
         // 2. Incrustar en píxeles
         guard let signed = embedBits(in: cgImage, payload: payloadData) else {
-            return image.pngData()
+            return safePNGData(for: image)
         }
 
         // 3. Convertir a PNG
         return pngData(from: signed)
     }
 
-    /// Extraer y verificar la firma invisible de un PNG.
-    /// Devuelve nil si no hay firma o si la firma no es válida.
     func extract(from image: NSImage) -> StegPayload? {
         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return nil
@@ -96,7 +84,6 @@ final class SteganographyEngine {
         return verifyAndDecode(payloadData)
     }
 
-    /// Verificar si una imagen contiene nuestra firma (para rastreo de filtraciones).
     func verify(image: NSImage) -> VerificationResult {
         guard let payload = extract(from: image) else {
             return .noSignature
@@ -118,16 +105,14 @@ final class SteganographyEngine {
         let bpp    = 4 // RGBA
         let bytesPerRow = width * bpp
 
-        // Capacidad en bits disponibles
         let availableBits = width * height * config.channels.count * config.bitsPerChannel
-        let requiredBits  = (payload.count + 4) * 8 // 4 bytes para longitud del payload
+        let requiredBits  = (payload.count + 4) * 8
 
         guard requiredBits <= availableBits else {
             print("⚠️ Steg: imagen demasiado pequeña para el payload")
             return nil
         }
 
-        // Copiar píxeles a buffer mutable
         guard let colorSpace = cgImage.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
               let ctx = CGContext(
                 data: nil,
@@ -140,16 +125,13 @@ final class SteganographyEngine {
               let pixelData = ctx.data
         else { return nil }
 
-        // Dibujar imagen original en el contexto para obtener los píxeles
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
 
         let buffer = pixelData.bindMemory(to: UInt8.self, capacity: width * height * bpp)
 
-        // Prepend longitud del payload (4 bytes big-endian)
-        var lengthBytes = withUnsafeBytes(of: UInt32(payload.count).bigEndian) { Data($0) }
+        let lengthBytes = withUnsafeBytes(of: UInt32(payload.count).bigEndian) { Data($0) }
         let fullPayload = lengthBytes + payload
 
-        // Convertir payload a bits
         var bits: [UInt8] = []
         for byte in fullPayload {
             for i in stride(from: 7, through: 0, by: -1) {
@@ -157,14 +139,12 @@ final class SteganographyEngine {
             }
         }
 
-        // Incrustar bits en LSB de los canales seleccionados
         var bitIndex = 0
         outer: for pixelIndex in 0..<(width * height) {
             let base = pixelIndex * bpp
             for channel in config.channels {
                 guard bitIndex < bits.count else { break outer }
                 let byteIndex = base + channel
-                // Limpiar LSB y poner el bit del payload
                 buffer[byteIndex] = (buffer[byteIndex] & 0xFE) | bits[bitIndex]
                 bitIndex += 1
             }
@@ -194,7 +174,6 @@ final class SteganographyEngine {
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         let buffer = pixelData.bindMemory(to: UInt8.self, capacity: width * height * bpp)
 
-        // Extraer primeros 32 bits para obtener la longitud
         var lengthBits: [UInt8] = []
         var bitIndex = 0
         for pixelIndex in 0..<(width * height) {
@@ -209,9 +188,8 @@ final class SteganographyEngine {
         }
 
         let payloadLength = Int(bitsToUInt32(lengthBits))
-        guard payloadLength > 0, payloadLength < 10_000 else { return nil } // Sanity check
+        guard payloadLength > 0, payloadLength < 10_000 else { return nil }
 
-        // Extraer payload completo
         let totalBitsNeeded = (payloadLength + 4) * 8
         var allBits: [UInt8] = []
         bitIndex = 0
@@ -225,7 +203,6 @@ final class SteganographyEngine {
             }
         }
 
-        // Convertir bits a bytes (omitir los 4 bytes de longitud)
         guard allBits.count >= totalBitsNeeded else { return nil }
         let payloadBits = Array(allBits.dropFirst(32))
         var result = Data()
@@ -247,7 +224,6 @@ final class SteganographyEngine {
     ) -> Data? {
         let timestamp = Date().timeIntervalSince1970
 
-        // Construir string para HMAC
         let hmacInput = "\(config.artistID)|\(assetID)|\(timestamp)|\(sha256)"
         let hmac = HMAC<SHA256>.authenticationCode(
             for: Data(hmacInput.utf8),
@@ -272,7 +248,6 @@ final class SteganographyEngine {
             return nil
         }
 
-        // Verificar HMAC
         let hmacInput = "\(payload.artistID)|\(payload.assetID)|\(payload.timestamp)|\(payload.sha256)"
         let expectedHMAC = HMAC<SHA256>.authenticationCode(
             for: Data(hmacInput.utf8),
@@ -327,11 +302,7 @@ final class SteganographyEngine {
 }
 
 // MARK: - KeychainHelper
-// Wrapper mínimo para guardar/leer datos sensibles en el Keychain del sistema.
-// La clave HMAC y el Artist ID nunca tocan UserDefaults ni el disco.
-
 enum KeychainHelper {
-
     static func save(key: String, data: Data) {
         let query: [CFString: Any] = [
             kSecClass:       kSecClassGenericPassword,

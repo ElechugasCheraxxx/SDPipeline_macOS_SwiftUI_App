@@ -11,7 +11,7 @@ import Combine
 //
 // Arquitectura:
 //   VaultRoot/
-//   ├── .projects_registry.json     ← índice de todos los proyectos
+//   ├── .projects_registry.json      ← índice de todos los proyectos
 //   ├── Proyecto_A/                 ← vault aislado del proyecto A
 //   │   ├── Generaciones/
 //   │   ├── Export/
@@ -198,7 +198,6 @@ final class ProjectManager: ObservableObject {
         else { return }
         projects[idx].approvedCount = count
         activeProject = projects[idx]
-        // No save en cada update — lo hace el caller cuando sea oportuno
     }
 
     /// URL raíz del directorio de un proyecto.
@@ -328,12 +327,6 @@ final class ProjectManager: ObservableObject {
         guard projects.isEmpty, VaultManager.shared.vaultRoot != nil else { return }
         create(name: "Mi Primer Proyecto", description: "Proyecto creado automáticamente", category: .general)
     }
-}
-
-// MARK: - Notification
-
-extension Notification.Name {
-    static let projectDidChange = Notification.Name("SDPipeline.projectDidChange")
 }
 
 // MARK: - VaultManager extensions for multi-project

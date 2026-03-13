@@ -2,23 +2,10 @@ import Foundation
 import SwiftUI
 import CoreData
 
-// MARK: - Models_Extended.swift v4
-//
-// REGLA ESTRICTA: nada declarado aquí puede ya existir en otro archivo.
-// Archivos auditados antes de escribir esto:
-//   NSImage_Helpers.swift   → pngData(), resized(maxDimension:), cgImageSafe
-//   View_Helpers.swift      → String.truncated(_:), Date.shortDisplay, Date.filenameDate
-//   Data_Crypto.swift       → Data.sha256Hex
-//   ReusableSettings.swift  → struct ReusableSettings + init(from asset:)
-//   AssetStore.swift        → assets(withStatus:limit:), fetchAllAssets(limit:)
-//   CharacterEngine.swift   → CharacterProfile es top-level struct (NO nested en CharacterEngine)
+// MARK: - Models_Extended.swift v5 (Corregido para escalabilidad)
 
 // MARK: - SDRequest convenience factory
-
 extension SDRequest {
-
-    /// Build from GenerationSettings + resolved prompt.
-    /// Usado en PipelineConnector, BatchEngine, XYPlotEngine, JobQueueManager.
     static func from(
         settings:        GenerationSettings,
         prompt:          String,
@@ -42,7 +29,6 @@ extension SDRequest {
         )
     }
 
-    /// Variante img2img: deshabilita HR fix y permite override de dimensiones.
     static func img2imgBase(
         settings: GenerationSettings,
         prompt:   String,
@@ -58,10 +44,7 @@ extension SDRequest {
 }
 
 // MARK: - GenerationSettings convenience
-
 extension GenerationSettings {
-
-    /// Resumen en una línea para labels de jobs, logs, etc.
     var summaryLabel: String {
         "\(width)×\(height) · \(steps)s · CFG\(String(format: "%.1f", cfgScale)) · \(samplerName)"
     }
@@ -74,7 +57,6 @@ extension GenerationSettings {
         enableHR ? "×\(String(format: "%.1f", hrScale)) Hires" : "No Hires"
     }
 
-    /// Aplica el checkpoint y resolución preferidos de un personaje.
     mutating func applyCharacterDefaults(_ character: CharacterProfile) {
         if !character.preferredCheckpoint.isEmpty {
             checkpoint = character.preferredCheckpoint
@@ -83,11 +65,7 @@ extension GenerationSettings {
 }
 
 // MARK: - GeneratedAsset display helpers
-// GeneratedAsset está declarado en AssetStore.swift como NSManagedObject.
-// Solo se añaden computed helpers que NO existen allí.
-
 extension GeneratedAsset {
-
     var displayTitle: String {
         baseName ?? id?.uuidString.prefix(8).description ?? "Untitled"
     }
@@ -110,7 +88,7 @@ extension GeneratedAsset {
     var ageLabel: String {
         guard let date = createdAt else { return "—" }
         let secs = -date.timeIntervalSinceNow
-        if secs < 60    { return "Just now" }
+        if secs < 60  { return "Just now" }
         if secs < 3600  { return "\(Int(secs / 60))m ago" }
         if secs < 86400 { return "\(Int(secs / 3600))h ago" }
         return "\(Int(secs / 86400))d ago"
@@ -130,6 +108,11 @@ extension GeneratedAsset {
         tags = list.joined(separator: ",")
     }
 
+    var tagList: [String] {
+        guard let t = tags, !t.isEmpty else { return [] }
+        return t.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
+    }
+
     var absoluteImageURL: URL? {
         guard let path = imagePath,
               let root = VaultManager.shared.vaultRoot else { return nil }
@@ -141,26 +124,10 @@ extension GeneratedAsset {
               let root = VaultManager.shared.vaultRoot else { return nil }
         return root.appending(path: path)
     }
-
-    var loraWeights: [String: Double] {
-        guard let json = loraWeightsJSON,
-              let data = json.data(using: .utf8),
-              let dict = try? JSONDecoder().decode([String: Double].self, from: data)
-        else { return [:] }
-        return dict
-    }
-
-    var tagList: [String] {
-        guard let t = tags, !t.isEmpty else { return [] }
-        return t.split(separator: ",").map { $0.trimmingCharacters(in: .whitespace) }
-    }
 }
 
 // MARK: - AssetStore extra queries
-// assets(withStatus:) ya existe en AssetStore.swift. Solo se añaden los que faltan.
-
 extension AssetStore {
-
     func assets(forCharacter characterID: UUID, limit: Int = 100) -> [GeneratedAsset] {
         fetchAllAssets(limit: limit).filter { $0.characterID == characterID }
     }
@@ -197,12 +164,9 @@ extension AssetStore {
 }
 
 // MARK: - GPUPreCheckStatus typealias
-
 typealias GPUPreCheckStatus = GPUMonitor.PreCheckStatus
 
 // MARK: - SelectedLoRA Codable conformance
-// LoRAManager.swift declara SelectedLoRA: Identifiable sin Codable.
-
 extension SelectedLoRA: Codable {
     enum CodingKeys: String, CodingKey { case id, lora, weight }
 
@@ -222,11 +186,7 @@ extension SelectedLoRA: Codable {
 }
 
 // MARK: - Date extra helpers
-// shortDisplay y filenameDate ya existen en View_Helpers.swift. Solo se añaden los que faltan.
-
 extension Date {
-
-    /// "2 hours ago", "3d ago", etc. — NO existe en View_Helpers.swift
     var relativeLabel: String {
         let secs = -timeIntervalSinceNow
         switch secs {
@@ -234,11 +194,10 @@ extension Date {
         case ..<3600:    return "\(Int(secs / 60))m ago"
         case ..<86400:   return "\(Int(secs / 3600))h ago"
         case ..<604800:  return "\(Int(secs / 86400))d ago"
-        default:         return shortDisplay    // usa el de View_Helpers.swift
+        default:         return shortDisplay
         }
     }
 
-    /// "2025-03-13" (ISO date only, distinto de filenameDate que usa formato similar)
     var isoDateOnly: String {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
@@ -247,49 +206,26 @@ extension Date {
 }
 
 // MARK: - String extra helpers
-// truncated(_:) ya existe en View_Helpers.swift. Solo los que faltan.
-
 extension String {
-
     var isBlank: Bool { trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-
     var wordCount: Int { split(separator: " ").count }
-
     var tokenCount: Int { split(separator: ",").count }
 }
 
-// MARK: - UserDefaults Codable helpers
-
-extension UserDefaults {
-
-    func encode<T: Encodable>(_ value: T, forKey key: String) {
-        guard let data = try? JSONEncoder.compact.encode(value) else { return }
-        set(data, forKey: key)
-    }
-
-    func decode<T: Decodable>(_ type: T.Type, forKey key: String) -> T? {
-        guard let data = data(forKey: key) else { return nil }
-        return try? JSONDecoder.iso8601.decode(type, from: data)
-    }
-
-    func setDate(_ date: Date?, forKey key: String) {
-        if let date { set(date.timeIntervalSince1970, forKey: key) }
-        else        { removeObject(forKey: key) }
-    }
-
-    func date(forKey key: String) -> Date? {
-        let t = double(forKey: key)
-        return t > 0 ? Date(timeIntervalSince1970: t) : nil
-    }
-}
-
 // MARK: - ReusableSettings static factory
-// ReusableSettings struct y init(from asset:) ya existen en ReusableSettings.swift.
-// Solo se agrega el static factory que construye desde los campos sueltos.
-
 extension ReusableSettings {
-
     static func from(asset: GeneratedAsset) -> ReusableSettings {
-        ReusableSettings(from: asset)   // usa el init(from:) de ReusableSettings.swift
+        // Mapeo seguro y explícito de los valores del asset al struct.
+        ReusableSettings(
+            promptPositive: asset.promptPositive ?? "",
+            promptNegative: asset.promptNegative ?? "",
+            seed: Int(asset.seed),
+            steps: Int(asset.steps),
+            cfgScale: asset.cfgScale,
+            samplerName: asset.samplerName ?? "DPM++ 2M Karras",
+            width: Int(asset.width),
+            height: Int(asset.height),
+            checkpoint: asset.checkpoint ?? ""
+        )
     }
 }

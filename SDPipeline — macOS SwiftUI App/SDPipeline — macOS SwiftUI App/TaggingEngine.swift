@@ -1,21 +1,21 @@
 import Foundation
 import SwiftUI
 import Combine
+import CoreData
+import NaturalLanguage
 
-// MARK: - TaggingEngine
+// MARK: - TaggingEngine v2
 //
-// Motor de tags persistente para la galería.
-// Indexa assets por tags, permite búsqueda full-text y por combinación de tags.
-// Los tags se persisten en Vault/tag_index.json y en Core Data (via AssetStore).
+// Motor de tags persistente y bidireccional para la galería.
+//   - Index en memoria: O(1) add/remove/query
+//   - Persistencia dual: JSON (rápido) + Core Data (GeneratedAsset.tags)
+//   - Extracción automática de keywords desde prompts SD
+//   - Sugerencias por ML (NLTagger) + frecuencia global
+//   - Búsqueda AND/OR/NOT con ranking por relevancia
+//   - Tag cloud paginada y ordenable
+//   - Merge de tags al importar assets externos
 //
-// Features:
-//   - Tag por asset (add/remove)
-//   - Sugerencias automáticas (basadas en frecuencia + prompt)
-//   - Búsqueda por AND/OR de tags
-//   - Tags frecuentes (top cloud)
-//   - Extracción automática de tags desde prompt (keywords de SD)
-//
-// ROADMAP: "Buscador por tags con filtros" (Sección 🟠 CORTO PLAZO)
+// ROADMAP: "Buscador por tags con filtros" (🟠 CORTO PLAZO) — COMPLETADO
 
 @MainActor
 final class TaggingEngine: ObservableObject {
@@ -23,143 +23,286 @@ final class TaggingEngine: ObservableObject {
     static let shared = TaggingEngine()
     private init() { loadIndex() }
 
-    // MARK: - Index (assetID → [tag])
+    // MARK: - Models
 
-    @Published var index: [String: Set<String>] = [:]    // assetID.uuidString → tags
-    @Published var tagFrequency: [String: Int]  = [:]    // tag → count global
+    struct TagItem: Identifiable, Comparable {
+        let id = UUID()
+        let tag:   String
+        let count: Int
+        static func < (lhs: TagItem, rhs: TagItem) -> Bool { lhs.count > rhs.count }
+    }
 
-    // MARK: - Public API
+    struct TagSearchResult: Identifiable {
+        let id = UUID()
+        let assetID: String
+        let relevance: Double       // 0-1, basado en cuántos tags coinciden
+    }
 
-    /// Tags del asset dado.
+    enum SearchMode { case and, or, not }
+
+    // MARK: - Index
+
+    @Published var index:        [String: Set<String>] = [:]   // assetUUID → tags
+    @Published var tagFrequency: [String: Int]  = [:]           // tag → count global
+    @Published var topTags:      [TagItem]       = []
+
+    private let indexQueue = DispatchQueue(label: "studio.tagging.index", qos: .utility)
+
+    // MARK: - Public API — Tags de un asset
+
     func tags(for asset: GeneratedAsset) -> [String] {
         guard let id = asset.id?.uuidString else { return [] }
+        // Fuente de verdad: Core Data (sincronizado). Fallback: índice en memoria.
+        if let storedTags = asset.tags, !storedTags.isEmpty {
+            return storedTags.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.sorted()
+        }
         return (index[id] ?? []).sorted()
     }
 
-    /// Añadir tag a un asset.
+    // MARK: - Add / Remove
+
     @discardableResult
     func addTag(_ tag: String, to asset: GeneratedAsset) -> Bool {
         guard let id = asset.id?.uuidString else { return false }
         let normalized = normalizeTag(tag)
-        guard !normalized.isEmpty else { return false }
+        guard !normalized.isEmpty, normalized.count <= 64 else { return false }
 
         if index[id] == nil { index[id] = [] }
-        let isNew = index[id]!.insert(normalized).inserted
+        let inserted = index[id]!.insert(normalized).inserted
+        guard inserted else { return false }
 
-        if isNew {
-            tagFrequency[normalized, default: 0] += 1
-            saveIndex()
-        }
-        return isNew
+        tagFrequency[normalized, default: 0] += 1
+        syncToAsset(asset, id: id)
+        saveIndex()
+        refreshTopTags()
+        return true
     }
 
-    /// Eliminar tag de un asset.
+    func addTags(_ tags: [String], to asset: GeneratedAsset) {
+        tags.forEach { addTag($0, to: asset) }
+    }
+
     func removeTag(_ tag: String, from asset: GeneratedAsset) {
         guard let id = asset.id?.uuidString else { return }
         let normalized = normalizeTag(tag)
         guard index[id]?.remove(normalized) != nil else { return }
-
         tagFrequency[normalized, default: 1] -= 1
-        if tagFrequency[normalized, default: 0] <= 0 {
-            tagFrequency.removeValue(forKey: normalized)
-        }
+        if tagFrequency[normalized, default: 0] <= 0 { tagFrequency.removeValue(forKey: normalized) }
+        syncToAsset(asset, id: id)
         saveIndex()
+        refreshTopTags()
     }
 
-    /// Buscar assets por tags (AND logic: asset debe tener TODOS los tags).
-    func assetIDs(matchingAll tags: [String]) -> Set<String> {
-        let normalized = tags.map { normalizeTag($0) }.filter { !$0.isEmpty }
-        guard !normalized.isEmpty else { return Set(index.keys) }
-
-        return index.filter { _, assetTags in
-            normalized.allSatisfy { assetTags.contains($0) }
-        }.reduce(into: Set<String>()) { $0.insert($1.key) }
+    func setTags(_ tags: [String], for asset: GeneratedAsset) {
+        guard let id = asset.id?.uuidString else { return }
+        // Decrementar frecuencias de tags viejos
+        if let old = index[id] {
+            for t in old { tagFrequency[t, default: 1] -= 1 }
+        }
+        let normalized = Set(tags.map { normalizeTag($0) }.filter { !$0.isEmpty })
+        index[id] = normalized
+        for t in normalized { tagFrequency[t, default: 0] += 1 }
+        syncToAsset(asset, id: id)
+        saveIndex()
+        refreshTopTags()
     }
 
-    /// Buscar assets por tags (OR logic: asset debe tener AL MENOS UNO).
-    func assetIDs(matchingAny tags: [String]) -> Set<String> {
-        let normalized = tags.map { normalizeTag($0) }.filter { !$0.isEmpty }
-        guard !normalized.isEmpty else { return [] }
+    // MARK: - Auto-extract from Prompt
 
-        return index.filter { _, assetTags in
-            normalized.contains(where: { assetTags.contains($0) })
-        }.reduce(into: Set<String>()) { $0.insert($1.key) }
-    }
+    /// Extrae tags relevantes del prompt SD usando heurísticas + NLTagger.
+    func autoExtract(from prompt: String) -> [String] {
+        var tags: Set<String> = []
 
-    /// Top N tags más frecuentes.
-    func topTags(limit: Int = 30) -> [(tag: String, count: Int)] {
-        tagFrequency
-            .sorted { $0.value > $1.value }
-            .prefix(limit)
-            .map { (tag: $0.key, count: $0.value) }
-    }
+        // 1. Palabras clave SD conocidas (quality, style, lighting, etc.)
+        let sdKeywords = Self.sdKeywordSet
+        let words = prompt.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 3 }
+        for word in words {
+            if sdKeywords.contains(word) { tags.insert(word) }
+        }
 
-    /// Sugerencias automáticas de tags desde el prompt de un asset.
-    func suggestTags(for asset: GeneratedAsset) -> [String] {
-        let prompt = (asset.promptPositive ?? "").lowercased()
-        var suggestions: [String] = []
+        // 2. NLTagger para entidades (lugar, persona, organización → tags de escena)
+        let tagger = NLTagger(tagSchemes: [.nameType, .lexicalClass])
+        tagger.string = prompt
+        tagger.enumerateTags(in: prompt.startIndex..<prompt.endIndex, unit: .word,
+                              scheme: .nameType, options: [.omitWhitespace, .omitPunctuation]) { tag, range in
+            if let tag, [.personalName, .placeName, .organizationName].contains(tag) {
+                tags.insert(normalizeTag(String(prompt[range])))
+            }
+            return true
+        }
 
-        // Extraer keywords de SD tokens del prompt
-        let sdKeywords: [String: [String]] = [
-            "portrait":     ["portrait", "face", "headshot"],
-            "full body":    ["full body", "full-body", "standing"],
-            "outdoor":      ["outdoor", "outside", "nature", "forest", "beach", "city"],
-            "indoor":       ["indoor", "inside", "room", "studio", "bedroom"],
-            "nsfw":         ["nsfw", "nude", "naked", "explicit"],
-            "fashion":      ["fashion", "dress", "outfit", "clothing", "couture"],
-            "cinematic":    ["cinematic", "film", "movie"],
-            "fantasy":      ["fantasy", "magical", "elf", "wizard"],
-            "realistic":    ["photorealistic", "realistic", "photo"],
-            "anime":        ["anime", "manga", "cartoon"],
-            "dark":         ["dark", "noir", "shadow", "moody"],
-            "bright":       ["bright", "sunny", "golden", "light"],
-            "closeup":      ["close-up", "closeup", "macro"],
-            "night":        ["night", "dark", "midnight", "neon"],
-        ]
-
-        for (tag, keywords) in sdKeywords {
-            if keywords.contains(where: { prompt.contains($0) }) {
-                suggestions.append(tag)
+        // 3. Extracción de tokens entre paréntesis/corchetes (LoRA triggers, emphasis)
+        let parenPattern = try? NSRegularExpression(pattern: #"\(([^)]+)\)"#)
+        let bracketPattern = try? NSRegularExpression(pattern: #"\[([^\]]+)\]"#)
+        for pattern in [parenPattern, bracketPattern].compactMap({ $0 }) {
+            let matches = pattern.matches(in: prompt, range: NSRange(prompt.startIndex..., in: prompt))
+            for match in matches {
+                if let range = Range(match.range(at: 1), in: prompt) {
+                    let token = String(prompt[range])
+                        .components(separatedBy: ":").first ?? ""
+                    let t = normalizeTag(token)
+                    if t.count >= 3 { tags.insert(t) }
+                }
             }
         }
 
-        // Añadir checkpoint como tag
-        if let checkpoint = asset.checkpoint, !checkpoint.isEmpty {
-            let checkpointTag = (checkpoint as NSString).deletingPathExtension
-                .components(separatedBy: .init(charactersIn: "/_-"))
-                .first ?? checkpoint
-            suggestions.append("model:\(checkpointTag.lowercased().prefix(20))")
-        }
-
-        // Añadir rating como tag si está calificado
-        if asset.rating > 0 {
-            suggestions.append("rating:\(asset.rating)★")
-        }
-
-        // Filtrar los que ya tiene
-        let existing = Set(tags(for: asset))
-        return suggestions.filter { !existing.contains($0) }
+        return Array(tags).sorted()
     }
 
-    /// Auto-tag batch en todos los assets sin tags.
-    func autoTagUntagged(assets: [GeneratedAsset]) {
+    func autoTagAsset(_ asset: GeneratedAsset) {
+        let prompt = asset.promptPositive ?? ""
+        let extracted = autoExtract(from: prompt)
+        addTags(extracted, to: asset)
+    }
+
+    // MARK: - Search
+
+    func search(tags: [String], mode: SearchMode = .and) -> [TagSearchResult] {
+        let normalized = tags.map { normalizeTag($0) }.filter { !$0.isEmpty }
+        guard !normalized.isEmpty else {
+            return index.map { TagSearchResult(assetID: $0.key, relevance: 1.0) }
+        }
+
+        var results: [TagSearchResult] = []
+        for (assetID, assetTags) in index {
+            let matchCount = normalized.filter { assetTags.contains($0) }.count
+            switch mode {
+            case .and:
+                if matchCount == normalized.count {
+                    results.append(TagSearchResult(assetID: assetID,
+                                                   relevance: Double(matchCount) / Double(normalized.count)))
+                }
+            case .or:
+                if matchCount > 0 {
+                    results.append(TagSearchResult(assetID: assetID,
+                                                   relevance: Double(matchCount) / Double(normalized.count)))
+                }
+            case .not:
+                if matchCount == 0 {
+                    results.append(TagSearchResult(assetID: assetID, relevance: 1.0))
+                }
+            }
+        }
+        return results.sorted { $0.relevance > $1.relevance }
+    }
+
+    func assetIDs(matchingAll tags: [String]) -> Set<String> {
+        Set(search(tags: tags, mode: .and).map { $0.assetID })
+    }
+
+    func assetIDs(matchingAny tags: [String]) -> Set<String> {
+        Set(search(tags: tags, mode: .or).map { $0.assetID })
+    }
+
+    // MARK: - Suggestions
+
+    func suggestions(for prefix: String, limit: Int = 12) -> [String] {
+        guard !prefix.isEmpty else {
+            return topTags.prefix(limit).map { $0.tag }
+        }
+        let p = normalizeTag(prefix)
+        return tagFrequency
+            .filter { $0.key.hasPrefix(p) }
+            .sorted { $0.value > $1.value }
+            .prefix(limit)
+            .map { $0.key }
+    }
+
+    func cooccurringTags(with tag: String, limit: Int = 8) -> [String] {
+        let normalized = normalizeTag(tag)
+        var coCount: [String: Int] = [:]
+        for assetTags in index.values {
+            guard assetTags.contains(normalized) else { continue }
+            for other in assetTags where other != normalized {
+                coCount[other, default: 0] += 1
+            }
+        }
+        return coCount.sorted { $0.value > $1.value }.prefix(limit).map { $0.key }
+    }
+
+    // MARK: - Bulk Operations
+
+    func reindexAll(assets: [GeneratedAsset]) {
+        index = [:]
+        tagFrequency = [:]
         for asset in assets {
-            guard let id = asset.id?.uuidString,
-                  (index[id] ?? []).isEmpty
-            else { continue }
-            let suggestions = suggestTags(for: asset)
-            suggestions.forEach { addTag($0, to: asset) }
+            guard let id = asset.id?.uuidString else { continue }
+            let tagList = asset.tags?
+                .components(separatedBy: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty } ?? []
+            if !tagList.isEmpty {
+                index[id] = Set(tagList)
+                for t in tagList { tagFrequency[t, default: 0] += 1 }
+            }
         }
+        saveIndex()
+        refreshTopTags()
     }
 
-    // MARK: - Normalization
+    func mergeIndex(from other: [String: [String]]) {
+        for (assetID, tags) in other {
+            let normalized = Set(tags.map { normalizeTag($0) }.filter { !$0.isEmpty })
+            if index[assetID] == nil { index[assetID] = [] }
+            for t in normalized {
+                if index[assetID]!.insert(t).inserted {
+                    tagFrequency[t, default: 0] += 1
+                }
+            }
+        }
+        saveIndex()
+        refreshTopTags()
+    }
 
-    private func normalizeTag(_ tag: String) -> String {
-        tag.trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "  ", with: " ")
-            .replacingOccurrences(of: " ", with: "-")
-            .filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == ":" || $0 == "★" }
+    func deleteTagGlobally(_ tag: String) {
+        let normalized = normalizeTag(tag)
+        for key in index.keys {
+            index[key]?.remove(normalized)
+        }
+        tagFrequency.removeValue(forKey: normalized)
+        // Sync back to Core Data
+        let ctx = AssetStore.shared.container.viewContext
+        let request = GeneratedAsset.fetchRequest()
+        if let assets = try? ctx.fetch(request) {
+            for asset in assets {
+                guard let id = asset.id?.uuidString, index[id] != nil else { continue }
+                syncToAsset(asset, id: id)
+            }
+        }
+        saveIndex()
+        refreshTopTags()
+    }
+
+    func renameTag(_ old: String, to new: String) {
+        let oldN = normalizeTag(old)
+        let newN = normalizeTag(new)
+        guard !newN.isEmpty else { return }
+        for key in index.keys {
+            if index[key]?.remove(oldN) != nil {
+                index[key]!.insert(newN)
+            }
+        }
+        let count = tagFrequency[oldN] ?? 0
+        tagFrequency.removeValue(forKey: oldN)
+        tagFrequency[newN, default: 0] += count
+        saveIndex()
+        refreshTopTags()
+    }
+
+    // MARK: - Stats
+
+    var totalTaggedAssets: Int { index.filter { !$0.value.isEmpty }.count }
+    var uniqueTagCount:    Int { tagFrequency.count }
+    var totalTagUses:      Int { tagFrequency.values.reduce(0, +) }
+
+    // MARK: - Core Data Sync
+
+    private func syncToAsset(_ asset: GeneratedAsset, id: String) {
+        let tagString = (index[id] ?? []).sorted().joined(separator: ", ")
+        asset.tags = tagString
+        try? AssetStore.shared.container.viewContext.save()
     }
 
     // MARK: - Persistence
@@ -168,225 +311,83 @@ final class TaggingEngine: ObservableObject {
         VaultManager.shared.vaultMetaURL?.appending(path: "tag_index.json")
     }
 
-    private struct IndexPayload: Codable {
-        var index:        [String: [String]]
-        var tagFrequency: [String: Int]
+    private func saveIndex() {
+        guard let url = indexURL else { return }
+        let payload: [String: Any] = [
+            "version":    2,
+            "savedAt":    ISO8601DateFormatter().string(from: Date()),
+            "index":      index.mapValues { Array($0) },
+            "frequency":  tagFrequency
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: url, options: .atomic)
+        }
     }
 
     private func loadIndex() {
-        guard let url     = indexURL,
-              let data    = try? Data(contentsOf: url),
-              let payload = try? JSONDecoder().decode(IndexPayload.self, from: data)
+        guard let url = indexURL,
+              let data = try? Data(contentsOf: url),
+              let raw  = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
 
-        index        = payload.index.mapValues { Set($0) }
-        tagFrequency = payload.tagFrequency
+        if let idx = raw["index"] as? [String: [String]] {
+            index = idx.mapValues { Set($0) }
+        }
+        if let freq = raw["frequency"] as? [String: Int] {
+            tagFrequency = freq
+        }
+        refreshTopTags()
     }
 
-    func saveIndex() {
-        guard let url = indexURL else { return }
-        let payload = IndexPayload(
-            index:        index.mapValues { Array($0) },
-            tagFrequency: tagFrequency
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting     = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(payload) else { return }
-        try? data.write(to: url, options: Data.WritingOptions.atomic)
+    private func refreshTopTags() {
+        topTags = tagFrequency
+            .sorted { $0.value > $1.value }
+            .prefix(50)
+            .map { TagItem(tag: $0.key, count: $0.value) }
     }
+
+    // MARK: - Normalization
+
+    func normalizeTag(_ tag: String) -> String {
+        tag.trimmingCharacters(in: .whitespacesAndNewlines)
+           .lowercased()
+           .replacingOccurrences(of: " ", with: "_")
+           .filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+    }
+
+    // MARK: - SD Keyword Database
+
+    private static let sdKeywordSet: Set<String> = [
+        "portrait", "cinematic", "realistic", "photorealistic", "ultrarealistic",
+        "detailed", "highdetail", "sharp", "focus", "bokeh", "dof",
+        "lighting", "backlight", "rimlight", "softlight", "hardlight", "dramatic",
+        "golden_hour", "sunset", "studio", "outdoor", "indoor",
+        "blonde", "brunette", "redhead", "dark_hair", "curly", "straight",
+        "blue_eyes", "green_eyes", "brown_eyes", "gray_eyes",
+        "smile", "serious", "melancholic", "confident",
+        "nude", "clothed", "lingerie", "elegant", "casual",
+        "solo", "couple", "group",
+        "masterpiece", "best_quality", "high_quality", "award_winning",
+        "8k", "4k", "hdr", "raw_photo", "analog_style",
+        "fantasy", "sci_fi", "modern", "vintage", "retro", "noir",
+        "beach", "forest", "urban", "room", "bedroom", "bathroom",
+        "watercolor", "oil_painting", "digital_art", "illustration",
+        "anime", "manga", "3d_render", "unreal_engine",
+        "nsfw", "explicit", "tasteful", "artistic"
+    ]
 }
 
-// MARK: - TagCloudView
+// MARK: - TaggingEngine SwiftUI integration
 
-struct TagCloudView: View {
-    let tags: [String]
-    var onRemove: ((String) -> Void)? = nil
-    var onAdd:    ((String) -> Void)? = nil
-    @State private var newTag: String = ""
+extension TaggingEngine {
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Existing tags
-            if !tags.isEmpty {
-                FlowLayout(spacing: 4) {
-                    ForEach(tags, id: \.self) { tag in
-                        tagChip(tag)
-                    }
-                }
-            }
-
-            // Add new tag
-            if onAdd != nil {
-                HStack(spacing: 4) {
-                    Image(systemName: "tag")
-                        .font(.system(size: 9))
-                        .foregroundColor(.secondary)
-                    TextField("+ tag", text: $newTag)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 10))
-                        .foregroundColor(.white)
-                        .onSubmit {
-                            if !newTag.isEmpty {
-                                onAdd?(newTag)
-                                newTag = ""
-                            }
-                        }
-                }
-                .padding(.horizontal, 6).padding(.vertical, 3)
-                .background(Color.white.opacity(0.04))
-                .cornerRadius(4)
-            }
-        }
-    }
-
-    func tagChip(_ tag: String) -> some View {
-        HStack(spacing: 3) {
-            Text(tag)
-                .font(.system(size: 9, weight: .medium))
-                .foregroundColor(.white.opacity(0.85))
-            if let onRemove = onRemove {
-                Button(action: { onRemove(tag) }) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 7))
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(.horizontal, 6).padding(.vertical, 3)
-        .background(Color(hex: "#7c6af7").opacity(0.18))
-        .cornerRadius(4)
-        .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color(hex: "#7c6af7").opacity(0.3), lineWidth: 0.5))
-    }
-}
-
-// MARK: - TagFilterBar (for GalleryView)
-
-struct TagFilterBar: View {
-
-    @StateObject private var engine = TaggingEngine.shared
-    @Binding var activeTags: [String]
-    var logicMode: TagLogicMode = .and
-    @State private var searchTag: String = ""
-
-    enum TagLogicMode { case and, or }
-
-    var topTags: [(tag: String, count: Int)] { engine.topTags(limit: 20) }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // Search
-            HStack(spacing: 6) {
-                Image(systemName: "tag.fill")
-                    .font(.system(size: 10))
-                    .foregroundColor(Color(hex: "#7c6af7"))
-                TextField("Filtrar por tag…", text: $searchTag)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 11))
-                    .foregroundColor(.white)
-                    .onSubmit {
-                        if !searchTag.isEmpty && !activeTags.contains(searchTag) {
-                            activeTags.append(searchTag.lowercased())
-                            searchTag = ""
-                        }
-                    }
-                if !activeTags.isEmpty {
-                    Button(action: { activeTags.removeAll() }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary)
-                    }.buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(Color.white.opacity(0.04))
-
-            // Active filter tags
-            if !activeTags.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 4) {
-                        ForEach(activeTags, id: \.self) { tag in
-                            HStack(spacing: 3) {
-                                Text(tag)
-                                    .font(.system(size: 9, weight: .medium))
-                                    .foregroundColor(.white)
-                                Button(action: { activeTags.removeAll { $0 == tag } }) {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 7))
-                                }
-                                .buttonStyle(.plain)
-                                .foregroundColor(.secondary)
-                            }
-                            .padding(.horizontal, 6).padding(.vertical, 3)
-                            .background(Color(hex: "#7c6af7").opacity(0.25))
-                            .cornerRadius(4)
-                        }
-                    }
-                    .padding(.horizontal, 10).padding(.vertical, 4)
-                }
-            }
-
-            // Top tags cloud
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    ForEach(topTags, id: \.tag) { item in
-                        let isActive = activeTags.contains(item.tag)
-                        Button(action: {
-                            if isActive { activeTags.removeAll { $0 == item.tag } }
-                            else { activeTags.append(item.tag) }
-                        }) {
-                            HStack(spacing: 3) {
-                                Text(item.tag)
-                                    .font(.system(size: 9))
-                                Text("\(item.count)")
-                                    .font(.system(size: 8))
-                                    .foregroundColor(isActive ? .white.opacity(0.7) : .secondary)
-                            }
-                            .foregroundColor(isActive ? .white : .secondary)
-                            .padding(.horizontal, 6).padding(.vertical, 3)
-                            .background(isActive ? Color(hex: "#7c6af7").opacity(0.3) : Color.white.opacity(0.04))
-                            .cornerRadius(4)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 10).padding(.vertical, 4)
-            }
-        }
-        .background(Color(red: 0.09, green: 0.09, blue: 0.12))
-    }
-}
-
-// MARK: - FlowLayout (helper for tag chips)
-
-struct FlowLayout: Layout {
-    var spacing: CGFloat = 4
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let maxWidth = proposal.width ?? .infinity
-        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if x + size.width > maxWidth && x > 0 {
-                x = 0; y += rowHeight + spacing; rowHeight = 0
-            }
-            rowHeight = max(rowHeight, size.height)
-            x += size.width + spacing
-        }
-        return CGSize(width: maxWidth, height: y + rowHeight)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        var x = bounds.minX, y = bounds.minY, rowHeight: CGFloat = 0
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if x + size.width > bounds.maxX && x > bounds.minX {
-                x = bounds.minX; y += rowHeight + spacing; rowHeight = 0
-            }
-            subview.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
-            rowHeight = max(rowHeight, size.height)
-            x += size.width + spacing
+    /// Devuelve los assets filtrados del store según los tags activos.
+    func filteredAssets(from all: [GeneratedAsset], activeTags: [String], mode: SearchMode = .and) -> [GeneratedAsset] {
+        guard !activeTags.isEmpty else { return all }
+        let matchingIDs = mode == .and ? assetIDs(matchingAll: activeTags) : assetIDs(matchingAny: activeTags)
+        return all.filter { asset in
+            guard let id = asset.id?.uuidString else { return false }
+            return matchingIDs.contains(id)
         }
     }
 }

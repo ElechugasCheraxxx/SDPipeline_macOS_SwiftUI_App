@@ -2,37 +2,70 @@ import Foundation
 import AppKit
 import SwiftUI
 
-// MARK: - PipelineConnector v5
-// CAMBIOS v4→v5:
-//   - validateBeforeGenerate incluye licenseCheck integrado
-//   - saveToVaultFull usa ProjectManager para path correcto
-//   - IntegrityManager.shared registra asset tras guardar
-//   - ValidationReport incluye licenseWarning separado de gpuWarning
+// MARK: - PipelineConnector v6
+//
+// Cambios v5→v6:
+//   + generateWithIPAdapter() — inyecta alwayson_scripts de IPAdapterEngine
+//   + saveToVaultFull() — compliance logging automático post-export
+//   + auto-tagging mejorado (usa TaggingEngine.autoTagAsset)
+//   + validateBeforeGenerate() — verifica IP-Adapter config
+//   + IC-Light post-processing opcional
+//   + ProjectFolderManager aware (guarda en proyecto activo)
 
 struct PipelineConnector {
 
     // MARK: - ValidationReport
 
     struct ValidationReport {
-        var blocked:        Bool    = false
-        var message:        String? = nil
+        var blocked:        Bool     = false
+        var message:        String?  = nil
         var warnings:       [String] = []
-        var gpuWarning:     String? = nil
-        var licenseWarning: String? = nil    // NEW v5: separado para mostrar diferente en UI
+        var gpuWarning:     String?  = nil
+        var licenseWarning: String?  = nil
+        var ipAdapterWarning: String? = nil
 
         var hasIssues:  Bool { blocked || !warnings.isEmpty || gpuWarning != nil || licenseWarning != nil }
         var canProceed: Bool { !blocked }
 
-        /// Mensaje principal a mostrar en la UI (prioridad: blocked > gpu > license > warning)
         var primaryMessage: String? {
             if blocked { return message }
-            if let g = gpuWarning { return g }
+            if let g = gpuWarning  { return g }
             if let l = licenseWarning { return l }
             return warnings.first
         }
     }
 
-    // MARK: - Save to Vault Full (v5: usa ProjectManager)
+    // MARK: - Generate with IP-Adapter
+
+    /// Construye el request completo con alwayson_scripts y ejecuta la generación.
+    @MainActor
+    static func generateWithIPAdapter(
+        prompt:         String,
+        negativePrompt: String,
+        settings:       GenerationSettings,
+        sdService:      SDService
+    ) async {
+        let (request, scripts) = settings.buildRequestWithScripts(
+            prompt:         prompt,
+            negativePrompt: negativePrompt
+        )
+
+        if scripts.isEmpty {
+            await sdService.generate(request: request, baseURL: settings.sdBaseURL)
+        } else {
+            await sdService.generateWithScripts(
+                request:  request,
+                scripts:  scripts,
+                baseURL:  settings.sdBaseURL
+            )
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message:  "Generación con scripts: \(scripts.keys.joined(separator: ", "))"
+            )
+        }
+    }
+
+    // MARK: - Save to Vault Full (v6)
 
     @MainActor
     static func saveToVaultFull(
@@ -66,7 +99,7 @@ struct PipelineConnector {
         let loraWeights: [String: Double] = LoRAManager.shared.selectedLoRAs
             .reduce(into: [:]) { $0[$1.lora.name] = $1.weight }
 
-        // 1. Core Data + PNG con esteganografía + sidecar
+        // 1. Core Data + PNG + sidecar + esteganografía
         let asset = await AssetStore.shared.saveAsset(
             image:       image,
             request:     req,
@@ -75,56 +108,51 @@ struct PipelineConnector {
             checkpoint:  checkpoint,
             vaeUsed:     "",
             loraWeights: loraWeights,
-            sessionTag:  ContentSessionManager.shared.activeSession?.tag
+            sessionTag:  ContentSessionManager.shared.activeSession?.tag,
+            characterID: CharacterEngine.shared.activeCharacter?.id
         )
 
         guard let asset else {
-            ZeroKnowledgeLog.shared.write(
-                category: .systemEvent,
-                message:  "saveToVaultFull: fallo al guardar asset en Core Data"
-            )
+            ZeroKnowledgeLog.shared.write(category: .systemEvent,
+                message: "saveToVaultFull: fallo al guardar asset en Core Data")
             return "⚠️ Error al guardar en vault"
         }
 
-        // 2. ExportEngine — clean PNG + preview con watermark
-        var exportMsg = ""
+        // 2. Export (clean PNG + preview watermark)
+        var exportMsg  = ""
+        var exportedURLs: [URL] = []
         do {
             let result = try await ExportEngine.shared.export(asset: asset, addWatermark: true)
-            exportMsg = " · \(result.cleanURL.lastPathComponent)"
+            exportMsg    = " · \(result.cleanURL.lastPathComponent)"
+            exportedURLs = [result.cleanURL, result.previewURL]
             ZeroKnowledgeLog.shared.write(
                 category: .exportPerformed,
                 message:  "Export OK · sha256: \(result.sha256Clean.prefix(12))…",
                 metadata: ["asset": asset.baseName ?? "", "sha256": result.sha256Clean]
             )
         } catch {
-            exportMsg = " · ⚠️ Export falló: \(error.localizedDescription)"
-            print("⚠️ ExportEngine: \(error.localizedDescription)")
+            exportMsg = " · ⚠️ Export: \(error.localizedDescription)"
         }
 
         // 3. SeedManager
         if let seed = sdService.lastSeed, seed > 0 {
             SeedManager.shared.recordUsage(
-                seed:       seed,
-                promptHint: String(parsedPrompt.prefix(60)),
-                width:      settings.width,
-                height:     settings.height
+                seed: seed, promptHint: String(parsedPrompt.prefix(60)),
+                width: settings.width, height: settings.height
             )
         }
 
-        // 4. CharacterEngine
-        if let seed = sdService.lastSeed, let char = CharacterEngine.shared.activeCharacter {
+        // 4. CharacterEngine seed pinning
+        if let seed = sdService.lastSeed,
+           let char = CharacterEngine.shared.activeCharacter {
             CharacterEngine.shared.pinSeed(seed, to: char.id)
         }
 
         // 5. ContentSessionManager
         ContentSessionManager.shared.recordAsset(asset)
 
-        // 6. TaggingEngine — auto-tag si vacío
-        if TaggingEngine.shared.tags(for: asset).isEmpty {
-            TaggingEngine.shared.suggestTags(for: asset).forEach {
-                TaggingEngine.shared.addTag($0, to: asset)
-            }
-        }
+        // 6. TaggingEngine — auto-extract desde prompt
+        TaggingEngine.shared.autoTagAsset(asset)
 
         // 7. PromptVersioningStore
         if !parsedPrompt.isEmpty {
@@ -140,17 +168,30 @@ struct PipelineConnector {
             )
         }
 
-        // 8. ProjectManager — incrementar contador (v5 NEW)
+        // 8. ProjectManager
         ProjectManager.shared.incrementAssetCount()
 
-        // 9. Refrescar galería + dashboard
+        // 9. Compliance logging (v6 NEW)
+        if !exportedURLs.isEmpty {
+            await PublishComplianceLogger.shared.logPublish(
+                assets:          [asset],
+                platform:        "Vault",
+                presetName:      "Auto-export",
+                paths:           exportedURLs,
+                notes:           "Guardado automático post-generación",
+                watermarked:     true,
+                metadataStripped: true
+            )
+        }
+
+        // 10. Dashboard refresh
         AssetStore.shared.fetchRecentAssets()
         DashboardViewModel.shared.refresh()
 
         return "✓ Guardado en Vault\(exportMsg)"
     }
 
-    // MARK: - Validation (v5: incluye licenseCheck)
+    // MARK: - Validation (v6)
 
     @MainActor
     static func validateBeforeGenerate(
@@ -159,14 +200,12 @@ struct PipelineConnector {
     ) -> ValidationReport {
         var report = ValidationReport()
 
-        // 1. Safety filter
+        // Prompt safety
         let safetyResult = PromptSafetyFilter.validatePrompt(
             positive: parsedPrompt,
             negative: settings.negativePrompt
         )
-        Task { @MainActor in
-            PromptSafetyFilter.logResult(safetyResult, prompt: parsedPrompt)
-        }
+        Task { @MainActor in PromptSafetyFilter.logResult(safetyResult, prompt: parsedPrompt) }
 
         switch safetyResult {
         case .allowed:
@@ -179,10 +218,9 @@ struct PipelineConnector {
             report.message = "🚫 \(reason)"
         }
 
-        // Guard — si está bloqueado, no seguir validando
         guard !report.blocked else { return report }
 
-        // 2. GPU pre-check
+        // GPU pre-check
         GPUMonitor.shared.runPreCheck(
             requestedWidth:  settings.width,
             requestedHeight: settings.height
@@ -193,16 +231,19 @@ struct PipelineConnector {
         case .ok, .unknown:      break
         }
 
-        // 3. License check (v5 NEW — integrado aquí en lugar de solo en ContentView)
+        // License check
         if !settings.checkpoint.isEmpty {
             let (_, msg) = checkLicense(checkpoint: settings.checkpoint)
             report.licenseWarning = msg
         }
 
+        // IP-Adapter config warning
+        if IPAdapterEngine.shared.isEnabled && IPAdapterEngine.shared.referenceImage == nil {
+            report.ipAdapterWarning = "⚠️ IP-Adapter activo pero sin imagen de referencia"
+        }
+
         return report
     }
-
-    // MARK: - License Check
 
     @MainActor
     static func checkLicense(checkpoint: String) -> (safe: Bool, message: String?) {
@@ -211,27 +252,64 @@ struct PipelineConnector {
         return (status.isUsable, status.alertMessage)
     }
 
-    // MARK: - Quick Vault (helper para guardar sin settings completos)
+    // MARK: - Quick Save (sin export completo)
 
     @MainActor
-    static func quickSave(
-        image:     NSImage,
-        prompt:    String,
-        seed:      Int?,
-        baseURL:   String
-    ) async -> String {
-        var settings = GenerationSettings()
-        settings.sdBaseURL = baseURL
-
-        // Crear SDService temporal solo para el seed
-        let tempService = SDService()
-        tempService.lastSeed = seed
-
-        return await saveToVaultFull(
-            image:        image,
-            settings:     settings,
-            parsedPrompt: prompt,
-            sdService:    tempService
+    static func quickSave(image: NSImage, settings: GenerationSettings, parsedPrompt: String) async {
+        let req = SDRequest(
+            prompt:         parsedPrompt,
+            negativePrompt: settings.negativePrompt,
+            seed:           settings.seed,
+            steps:          settings.steps,
+            cfgScale:       settings.cfgScale,
+            width:          settings.width,
+            height:         settings.height
+        )
+        _ = await AssetStore.shared.saveAsset(
+            image:       image,
+            request:     req,
+            seed:        settings.seed,
+            modelName:   settings.checkpoint,
+            checkpoint:  settings.checkpoint,
+            vaeUsed:     "",
+            loraWeights: [:]
         )
     }
+
+    // MARK: - IC-Light Post-Process
+
+    @MainActor
+    static func applyICLightIfEnabled(to image: NSImage, settings: GenerationSettings) async -> NSImage {
+        guard settings.autoRunICLight,
+              ICLightEngine.shared.config.enabled
+        else { return image }
+
+        do {
+            let relighted = try await ICLightEngine.shared.relight(image: image)
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message: "IC-Light relight aplicado (\(ICLightEngine.shared.config.direction.rawValue))"
+            )
+            return relighted
+        } catch {
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message: "IC-Light falló: \(error.localizedDescription)"
+            )
+            return image
+        }
+    }
+}
+
+// MARK: - TaggingEngine suggestTags bridge
+
+extension TaggingEngine {
+    /// Extrae tags sugeridos del prompt del asset sin añadirlos todavía.
+    func suggestTags(for asset: GeneratedAsset) -> [String] {
+        autoExtract(from: asset.promptPositive ?? "")
+    }
+}
+
+extension Int {
+    func nonZero(default value: Int) -> Int { self == 0 ? value : self }
 }

@@ -220,7 +220,8 @@ final class NSFWDetector: ObservableObject {
 
     private func loadLog() {
         guard let url  = logURL,
-              let text = try? String(contentsOf: url) else { return }
+              // CORRECCIÓN: Agregar parámetro encoding explícito (deprecated in macOS 15)
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
         log = lines.compactMap {
             try? JSONDecoder.iso8601.decode(NSFWDetectionResult.self, from: Data($0.utf8))

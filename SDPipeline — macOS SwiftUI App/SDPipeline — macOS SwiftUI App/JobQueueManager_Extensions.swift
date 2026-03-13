@@ -56,7 +56,7 @@ extension JobQueueManager {
     }
 }
 
-// MARK: - Asset-based job creation
+// MARK: - Asset-based job creation (CORREGIDO)
 
 extension JobQueueManager {
 
@@ -70,7 +70,8 @@ extension JobQueueManager {
             priority:   priority,
             sessionTag: asset.sessionTag
         )
-        return enqueue(job)
+        enqueue(job)
+        return job
     }
 
     /// Enqueue a scheduled backup job.
@@ -82,7 +83,8 @@ extension JobQueueManager {
             settings: .default,
             priority: priority
         )
-        return enqueue(job)
+        enqueue(job)
+        return job
     }
 
     /// Enqueue an integrity scan job.
@@ -94,7 +96,8 @@ extension JobQueueManager {
             settings: .default,
             priority: .low
         )
-        return enqueue(job)
+        enqueue(job)
+        return job
     }
 }
 

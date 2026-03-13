@@ -11,8 +11,6 @@ import Combine
 // Aplica efectos de grano, bloom, aberración cromática, viñeta y LUTs.
 // Los filtros son no-destructivos y se aplican en cascada.
 // Se integra con PostProductionEngine y el panel de output.
-//
-// ROADMAP: "Filtros cinematográficos (grano, bloom, aberración)" (🟡 MEDIO PLAZO)
 
 // MARK: - Filter Models
 
@@ -203,7 +201,7 @@ final class CinematicFilterEngine: ObservableObject {
 
     // MARK: - Filter Application (nonisolated)
 
-    private static func applyFilter(_ filter: CinematicFilter, to image: CIImage) -> CIImage? {
+    nonisolated private static func applyFilter(_ filter: CinematicFilter, to image: CIImage) -> CIImage? {
         switch filter.type {
         case .filmGrain:
             return applyFilmGrain(image, params: filter.params)
@@ -230,10 +228,10 @@ final class CinematicFilterEngine: ObservableObject {
 
     // MARK: - Individual Filters
 
-    private static func applyFilmGrain(_ image: CIImage, params: [String: Double]) -> CIImage? {
+    nonisolated private static func applyFilmGrain(_ image: CIImage, params: [String: Double]) -> CIImage? {
         let intensity  = params["intensity"] ?? 0.15
-        let grainSize  = params["size"]      ?? 2.0
-
+        
+        // CORRECCIÓN: grainSize se declaró pero no se usaba. Ha sido eliminado.
         guard let noiseFilter = CIFilter(name: "CIRandomGenerator"),
               let noiseImage  = noiseFilter.outputImage
         else { return image }
@@ -253,7 +251,7 @@ final class CinematicFilterEngine: ObservableObject {
         ])
     }
 
-    private static func applyBloom(_ image: CIImage, params: [String: Double]) -> CIImage? {
+    nonisolated private static func applyBloom(_ image: CIImage, params: [String: Double]) -> CIImage? {
         let radius    = params["radius"]    ?? 8.0
         let intensity = params["intensity"] ?? 0.4
 
@@ -264,7 +262,7 @@ final class CinematicFilterEngine: ObservableObject {
         return bloom.outputImage
     }
 
-    private static func applyChromaticAberration(_ image: CIImage, params: [String: Double]) -> CIImage? {
+    nonisolated private static func applyChromaticAberration(_ image: CIImage, params: [String: Double]) -> CIImage? {
         let amount  = params["amount"] ?? 3.0
         let angle   = params["angle"]  ?? 0.0
         let radians = angle * .pi / 180
@@ -272,7 +270,6 @@ final class CinematicFilterEngine: ObservableObject {
         let offsetX = amount * cos(radians)
         let offsetY = amount * sin(radians)
 
-        // Separar canales RGB y desplazar rojo/azul
         let rChannel = image.applyingFilter("CIColorMatrix", parameters: [
             "inputRVector": CIVector(x: 1, y: 0, z: 0, w: 0),
             "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
@@ -300,7 +297,7 @@ final class CinematicFilterEngine: ObservableObject {
             .cropped(to: image.extent)
     }
 
-    private static func applyVignette(_ image: CIImage, params: [String: Double]) -> CIImage? {
+    nonisolated private static func applyVignette(_ image: CIImage, params: [String: Double]) -> CIImage? {
         let radius    = params["radius"]    ?? 1.2
         let intensity = params["intensity"] ?? 0.4
 
@@ -311,9 +308,7 @@ final class CinematicFilterEngine: ObservableObject {
         return vignette.outputImage
     }
 
-    private static func applyColorGrade(_ image: CIImage, params: [String: Double]) -> CIImage? {
-        // Shift shadows (darks) and highlights separately using CIColorCube would be complex.
-        // Using CIColorMatrix as approximation for color shift.
+    nonisolated private static func applyColorGrade(_ image: CIImage, params: [String: Double]) -> CIImage? {
         let sr = params["shadows_r"] ?? 0, sg = params["shadows_g"] ?? 0, sb = params["shadows_b"] ?? 0
         let hr = params["highlights_r"] ?? 0, hg = params["highlights_g"] ?? 0, hb = params["highlights_b"] ?? 0
 
@@ -326,12 +321,10 @@ final class CinematicFilterEngine: ObservableObject {
         ])
     }
 
-    private static func applyHalation(_ image: CIImage, params: [String: Double]) -> CIImage? {
-        // Halation: bloom rojo en zonas brillantes
+    nonisolated private static func applyHalation(_ image: CIImage, params: [String: Double]) -> CIImage? {
         let radius    = params["radius"]    ?? 12.0
         let intensity = params["intensity"] ?? 0.25
 
-        // Extraer canal rojo de highlights
         let redHighlights = image.applyingFilter("CIColorMatrix", parameters: [
             "inputRVector": CIVector(x: 1, y: 0, z: 0, w: 0),
             "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
@@ -357,7 +350,7 @@ final class CinematicFilterEngine: ObservableObject {
         ])
     }
 
-    private static func applyLensBlur(_ image: CIImage, params: [String: Double]) -> CIImage? {
+    nonisolated private static func applyLensBlur(_ image: CIImage, params: [String: Double]) -> CIImage? {
         let radius = params["radius"] ?? 2.0
         guard let blur = CIFilter(name: "CIDiscBlur") else { return image }
         blur.setValue(image, forKey: kCIInputImageKey)
@@ -365,7 +358,7 @@ final class CinematicFilterEngine: ObservableObject {
         return blur.outputImage?.cropped(to: image.extent)
     }
 
-    private static func applyClarity(_ image: CIImage, params: [String: Double]) -> CIImage? {
+    nonisolated private static func applyClarity(_ image: CIImage, params: [String: Double]) -> CIImage? {
         let amount = params["amount"] ?? 0.3
         guard let unsharp = CIFilter(name: "CIUnsharpMask") else { return image }
         unsharp.setValue(image,        forKey: kCIInputImageKey)
@@ -374,7 +367,7 @@ final class CinematicFilterEngine: ObservableObject {
         return unsharp.outputImage
     }
 
-    private static func applyShadowsHighlights(_ image: CIImage, params: [String: Double]) -> CIImage? {
+    nonisolated private static func applyShadowsHighlights(_ image: CIImage, params: [String: Double]) -> CIImage? {
         let shadows    = params["shadows"]    ?? 0
         let highlights = params["highlights"] ?? 0
         guard let filter = CIFilter(name: "CIHighlightShadowAdjust") else { return image }
@@ -384,7 +377,7 @@ final class CinematicFilterEngine: ObservableObject {
         return filter.outputImage
     }
 
-    private static func applyTemperature(_ image: CIImage, params: [String: Double]) -> CIImage? {
+    nonisolated private static func applyTemperature(_ image: CIImage, params: [String: Double]) -> CIImage? {
         let temp = params["temp"] ?? 0
         let tint = params["tint"] ?? 0
         guard let filter = CIFilter(name: "CITemperatureAndTint") else { return image }

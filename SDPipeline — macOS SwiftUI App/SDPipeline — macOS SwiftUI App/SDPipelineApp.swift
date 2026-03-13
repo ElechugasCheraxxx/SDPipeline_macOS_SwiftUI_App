@@ -5,6 +5,7 @@ import SwiftUI
 struct SDPipelineApp: App {
 
     @StateObject private var vault = VaultManager.shared
+    @StateObject private var env   = AppEnvironment.shared
 
     // MARK: - App Init
 
@@ -23,6 +24,7 @@ struct SDPipelineApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(vault)
+                .environmentObject(env)
                 .sheet(isPresented: $vault.showFirstRunSheet) {
                     VaultSetupSheet()
                         .environmentObject(vault)
@@ -30,7 +32,7 @@ struct SDPipelineApp: App {
                             ProjectManager.shared.createDefaultProjectIfNeeded()
                         }
                 }
-                .task { await bootSequence() }
+                .task { await env.boot() }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1400, height: 860)
@@ -42,52 +44,7 @@ struct SDPipelineApp: App {
     }
 
     // MARK: - Boot Sequence
-
-    private func bootSequence() async {
-        // Phase 1: Vault & persistence
-        vault.checkFirstRun()
-        ProjectManager.shared.createDefaultProjectIfNeeded()
-
-        // Phase 2: Legal & integrity
-        LicenseVault.shared.generateAllTemplates()
-        Task.detached(priority: .background) {
-            // Schedule integrity check after 10s (non-blocking)
-            try? await Task.sleep(nanoseconds: 10_000_000_000)
-            await IntegrityManager.shared.runScheduledCheck()
-        }
-
-        // Phase 3: Hardware detection
-        GPUMonitor.shared.detectDevice()
-        let isAppleSilicon = GPUMonitor.shared.isAppleSilicon
-        if isAppleSilicon {
-            print("🍎 Apple Silicon detected — MPS backend will be used")
-        }
-
-        // Phase 4: Lazy init of singletons (touch to allocate)
-        _ = PromptVersioningStore.shared
-        _ = TaggingEngine.shared
-        _ = WildcardEngine.shared
-        _ = DashboardViewModel.shared
-        _ = ContentSessionManager.shared
-        _ = JobQueueManager.shared
-        _ = IntegrityManager.shared
-        _ = SeedManager.shared
-
-        // Phase 5: Presets & session state
-        CinematicFilterEngine.shared.loadPersistedPresets()
-        ContentSessionManager.shared.refreshAllStats()
-        DashboardViewModel.shared.refresh()
-
-        // Phase 6: Backup scheduler
-        BackupManager.shared.startScheduler()
-
-        // Phase 7: Auto-resume job queue (resume paused jobs from last session)
-        let queue = JobQueueManager.shared
-        if queue.totalQueued > 0 {
-            print("📋 Resuming \(queue.totalQueued) queued jobs from last session")
-            queue.startQueue()
-        }
-    }
+    // ↳ Delegado a AppEnvironment.boot() — ver AppEnvironment.swift
 
     // MARK: - Menu Commands
 
@@ -246,18 +203,6 @@ extension Notification.Name {
 
 extension ContentSessionManager {
     func close(session: ContentSession) { close(session) }
-}
-
-// MARK: - GPUMonitor Apple Silicon helper
-
-extension GPUMonitor {
-    var isAppleSilicon: Bool {
-        #if arch(arm64)
-        return true
-        #else
-        return false
-        #endif
-    }
 }
 
 // MARK: - IntegrityManager scheduled check

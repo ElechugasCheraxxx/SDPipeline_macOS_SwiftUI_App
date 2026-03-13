@@ -1,4 +1,6 @@
 import Foundation
+import Combine
+import SwiftUI
 
 // MARK: - SidecarJSON
 // Cada imagen generada nace con un .meta.json hermano que contiene
@@ -164,5 +166,3 @@ struct SidecarJSON: Codable {
         return String(cString: machine)
     }
 }
-
-// JSONDecoder.iso8601 → Codable+Helpers.swift

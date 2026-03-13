@@ -1,6 +1,7 @@
 import SwiftUI
 import Foundation
 import AppKit
+import Combine
 
 // MARK: - SetupAssistantView
 //
@@ -654,7 +655,8 @@ struct SetupAssistantView: View {
 
             Spacer()
 
-            if let status = state.extensionStatus[name] {
+            // CORRECCIÓN: Evitamos la advertencia "Value 'status' was defined but never used"
+            if state.extensionStatus[name] != nil {
                 let (icon, color) = state.statusIcon(name)
                 Image(systemName: icon)
                     .font(.system(size: 12))

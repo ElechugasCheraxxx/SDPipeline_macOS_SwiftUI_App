@@ -2,13 +2,13 @@ import SwiftUI
 import AppKit
 import CoreData
 import Combine
+import UniformTypeIdentifiers
 
-// MARK: - GalleryView v4
-// Fixes sobre v3:
-//   - TagCloudView usa firma real de TaggingEngine.swift
-//   - Removed referencias a métodos inexistentes
-//   - RatingCuratorView inline y funcional
-//   - Inspector completo sin dependencias externas rotas
+// MARK: - GalleryView v5
+// Correcciones aplicadas:
+//   - Añadido `import UniformTypeIdentifiers` para acceder a UTType.png
+//   - Uso de `id: \.objectID` en ForEach para modelos de CoreData.
+//   - Invocación correcta del factory estático: `ReusableSettings.from(asset:)`
 
 struct GalleryView: View {
 
@@ -276,7 +276,8 @@ struct GalleryView: View {
                 emptyState
             } else {
                 LazyVGrid(columns: columns, spacing: 6) {
-                    ForEach(filteredAssets) { asset in
+                    // Usar \.objectID para garantizar conformidad con Identifiable en NSManagedObject
+                    ForEach(filteredAssets, id: \.objectID) { asset in
                         ThumbnailCell(
                             asset:      asset,
                             isSelected: selectedIDs.contains(asset.id ?? UUID()),
@@ -377,7 +378,7 @@ struct ThumbnailCell: View {
             Spacer()
             ZStack(alignment: .bottom) {
                 LinearGradient(colors: [.clear, .black.opacity(0.55)],
-                               startPoint: .center, endPoint: .bottom)
+                              startPoint: .center, endPoint: .bottom)
                     .frame(height: 44).cornerRadius(5)
                 HStack(spacing: 4) {
                     Circle().fill(asset.statusEnum.color).frame(width: 4, height: 4)
@@ -588,7 +589,8 @@ struct AssetInspectorView: View {
 
     var actionsSection: some View {
         VStack(spacing: 7) {
-            Button(action: { onReuseSettings(ReusableSettings(from: asset)) }) {
+            // Llamada al factory method estático de ReusableSettings
+            Button(action: { onReuseSettings(ReusableSettings.from(asset: asset)) }) {
                 Label("Reutilizar settings", systemImage: "arrow.uturn.left")
                     .font(.system(size: 11, weight: .medium)).frame(maxWidth: .infinity)
             }
@@ -616,6 +618,7 @@ struct AssetInspectorView: View {
         let path = asset.cleanPath ?? asset.imagePath
         guard let path, let img = NSImage(contentsOfFile: path) else { return }
         let panel = NSSavePanel()
+        // Utilizando UTType.png gracias a la importación añadida en la parte superior
         panel.allowedContentTypes = [.png]
         panel.nameFieldStringValue = "\(asset.baseName ?? "export")_clean.png"
         if panel.runModal() == .OK, let url = panel.url { img.pngData().map { try? $0.write(to: url) } }

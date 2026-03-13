@@ -102,7 +102,8 @@ final class ExportEngine: ObservableObject {
         // 6. Incrustar metadatos IPTC/XMP en versión limpia (auditoría + DAM)
         //    El preview con watermark NO recibe metadatos de autoría.
         let tags = TaggingEngine.shared.tags(for: asset)
-        try? IPTCMetadataWriter.embed(in: cleanURL, asset: asset, tags: tags)
+        // CORRECCIÓN: Usar descarte de variable explícito para el return ignorado de embed
+        _ = try? IPTCMetadataWriter.embed(in: cleanURL, asset: asset, tags: tags)
 
         return ExportResult(
             cleanURL:    cleanURL,
@@ -212,7 +213,7 @@ final class ExportEngine: ObservableObject {
 
         let text = config.text as NSString
         let attrs: [NSAttributedString.Key: Any] = [
-            .font:            NSFont.boldSystemFont(ofSize: config.fontSize),
+            .font:            NSFont.boldSystemFont(ofSize: max(image.size.width * 0.04, 18)),
             .foregroundColor: config.textColor.withAlphaComponent(config.opacity),
             .strokeColor:     NSColor.black.withAlphaComponent(config.opacity * 0.6),
             .strokeWidth:     -2.0,

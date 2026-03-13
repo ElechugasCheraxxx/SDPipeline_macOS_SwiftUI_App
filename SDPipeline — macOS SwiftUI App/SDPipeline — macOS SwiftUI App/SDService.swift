@@ -3,12 +3,6 @@ import AppKit
 import Combine
 
 // MARK: - SDService v3
-// Cambios v2→v3:
-//   - Live progress polling (/sdapi/v1/progress) con ETA y preview frame
-//   - Interrupt endpoint (/sdapi/v1/interrupt)
-//   - Apple Silicon launch flags: --precision full --no-half --use-cpu all / MPS
-//   - VRAM pre-check antes de generar
-//   - Async health check con retry logic
 
 @MainActor
 class SDService: ObservableObject {
@@ -21,7 +15,7 @@ class SDService: ObservableObject {
 
     // Live progress
     @Published var generationProgress: Double = 0.0   // 0.0 – 1.0
-    @Published var livePreviewImage:   NSImage?       // frame durante generación
+    @Published var livePreviewImage:   NSImage?
     @Published var etaText:            String = ""
 
     // WebUI process
@@ -31,7 +25,9 @@ class SDService: ObservableObject {
     private var webuiProcess:    Process?
     private var logPipe:         Pipe?
     private var healthPollTask:  Task<Void, Never>?
-    private var progressPollTask: Task<Void, Never>?
+    
+    // Cambiado de private a internal para acceso desde extensiones del mismo módulo
+    var progressPollTask: Task<Void, Never>?
 
     enum WebuiState: Equatable {
         case stopped
@@ -54,7 +50,6 @@ class SDService: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
 
-        // Apple Silicon MPS flags for better compatibility
         var args = [scriptPath, "--api", "--listen", "--xformers"]
         if appleM1Mode {
             args += ["--precision", "full", "--no-half", "--skip-torch-cuda-test", "--upcast-sampling"]
@@ -82,7 +77,6 @@ class SDService: ObservableObject {
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             Task { @MainActor [weak self] in
                 self?.webuiLog += text
-                // Detect "Model loaded" to set online faster
                 if text.contains("Model loaded") || text.contains("Running on local URL") {
                     self?.webuiState = .online
                     self?.healthPollTask?.cancel()
@@ -98,7 +92,6 @@ class SDService: ObservableObject {
             return
         }
 
-        // Poll health until online (120s timeout)
         healthPollTask?.cancel()
         healthPollTask = Task {
             let deadline = Date().addingTimeInterval(120)
@@ -156,7 +149,6 @@ class SDService: ObservableObject {
 
         progressText = "Generating (\(request.steps) steps)…"
 
-        // Start progress polling
         startProgressPolling(baseURL: baseURL, totalSteps: request.steps)
 
         do {
@@ -204,18 +196,20 @@ class SDService: ObservableObject {
 
     // MARK: - Live Progress Polling
 
-    private func startProgressPolling(baseURL: String, totalSteps: Int) {
+    // Cambiado a internal para acceso
+    func startProgressPolling(baseURL: String, totalSteps: Int) {
         progressPollTask?.cancel()
         progressPollTask = Task {
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 800_000_000) // 0.8s
+                try? await Task.sleep(nanoseconds: 800_000_000)
                 if Task.isCancelled { return }
                 await self.fetchProgress(baseURL: baseURL)
             }
         }
     }
 
-    private func fetchProgress(baseURL: String) async {
+    // Cambiado a internal para acceso
+    func fetchProgress(baseURL: String) async {
         guard let url = URL(string: "\(baseURL)/sdapi/v1/progress") else { return }
         guard let (data, _) = try? await URLSession.shared.data(from: url),
               let prog = try? JSONDecoder().decode(SDProgressResponse.self, from: data) else { return }
@@ -227,7 +221,6 @@ class SDService: ObservableObject {
             progressText = "Step \(step)/\(total) · \(prog.percentDisplay)"
         }
 
-        // Live preview frame
         if let previewB64 = prog.current_image,
            !previewB64.isEmpty,
            let previewData = Data(base64Encoded: previewB64),
@@ -252,20 +245,18 @@ class SDService: ObservableObject {
 
     // MARK: - VRAM Pre-check
 
-    /// Returns estimated VRAM requirement and warns if GPU memory may be insufficient.
     func vramPreCheck(width: Int, height: Int, steps: Int, enableHR: Bool, hrScale: Double) -> VRAMCheckResult {
         let megapixels = Double(width * height) / 1_000_000.0
-        var estimatedGB = megapixels * 2.5 + 1.5 // baseline estimate
+        var estimatedGB = megapixels * 2.5 + 1.5
         if enableHR { estimatedGB *= hrScale * 0.6 }
         if steps > 50 { estimatedGB += 0.5 }
 
         let availableGB: Double
         #if arch(arm64)
-        // Apple Silicon: check system RAM (shared with GPU)
         let totalRAM = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
-        availableGB = totalRAM * 0.6 // conservative: 60% for GPU
+        availableGB = totalRAM * 0.6
         #else
-        availableGB = 8.0 // default assumption for unknown GPU
+        availableGB = 8.0
         #endif
 
         return VRAMCheckResult(
@@ -321,7 +312,8 @@ class SDService: ObservableObject {
 
     // MARK: - Private helpers
 
-    private func extractSeedFromInfo(_ info: String?) -> Int? {
+    // Cambiado a internal o refactorizado
+    func extractSeedFromInfo(_ info: String?) -> Int? {
         guard let info else { return nil }
         if let range = info.range(of: "\"seed\":\\s*(\\d+)", options: .regularExpression) {
             let match = String(info[range])
