@@ -24,8 +24,11 @@ struct ContentView: View {
     @State private var showXYPlot:    Bool    = false
     @State private var showNewSession: Bool   = false
     @State private var showProjectPicker: Bool = false
+    @State private var showBatchView: Bool    = false
     @State private var validationMsg: String? = nil
     @State private var licenseWarning: String? = nil
+    @State private var vramWarning:   String? = nil
+    @State private var isAppleSilicon: Bool   = false
 
     @StateObject private var assetStore      = AssetStore.shared
     @StateObject private var loraManager     = LoRAManager.shared
@@ -41,30 +44,56 @@ struct ContentView: View {
     @StateObject private var dashboard       = DashboardViewModel.shared
     @StateObject private var sessionManager  = ContentSessionManager.shared
     @StateObject private var projectManager  = ProjectManager.shared
+    @StateObject private var queueManager    = JobQueueManager.shared
 
     // MARK: - Body
 
     var body: some View {
         ZStack {
             Color(red: 0.09, green: 0.09, blue: 0.11).ignoresSafeArea()
-            HSplitView {
-                leftPanel.frame(minWidth: 280, idealWidth: 340, maxWidth: 440)
-                centerPanel.frame(minWidth: 260, idealWidth: 320, maxWidth: 400)
-                RightPanelView(
-                    sdService:       sdService,
-                    settings:        $settings,
-                    parsedPrompt:    $parsedPrompt,
-                    onGenerate:      { generate() },
-                    onSaveImage:     { saveImage($0) },
-                    onReuseSettings: { applyReusable($0) }
-                )
-                .frame(minWidth: 360, maxWidth: .infinity)
+            VStack(spacing: 0) {
+                // Global banners
+                if let warning = vramWarning {
+                    bannerView(text: warning, color: "#f97316", icon: "memorychip")
+                        .onTapGesture { vramWarning = nil }
+                }
+                if let warning = licenseWarning {
+                    bannerView(text: warning, color: "#fbbf24", icon: "doc.badge.exclamationmark")
+                        .onTapGesture { licenseWarning = nil }
+                }
+                if let msg = validationMsg {
+                    bannerView(text: msg, color: "#ef4444", icon: "exclamationmark.triangle.fill")
+                        .onTapGesture { validationMsg = nil }
+                }
+
+                // Generation progress bar
+                if sdService.isGenerating {
+                    generationProgressBar
+                }
+
+                HSplitView {
+                    leftPanel.frame(minWidth: 280, idealWidth: 340, maxWidth: 440)
+                    centerPanel.frame(minWidth: 260, idealWidth: 320, maxWidth: 400)
+                    RightPanelView(
+                        sdService:       sdService,
+                        settings:        $settings,
+                        parsedPrompt:    $parsedPrompt,
+                        onGenerate:      { generate() },
+                        onSaveImage:     { saveImage($0) },
+                        onReuseSettings: { applyReusable($0) }
+                    )
+                    .frame(minWidth: 360, maxWidth: .infinity)
+                }
             }
         }
         .task {
-            // Init systems
+            isAppleSilicon = GPUMonitor.shared.isAppleSilicon
             projectManager.createDefaultProjectIfNeeded()
-            sdService.launchWebUI(scriptPath: settings.webuiScriptPath, baseURL: settings.sdBaseURL)
+            sdService.launchWebUI(
+                scriptPath:    settings.webuiScriptPath,
+                baseURL:       settings.sdBaseURL,
+                appleM1Mode:   isAppleSilicon
+            )
             GPUMonitor.shared.configure(baseURL: settings.sdBaseURL)
             LoRAManager.shared.configure(baseURL: settings.sdBaseURL)
             if !settings.sdBaseURL.isEmpty {
@@ -81,14 +110,15 @@ struct ContentView: View {
             }
         }
         .onChange(of: settings.checkpoint) { _, checkpoint in
-            // License check on checkpoint change
             guard !checkpoint.isEmpty else { licenseWarning = nil; return }
             let (_, msg) = PipelineConnector.checkLicense(checkpoint: checkpoint)
             licenseWarning = msg
         }
+        .onChange(of: settings.width) { _, _ in checkVRAM() }
+        .onChange(of: settings.height) { _, _ in checkVRAM() }
+        .onChange(of: settings.enableHR) { _, _ in checkVRAM() }
         .onReceive(NotificationCenter.default.publisher(for: .projectDidChange)) { note in
             if let project = note.object as? ProjectManager.Project {
-                // Apply project default settings
                 settings.checkpoint  = project.defaultCheckpoint
                 settings.sdBaseURL   = project.defaultBaseURL
                 settings.width       = project.defaultWidth
@@ -101,6 +131,16 @@ struct ContentView: View {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .triggerGenerate)) { _ in
+            generate()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .interruptGeneration)) { _ in
+            Task { await sdService.interruptGeneration(baseURL: settings.sdBaseURL) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showXYPlot))     { _ in showXYPlot    = true }
+        .onReceive(NotificationCenter.default.publisher(for: .showBatchView))  { _ in showBatchView = true }
+        .onReceive(NotificationCenter.default.publisher(for: .showNewSession)) { _ in showNewSession = true }
+        .onReceive(NotificationCenter.default.publisher(for: .exifKillSwitch)) { _ in runEXIFKillSwitch() }
         .sheet(isPresented: $showLog)          { logSheet }
         .sheet(isPresented: $showModelBuilder) {
             ModelBuilderSheet { json in
@@ -109,122 +149,145 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showXYPlot) {
-            XYPlotView(
-                sdService:    sdService,
-                settings:     settings,
-                parsedPrompt: parsedPrompt
-            )
-            .frame(width: 700, height: 580)
+            XYPlotView(sdService: sdService, settings: settings, parsedPrompt: parsedPrompt)
+                .frame(width: 700, height: 580)
+        }
+        .sheet(isPresented: $showBatchView) {
+            BatchJobView().frame(width: 720, height: 560)
         }
         .sheet(isPresented: $showNewSession) {
             NewSessionSheet { title, category in
-                let session = ContentSessionManager.shared.create(
-                    title:    title,
-                    category: category
-                )
-                ContentSessionManager.shared.setActive(session)
+                sessionManager.create(title: title, category: category, platform: .onlyfans)
+                showNewSession = false
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .showXYPlot))     { _ in showXYPlot    = true }
-        .onReceive(NotificationCenter.default.publisher(for: .showNewSession)) { _ in showNewSession = true }
+        .sheet(isPresented: $showProjectPicker) {
+            ProjectPickerSheet()
+        }
     }
 
-    // MARK: - Left Panel
+    // MARK: - Generation Progress Bar
 
-    var leftPanel: some View {
-        VStack(alignment: .leading, spacing: 0) {
+    var generationProgressBar: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                ProgressView(value: sdService.generationProgress)
+                    .progressViewStyle(.linear)
+                    .tint(Color(hex: "#7c6af7"))
+                    .frame(maxWidth: .infinity)
 
-            // Header with project badge
-            HStack(spacing: 8) {
-                Image(systemName: "curlybraces")
-                    .foregroundColor(.secondary).font(.system(size: 13))
-                Text("JSON Input")
-                    .font(.system(size: 13, weight: .semibold)).foregroundColor(.white.opacity(0.7))
-                Spacer()
-                // Project badge
-                ProjectBadge()
-                // Model Builder button
-                Button(action: { showModelBuilder = true }) {
-                    HStack(spacing: 5) {
-                        Image(systemName: "wand.and.sparkles").font(.system(size: 10, weight: .semibold))
-                        Text("Model Builder").font(.system(size: 10, weight: .bold))
-                    }
-                    .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(LinearGradient(
-                        colors: [Color(hex: "#7c6af7"), Color(hex: "#3de3c0")],
-                        startPoint: .leading, endPoint: .trailing))
-                    .foregroundColor(.white).cornerRadius(6)
+                if !sdService.etaText.isEmpty {
+                    Text(sdService.etaText)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .frame(width: 50, alignment: .trailing)
+                }
+
+                // Live preview thumbnail
+                if let preview = sdService.livePreviewImage {
+                    Image(nsImage: preview)
+                        .resizable().scaledToFill()
+                        .frame(width: 28, height: 28)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+
+                // Interrupt button
+                Button(action: {
+                    Task { await sdService.interruptGeneration(baseURL: settings.sdBaseURL) }
+                }) {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color(hex: "#ef4444"))
                 }
                 .buttonStyle(.plain)
+                .help("Interrumpir generación (⌘.)")
             }
-            .padding(.horizontal, 16).padding(.vertical, 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.white.opacity(0.03))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
 
-            webuiStatusBar
+            Text(sdService.progressText)
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 4)
+        }
+        .background(Color.black.opacity(0.25))
+    }
+
+    // MARK: - Banner
+
+    func bannerView(text: String, color: String, icon: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundColor(Color(hex: color))
+            Text(text)
+                .font(.system(size: 11))
+                .foregroundColor(.white.opacity(0.85))
+                .lineLimit(2)
+            Spacer()
+            Image(systemName: "xmark")
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 7)
+        .background(Color(hex: color).opacity(0.12))
+    }
+
+    // MARK: - Left Panel (JSON input)
+
+    var leftPanel: some View {
+        VStack(spacing: 0) {
+            leftHeader
             Divider().background(Color.white.opacity(0.07))
-
             sessionBanner
-            Divider().background(Color.white.opacity(0.05))
-
-            // License warning
-            if let licenseWarn = licenseWarning {
-                HStack(spacing: 6) {
-                    Image(systemName: "doc.badge.exclamationmark")
-                        .font(.system(size: 10))
-                        .foregroundColor(Color(hex: "#f59e0b"))
-                    Text(licenseWarn)
-                        .font(.system(size: 10))
-                        .foregroundColor(Color(hex: "#f59e0b"))
-                        .lineLimit(2)
-                }
-                .padding(.horizontal, 12).padding(.vertical, 7)
-                .background(Color(hex: "#f59e0b").opacity(0.08))
-                Divider().background(Color.white.opacity(0.05))
-            }
-
-            // JSON editor
-            ScrollView {
-                TextEditor(text: $jsonInput)
-                    .font(.system(.body, design: .monospaced))
-                    .scrollContentBackground(.hidden)
-                    .foregroundColor(Color(red: 0.85, green: 0.95, blue: 0.78))
-                    .frame(minHeight: 360).padding(12)
-            }
-            .background(Color(red: 0.09, green: 0.09, blue: 0.11))
-
-            // Parse error banner
+            Divider().background(Color.white.opacity(0.07))
+            TextEditor(text: $jsonInput)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(Color(hex: "#c3e88d"))
+                .scrollContentBackground(.hidden)
+                .background(Color(red: 0.07, green: 0.08, blue: 0.10))
+                .padding(8)
             if let err = parseError {
-                HStack(spacing: 6) {
-                    Image(systemName: "exclamationmark.circle.fill")
-                        .font(.system(size: 11)).foregroundColor(Color(hex: "#ef4444"))
-                    Text(err).font(.system(size: 10)).foregroundColor(Color(hex: "#ef4444"))
-                        .lineLimit(2)
-                }
-                .padding(.horizontal, 12).padding(.vertical, 8)
-                .background(Color(hex: "#ef4444").opacity(0.08))
+                Text(err).font(.system(size: 10)).foregroundColor(Color(hex: "#ef4444"))
+                    .padding(.horizontal, 12).padding(.bottom, 4)
             }
-
-            // Validation message
-            if let msg = validationMsg {
-                HStack(spacing: 6) {
-                    Image(systemName: msg.hasPrefix("🚫") ? "xmark.shield.fill" : "exclamationmark.shield")
-                        .font(.system(size: 10))
-                        .foregroundColor(msg.hasPrefix("🚫") ? Color(hex: "#ef4444") : Color(hex: "#f59e0b"))
-                    Text(msg).font(.system(size: 10))
-                        .foregroundColor(msg.hasPrefix("🚫") ? Color(hex: "#ef4444") : Color(hex: "#f59e0b"))
-                        .lineLimit(2)
-                }
-                .padding(.horizontal, 12).padding(.vertical, 7)
-                .background((msg.hasPrefix("🚫") ? Color(hex: "#ef4444") : Color(hex: "#f59e0b")).opacity(0.08))
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-                .animation(.easeInOut, value: validationMsg)
-            }
-
             Divider().background(Color.white.opacity(0.07))
             parseButton
         }
         .background(Color(red: 0.09, green: 0.09, blue: 0.12))
+    }
+
+    var leftHeader: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "chevron.left.forwardslash.chevron.right")
+                .foregroundColor(.secondary).font(.system(size: 11))
+            Text("Model JSON")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.white.opacity(0.7))
+            Spacer()
+            if isAppleSilicon {
+                Label("M-series", systemImage: "cpu")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(Color(hex: "#34d399"))
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color(hex: "#34d399").opacity(0.12))
+                    .cornerRadius(4)
+            }
+            Button(action: { showModelBuilder = true }) {
+                Image(systemName: "wand.and.stars")
+                    .font(.system(size: 11))
+                    .foregroundColor(Color(hex: "#7c6af7"))
+            }.buttonStyle(.plain).help("AI Model Builder")
+
+            Button(action: { jsonInput = "" }) {
+                Image(systemName: "trash")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+            }.buttonStyle(.plain).help("Limpiar JSON")
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(Color.white.opacity(0.03))
     }
 
     // MARK: - Center Panel (settings)
@@ -238,6 +301,7 @@ struct ContentView: View {
                     promptSection
                     generationParamsSection
                     modelSection
+                    pipelineFlagsSection
                     hiresSection
                     seedSection
                     loraSection
@@ -249,37 +313,103 @@ struct ContentView: View {
         .background(Color(red: 0.09, green: 0.09, blue: 0.12))
     }
 
-    // MARK: - Helpers (stubs for compilation — real implementations from ContentView)
-
-    var webuiStatusBar: some View {
-        HStack(spacing: 6) {
+    var centerHeader: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "slider.horizontal.3")
+                .foregroundColor(.secondary).font(.system(size: 12))
+            Text("Pipeline Settings")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.white.opacity(0.7))
+            Spacer()
+            // SD status dot
             Circle()
                 .fill(webuiStatusColor)
-                .frame(width: 6, height: 6)
-            Text(webuiStatusText)
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
-            Spacer()
+                .frame(width: 7, height: 7)
+                .help(webuiStatusText)
+            Button(action: { showLog = true }) {
+                Image(systemName: "lock.shield")
+                    .font(.system(size: 12)).foregroundColor(.secondary)
+            }.buttonStyle(.plain).help("Security Logs")
         }
-        .padding(.horizontal, 12).padding(.vertical, 5)
-        .background(Color.white.opacity(0.02))
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(Color.white.opacity(0.03))
     }
+
+    // MARK: - Pipeline Flags Section
+
+    var pipelineFlagsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("Post-Generation Pipeline", icon: "arrow.triangle.2.circlepath")
+            VStack(spacing: 6) {
+                flagRow(
+                    "Auto NSFW Check",
+                    icon: "eye.slash",
+                    binding: $settings.autoRunNSFWCheck,
+                    description: "Detecta y cuarentena automáticamente"
+                )
+                flagRow(
+                    "Auto ADetailer",
+                    icon: "face.smiling",
+                    binding: $settings.autoRunADetailer,
+                    description: "Refina rostros y manos post-generación"
+                )
+                flagRow(
+                    "Auto Post-Prod",
+                    icon: "sparkles",
+                    binding: $settings.autoRunPostProd,
+                    description: "Upscale + restauración automática"
+                )
+            }
+            .padding(10)
+            .background(Color.white.opacity(0.03))
+            .cornerRadius(8)
+        }
+    }
+
+    func flagRow(_ label: String, icon: String, binding: Binding<Bool>, description: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundColor(binding.wrappedValue ? Color(hex: "#7c6af7") : .secondary)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label).font(.system(size: 11, weight: .medium)).foregroundColor(.white)
+                Text(description).font(.system(size: 9)).foregroundColor(.secondary)
+            }
+            Spacer()
+            Toggle("", isOn: binding)
+                .toggleStyle(.switch)
+                .scaleEffect(0.7)
+                .tint(Color(hex: "#7c6af7"))
+        }
+    }
+
+    // MARK: - Reusable section label
+
+    func sectionLabel(_ title: String, icon: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon).font(.system(size: 10)).foregroundColor(.secondary)
+            Text(title).font(.system(size: 10, weight: .semibold)).foregroundColor(.secondary)
+        }
+    }
+
+    // MARK: - Status helpers
 
     var webuiStatusColor: Color {
         switch sdService.webuiState {
-        case .online:   return Color(hex: "#34d399")
+        case .online:    return Color(hex: "#34d399")
         case .launching: return Color(hex: "#f59e0b")
-        case .error:    return Color(hex: "#ef4444")
-        case .stopped:  return .gray
+        case .error:     return Color(hex: "#ef4444")
+        case .stopped:   return .gray
         }
     }
 
     var webuiStatusText: String {
         switch sdService.webuiState {
-        case .online:   return "Stable Diffusion online"
-        case .launching: return "Iniciando WebUI…"
-        case .error(let msg): return "Error: \(msg.truncated(40))"
-        case .stopped:  return "WebUI detenido"
+        case .online:          return "Stable Diffusion online"
+        case .launching:       return "Iniciando WebUI…"
+        case .error(let msg):  return "Error: \(msg.truncated(40))"
+        case .stopped:         return "WebUI detenido"
         }
     }
 
@@ -287,33 +417,21 @@ struct ContentView: View {
         Group {
             if let session = sessionManager.activeSession {
                 HStack(spacing: 6) {
-                    Image(systemName: "film.stack")
-                        .font(.system(size: 9))
+                    Image(systemName: "film.stack").font(.system(size: 9))
                         .foregroundColor(Color(hex: "#7c6af7"))
                     Text(session.title)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.white.opacity(0.7))
+                        .font(.system(size: 10, weight: .medium)).foregroundColor(.white.opacity(0.7))
                     Spacer()
                     Text("\(Int(session.progressPercent * 100))%")
-                        .font(.system(size: 9))
-                        .foregroundColor(.secondary)
-                    Button(action: { showNewSession = true }) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 9))
-                            .foregroundColor(.secondary)
-                    }.buttonStyle(.plain)
+                        .font(.system(size: 9)).foregroundColor(.secondary)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 6)
                 .background(Color(hex: "#7c6af7").opacity(0.06))
             } else {
                 Button(action: { showNewSession = true }) {
                     HStack(spacing: 5) {
-                        Image(systemName: "plus.circle")
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                        Text("Nueva sesión de contenido")
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
+                        Image(systemName: "plus.circle").font(.system(size: 10)).foregroundColor(.secondary)
+                        Text("Nueva sesión de contenido").font(.system(size: 10)).foregroundColor(.secondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -340,28 +458,7 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
-    var centerHeader: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "slider.horizontal.3")
-                .foregroundColor(.secondary).font(.system(size: 12))
-            Text("Pipeline Settings")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(.white.opacity(0.7))
-            Spacer()
-            // Log button
-            Button(action: { showLog = true }) {
-                Image(systemName: "lock.shield")
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
-            }.buttonStyle(.plain)
-        }
-        .padding(.horizontal, 16).padding(.vertical, 12)
-        .background(Color.white.opacity(0.03))
-    }
-
-    // These sections are left as stubs — they exist in the original ContentView
-    // and only the new additions (ProjectBadge, licenseWarning, projectDidChange handler)
-    // are the actual new code in this file.
+    // Placeholder sections — full implementations exist in production ContentView
     var promptSection: some View        { EmptyView() }
     var generationParamsSection: some View { EmptyView() }
     var modelSection: some View         { EmptyView() }
@@ -370,6 +467,39 @@ struct ContentView: View {
     var loraSection: some View          { EmptyView() }
     var characterSection: some View     { EmptyView() }
     var logSheet: some View             { EmptyView() }
+
+    // MARK: - VRAM Check
+
+    func checkVRAM() {
+        let result = sdService.vramPreCheck(
+            width:    settings.width,
+            height:   settings.height,
+            steps:    settings.steps,
+            enableHR: settings.enableHR,
+            hrScale:  settings.hrScale
+        )
+        vramWarning = result.warning
+    }
+
+    // MARK: - EXIF Kill Switch
+
+    func runEXIFKillSwitch() {
+        let assets = assetStore.fetchAllAssets(limit: 1000)
+        var scrubbed = 0
+        for asset in assets {
+            guard let url = asset.absoluteImageURL else { continue }
+            // ExportEngine handles EXIF scrubbing via removePNGTextChunks
+            if let data = try? Data(contentsOf: url) {
+                let clean = ExportEngine.shared.scrubMetadata(from: data)
+                try? clean.write(to: url, options: .atomic)
+                scrubbed += 1
+            }
+        }
+        ZeroKnowledgeLog.shared.write(
+            category: .exportPerformed,
+            message:  "EXIF Kill-Switch: scrubbed \(scrubbed) files"
+        )
+    }
 
     // MARK: - Actions
 
@@ -382,7 +512,6 @@ struct ContentView: View {
                   let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { throw NSError(domain: "JSON", code: 0, userInfo: [NSLocalizedDescriptionKey: "JSON inválido"]) }
 
-            // Safety check on JSON
             let safetyResult = PromptSafetyFilter.validateJSON(json)
             Task { @MainActor in PromptSafetyFilter.logResult(safetyResult, prompt: jsonInput) }
 
@@ -401,9 +530,7 @@ struct ContentView: View {
             }
             sdService.stage = .idle
 
-            // Validation feedback
-            let report = PipelineConnector.validateBeforeGenerate(
-                parsedPrompt: parsedPrompt, settings: settings)
+            let report = PipelineConnector.validateBeforeGenerate(parsedPrompt: parsedPrompt, settings: settings)
             if report.hasIssues {
                 validationMsg = report.gpuWarning ?? report.message
                 Task {
@@ -411,6 +538,10 @@ struct ContentView: View {
                     await MainActor.run { validationMsg = nil }
                 }
             }
+
+            // VRAM check after parse
+            checkVRAM()
+
         } catch { parseError = error.localizedDescription; sdService.stage = .error }
     }
 
@@ -423,24 +554,16 @@ struct ContentView: View {
         let finalNegative = [settings.negativePrompt, CharacterEngine.shared.activeCharacterNegative]
             .filter { !$0.isEmpty }.joined(separator: ", ")
 
-        // Validation (safety + GPU)
-        let report = PipelineConnector.validateBeforeGenerate(
-            parsedPrompt: finalPrompt, settings: settings)
+        let report = PipelineConnector.validateBeforeGenerate(parsedPrompt: finalPrompt, settings: settings)
         guard report.canProceed else {
             sdService.errorMessage = report.message ?? "Prompt bloqueado."
             return
         }
-        if let gpuWarn = report.gpuWarning {
-            validationMsg = gpuWarn
-        }
+        if let gpuWarn = report.gpuWarning { validationMsg = gpuWarn }
 
-        // License check
         if !settings.checkpoint.isEmpty {
-            let (safe, msg) = PipelineConnector.checkLicense(checkpoint: settings.checkpoint)
-            if !safe {
-                licenseWarning = msg
-                // Don't block generation for license warnings — just inform
-            }
+            let (_, msg) = PipelineConnector.checkLicense(checkpoint: settings.checkpoint)
+            if let msg { licenseWarning = msg }
         }
 
         let req = SDRequest(
@@ -465,16 +588,22 @@ struct ContentView: View {
                                    samplerName: settings.samplerName), to: model.sha256)
             }
 
-            // NSFW detection
-            let detection = await NSFWDetector.shared.detect(
-                prompt: finalPrompt, image: sdService.generatedImage, baseURL: settings.sdBaseURL)
-            NSFWDetector.shared.logResultZK(detection)
-            if detection.action == .quarantine {
-                ZeroKnowledgeLog.shared.write(
-                    category: .nsfwQuarantine,
-                    message: "Cuarentena · Level: \(detection.finalLevel.label)",
-                    metadata: ["triggers": detection.triggerWords.joined(separator: ","),
-                               "prompt": String(finalPrompt.prefix(60))])
+            guard let image = sdService.generatedImage else {
+                await MainActor.run { validationMsg = nil }
+                return
+            }
+
+            // Auto NSFW Check
+            if settings.autoRunNSFWCheck {
+                let detection = await NSFWDetector.shared.detect(
+                    prompt: finalPrompt, image: image, baseURL: settings.sdBaseURL)
+                NSFWDetector.shared.logResultZK(detection)
+                if detection.action == .quarantine {
+                    ZeroKnowledgeLog.shared.write(
+                        category: .nsfwQuarantine,
+                        message: "Cuarentena · Level: \(detection.finalLevel.label)",
+                        metadata: ["prompt": String(finalPrompt.prefix(60))])
+                }
             }
 
             // Seed tracking
@@ -484,18 +613,34 @@ struct ContentView: View {
             }
 
             // Prompt versioning
-            if sdService.generatedImage != nil {
-                _ = PromptVersioningStore.shared.save(
-                    positive: finalPrompt, negative: finalNegative,
-                    steps: settings.steps, cfgScale: settings.cfgScale,
-                    samplerName: settings.samplerName, width: settings.width,
-                    height: settings.height, checkpoint: settings.checkpoint)
+            _ = PromptVersioningStore.shared.save(
+                positive: finalPrompt, negative: finalNegative,
+                steps: settings.steps, cfgScale: settings.cfgScale,
+                samplerName: settings.samplerName, width: settings.width,
+                height: settings.height, checkpoint: settings.checkpoint)
 
-                // Increment project asset count
-                projectManager.incrementAssetCount()
+            // Vault save (async, handled by PipelineConnector)
+            let vaultMsg = await PipelineConnector.saveToVaultFull(
+                image: image, settings: settings, parsedPrompt: finalPrompt, sdService: sdService)
+
+            // Auto Post-Prod
+            if settings.autoRunPostProd {
+                await PostProductionEngine.shared.upscaleAndRestore(
+                    image, factor: settings.hrScale, upscaler: settings.hrUpscaler,
+                    faceWeight: 0.5, baseURL: settings.sdBaseURL)
             }
 
+            // Auto ADetailer
+            if settings.autoRunADetailer {
+                // ADetailer runs through the queue
+                let adetailerReq = req
+                await ADetailerEngine.shared.process(image: image, request: adetailerReq, baseURL: settings.sdBaseURL)
+            }
+
+            projectManager.incrementAssetCount()
             await MainActor.run { validationMsg = nil }
+
+            print("✅ Generation complete: \(vaultMsg)")
         }
     }
 

@@ -6,6 +6,19 @@ struct SDPipelineApp: App {
 
     @StateObject private var vault = VaultManager.shared
 
+    // MARK: - App Init
+
+    init() {
+        // Configure URLSession for SD API (high timeout, no caching)
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest  = 600
+        config.timeoutIntervalForResource = 600
+        config.requestCachePolicy         = .reloadIgnoringLocalCacheData
+        URLSession.shared.configuration.timeoutIntervalForRequest = 600
+    }
+
+    // MARK: - Scene
+
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -14,126 +27,201 @@ struct SDPipelineApp: App {
                     VaultSetupSheet()
                         .environmentObject(vault)
                         .onDisappear {
-                            // After vault setup, init ProjectManager
                             ProjectManager.shared.createDefaultProjectIfNeeded()
                         }
                 }
-                .task {
-                    vault.checkFirstRun()
-                    LicenseVault.shared.generateAllTemplates()
-                    GPUMonitor.shared.detectDevice()
-                    BackupManager.shared.startScheduler()
-                    _ = PromptVersioningStore.shared
-                    _ = TaggingEngine.shared
-                    _ = WildcardEngine.shared
-                    _ = DashboardViewModel.shared
-                    _ = ContentSessionManager.shared
-                    _ = JobQueueManager.shared
-                    _ = ProjectManager.shared                    // ← Multi-proyecto
-                    _ = IntegrityManager.shared                 // ← Verificación integridad
-                    CinematicFilterEngine.shared.loadPersistedPresets()
-                    ContentSessionManager.shared.refreshAllStats()
-                }
+                .task { await bootSequence() }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1400, height: 860)
-        .commands {
-            CommandGroup(replacing: .newItem) {}
+        .commands { appCommands }
 
-            // ── Menú Vault ────────────────────────────────────────────────
-            CommandMenu("Vault") {
-                Button("Abrir Vault en Finder") {
-                    if let url = VaultManager.shared.vaultRoot {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
-                .keyboardShortcut("v", modifiers: [.command, .shift])
+        Settings {
+            SettingsView()
+        }
+    }
 
-                Divider()
+    // MARK: - Boot Sequence
 
-                Button("Re-configurar Vault…") {
-                    vault.showFirstRunSheet = true
-                }
+    private func bootSequence() async {
+        // Phase 1: Vault & persistence
+        vault.checkFirstRun()
+        ProjectManager.shared.createDefaultProjectIfNeeded()
 
-                Divider()
+        // Phase 2: Legal & integrity
+        LicenseVault.shared.generateAllTemplates()
+        Task.detached(priority: .background) {
+            // Schedule integrity check after 10s (non-blocking)
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            await IntegrityManager.shared.runScheduledCheck()
+        }
 
-                Button("Backup ahora") {
-                    Task { await BackupManager.shared.runAllBackups() }
-                }
-                .keyboardShortcut("b", modifiers: [.command, .shift])
+        // Phase 3: Hardware detection
+        GPUMonitor.shared.detectDevice()
+        let isAppleSilicon = GPUMonitor.shared.isAppleSilicon
+        if isAppleSilicon {
+            print("🍎 Apple Silicon detected — MPS backend will be used")
+        }
 
-                Divider()
+        // Phase 4: Lazy init of singletons (touch to allocate)
+        _ = PromptVersioningStore.shared
+        _ = TaggingEngine.shared
+        _ = WildcardEngine.shared
+        _ = DashboardViewModel.shared
+        _ = ContentSessionManager.shared
+        _ = JobQueueManager.shared
+        _ = IntegrityManager.shared
+        _ = SeedManager.shared
 
-                Button("Encolar exports pendientes") {
-                    JobQueueManager.shared.enqueueAllPendingExports()
-                }
+        // Phase 5: Presets & session state
+        CinematicFilterEngine.shared.loadPersistedPresets()
+        ContentSessionManager.shared.refreshAllStats()
+        DashboardViewModel.shared.refresh()
 
-                Divider()
+        // Phase 6: Backup scheduler
+        BackupManager.shared.startScheduler()
 
-                Button("Verificar integridad del vault") {
-                    Task { await IntegrityManager.shared.runFullVerification() }
+        // Phase 7: Auto-resume job queue (resume paused jobs from last session)
+        let queue = JobQueueManager.shared
+        if queue.totalQueued > 0 {
+            print("📋 Resuming \(queue.totalQueued) queued jobs from last session")
+            queue.startQueue()
+        }
+    }
+
+    // MARK: - Menu Commands
+
+    @CommandsBuilder
+    private var appCommands: some Commands {
+        CommandGroup(replacing: .newItem) {}
+
+        // ── Vault ─────────────────────────────────────────────────────────
+        CommandMenu("Vault") {
+            Button("Abrir Vault en Finder") {
+                if let url = VaultManager.shared.vaultRoot {
+                    NSWorkspace.shared.open(url)
                 }
             }
+            .keyboardShortcut("v", modifiers: [.command, .shift])
 
-            // ── Menú Proyectos ─────────────────────────────────────────────
-            CommandMenu("Proyecto") {
-                Button("Nuevo proyecto…") {
-                    ProjectManager.shared.showProjectPicker = true
-                }
-                .keyboardShortcut("n", modifiers: [.command, .shift, .option])
+            Divider()
 
-                Divider()
-
-                ForEach(ProjectManager.shared.activeProjects.prefix(5)) { project in
-                    Button(project.name) {
-                        ProjectManager.shared.setActive(project)
-                    }
-                }
+            Button("Re-configurar Vault…") {
+                vault.showFirstRunSheet = true
             }
 
-            // ── Menú Sesiones ─────────────────────────────────────────────
-            CommandMenu("Sesión") {
-                Button("Nueva sesión de contenido…") {
-                    NotificationCenter.default.post(name: .showNewSession, object: nil)
-                }
-                .keyboardShortcut("n", modifiers: [.command, .option])
+            Divider()
 
-                Divider()
+            Button("Backup ahora") {
+                Task { await BackupManager.shared.runAllBackups() }
+            }
+            .keyboardShortcut("b", modifiers: [.command, .shift])
 
-                Button("Cerrar sesión activa") {
-                    if let active = ContentSessionManager.shared.activeSession {
-                        ContentSessionManager.shared.close(session: active)
-                    }
-                }
-                .disabled(ContentSessionManager.shared.activeSession == nil)
+            Button("Verificar integridad del vault") {
+                Task { await IntegrityManager.shared.runFullVerification() }
             }
 
-            // ── Menú Pipeline ─────────────────────────────────────────────
-            CommandMenu("Pipeline") {
-                Button("X/Y Plot…") {
-                    NotificationCenter.default.post(name: .showXYPlot, object: nil)
-                }
-                .keyboardShortcut("p", modifiers: [.command, .option])
+            Divider()
 
-                Divider()
-
-                Button("Limpiar cola de jobs") {
-                    JobQueueManager.shared.cancelAll()
-                }
-
-                Divider()
-
-                Button("Curator de rating…") {
-                    // Open batch rating view — via notification or sheet
-                    NotificationCenter.default.post(name: .showBatchRating, object: nil)
-                }
-                .keyboardShortcut("r", modifiers: [.command, .option])
+            Button("Encolar exports pendientes") {
+                JobQueueManager.shared.enqueueAllPendingExports()
             }
         }
 
-        // ── Panel de Ajustes (Cmd+,) ──────────────────────────────────
-        Settings {
-            SettingsView()
+        // ── Proyecto ──────────────────────────────────────────────────────
+        CommandMenu("Proyecto") {
+            Button("Nuevo proyecto…") {
+                ProjectManager.shared.showProjectPicker = true
+            }
+            .keyboardShortcut("n", modifiers: [.command, .shift, .option])
+
+            Divider()
+
+            ForEach(ProjectManager.shared.activeProjects.prefix(6)) { project in
+                Button(project.name) {
+                    ProjectManager.shared.setActive(project)
+                }
+            }
+        }
+
+        // ── Sesión ────────────────────────────────────────────────────────
+        CommandMenu("Sesión") {
+            Button("Nueva sesión de contenido…") {
+                NotificationCenter.default.post(name: .showNewSession, object: nil)
+            }
+            .keyboardShortcut("n", modifiers: [.command, .option])
+
+            Divider()
+
+            Button("Cerrar sesión activa") {
+                if let active = ContentSessionManager.shared.activeSession {
+                    ContentSessionManager.shared.close(active)
+                }
+            }
+            .disabled(ContentSessionManager.shared.activeSession == nil)
+        }
+
+        // ── Pipeline ──────────────────────────────────────────────────────
+        CommandMenu("Pipeline") {
+            Button("Generar") {
+                NotificationCenter.default.post(name: .triggerGenerate, object: nil)
+            }
+            .keyboardShortcut(.return, modifiers: [.command])
+
+            Button("Interrumpir generación") {
+                NotificationCenter.default.post(name: .interruptGeneration, object: nil)
+            }
+            .keyboardShortcut(".", modifiers: [.command])
+
+            Divider()
+
+            Button("X/Y Plot…") {
+                NotificationCenter.default.post(name: .showXYPlot, object: nil)
+            }
+            .keyboardShortcut("p", modifiers: [.command, .option])
+
+            Button("Batch…") {
+                NotificationCenter.default.post(name: .showBatchView, object: nil)
+            }
+            .keyboardShortcut("k", modifiers: [.command, .option])
+
+            Divider()
+
+            Button("Curator de rating…") {
+                NotificationCenter.default.post(name: .showBatchRating, object: nil)
+            }
+            .keyboardShortcut("r", modifiers: [.command, .option])
+
+            Divider()
+
+            Button("Pausar cola de jobs") {
+                JobQueueManager.shared.pauseQueue()
+            }
+
+            Button("Reanudar cola de jobs") {
+                JobQueueManager.shared.startQueue()
+            }
+
+            Button("Limpiar historial de cola") {
+                JobQueueManager.shared.clearHistory()
+            }
+        }
+
+        // ── Seguridad ─────────────────────────────────────────────────────
+        CommandMenu("Seguridad") {
+            Button("Ver logs cifrados") {
+                NotificationCenter.default.post(name: .showSecurityLogs, object: nil)
+            }
+
+            Button("Exportar audit report…") {
+                NotificationCenter.default.post(name: .exportAuditReport, object: nil)
+            }
+
+            Divider()
+
+            Button("Purgar metadatos EXIF (Kill-Switch)") {
+                NotificationCenter.default.post(name: .exifKillSwitch, object: nil)
+            }
         }
     }
 }
@@ -141,40 +229,69 @@ struct SDPipelineApp: App {
 // MARK: - Notification Names
 
 extension Notification.Name {
-    static let showNewSession  = Notification.Name("SDPipeline.showNewSession")
-    static let showXYPlot      = Notification.Name("SDPipeline.showXYPlot")
-    static let showBatchRating = Notification.Name("SDPipeline.showBatchRating")
-    static let showProjectPicker = Notification.Name("SDPipeline.showProjectPicker")
+    static let showNewSession      = Notification.Name("SDPipeline.showNewSession")
+    static let showXYPlot          = Notification.Name("SDPipeline.showXYPlot")
+    static let showBatchView       = Notification.Name("SDPipeline.showBatchView")
+    static let showBatchRating     = Notification.Name("SDPipeline.showBatchRating")
+    static let showProjectPicker   = Notification.Name("SDPipeline.showProjectPicker")
+    static let triggerGenerate     = Notification.Name("SDPipeline.triggerGenerate")
+    static let interruptGeneration = Notification.Name("SDPipeline.interruptGeneration")
+    static let showSecurityLogs    = Notification.Name("SDPipeline.showSecurityLogs")
+    static let exportAuditReport   = Notification.Name("SDPipeline.exportAuditReport")
+    static let exifKillSwitch      = Notification.Name("SDPipeline.exifKillSwitch")
+    static let projectDidChange    = Notification.Name("SDPipeline.projectDidChange")
 }
 
-// MARK: - ContentSessionManager close fix
-// The app calls close(session:) — ensure the method signature matches.
+// MARK: - ContentSessionManager compatibility shim
 
 extension ContentSessionManager {
-    /// Close a session (wrapper to handle both signatures).
-    func close(session: ContentSession) {
-        close(session)
+    func close(session: ContentSession) { close(session) }
+}
+
+// MARK: - GPUMonitor Apple Silicon helper
+
+extension GPUMonitor {
+    var isAppleSilicon: Bool {
+        #if arch(arm64)
+        return true
+        #else
+        return false
+        #endif
     }
 }
 
-// MARK: - JobQueueManager enqueueAllPendingExports fix
+// MARK: - IntegrityManager scheduled check
+
+extension IntegrityManager {
+    /// Lightweight scheduled check — only warns, doesn't block UI.
+    func runScheduledCheck() async {
+        let lastRun = UserDefaults.standard.object(forKey: "integrity.lastScheduledCheck") as? Date
+        let interval: TimeInterval = 7 * 86400 // weekly
+        guard lastRun == nil || Date().timeIntervalSince(lastRun!) > interval else { return }
+        await runFullVerification()
+        UserDefaults.standard.set(Date(), forKey: "integrity.lastScheduledCheck")
+    }
+}
+
+// MARK: - JobQueueManager enqueueAllPendingExports
 
 extension JobQueueManager {
-    /// Enqueue export jobs for all approved assets that don't have a clean export yet.
     func enqueueAllPendingExports() {
-        let assets = AssetStore.shared.assets(withStatus: .approved, limit: 200)
-        let pending = assets.filter { $0.cleanPath == nil || ($0.cleanPath?.isEmpty ?? true) }
-
+        let assets = AssetStore.shared.fetchAllAssets(limit: 200)
+        let pending = assets.filter {
+            $0.statusEnum == .approved &&
+            ($0.cleanPath == nil || ($0.cleanPath?.isEmpty ?? true))
+        }
         for asset in pending {
-            let job = QueueJob(
-                type:     .export,
-                title:    "Export: \(asset.baseName ?? asset.id?.uuidString.prefix(8).description ?? "asset")",
-                priority: .normal,
-                metadata: ["assetID": asset.id?.uuidString ?? ""]
+            let job = GenerationJob(
+                name:       "Export: \(asset.displayTitle)",
+                request:    SDRequest(prompt: "[export-only]"),
+                settings:   .default,
+                priority:   .normal,
+                sessionTag: asset.sessionTag
             )
             enqueue(job)
         }
-
         if !pending.isEmpty {
             ZeroKnowledgeLog.shared.write(
                 category: .exportPerformed,

@@ -1,544 +1,432 @@
 import Foundation
-import AppKit
 import SwiftUI
 import Combine
 
-// MARK: - JobQueueManager
-//
-// Cola de trabajos asíncronos con prioridad, retry y planificación.
-// Permite encolar generaciones individuales, batch jobs, exports y backups
-// para ejecución ordenada sin bloquear la UI.
-//
-// Features:
-//   - Prioridad (urgent > high > normal > low)
-//   - Retry automático (configurable, max 3)
-//   - Pausa / resume
-//   - Concurrencia configurable (1-3 workers)
-//   - Persistencia de la cola en caso de crash
-//   - Notificaciones de completado
-//
-// ROADMAP: "Sistema de colas y jobs automáticos" (🟡 MEDIO PLAZO)
-
-// MARK: - Models
-
-enum JobPriority: Int, Codable, CaseIterable, Comparable {
-    case low     = 0
-    case normal  = 1
-    case high    = 2
-    case urgent  = 3
-
-    static func < (lhs: JobPriority, rhs: JobPriority) -> Bool {
-        lhs.rawValue < rhs.rawValue
-    }
-
-    var label: String {
-        switch self {
-        case .low:    return "Baja"
-        case .normal: return "Normal"
-        case .high:   return "Alta"
-        case .urgent: return "Urgente"
-        }
-    }
-
-    var color: String {
-        switch self {
-        case .low:    return "#6b7280"
-        case .normal: return "#7c6af7"
-        case .high:   return "#f59e0b"
-        case .urgent: return "#ef4444"
-        }
-    }
-}
-
-enum QueueJobType: String, Codable, CaseIterable {
-    case singleGeneration = "Generación"
-    case batchGeneration  = "Batch"
-    case export           = "Export"
-    case backup           = "Backup"
-    case postProduction   = "Post-prod"
-    case xyPlot           = "X/Y Plot"
-
-    var icon: String {
-        switch self {
-        case .singleGeneration: return "wand.and.stars"
-        case .batchGeneration:  return "square.grid.3x3.fill"
-        case .export:           return "arrow.up.doc.fill"
-        case .backup:           return "externaldrive.badge.timemachine"
-        case .postProduction:   return "camera.filters"
-        case .xyPlot:           return "grid.circle.fill"
-        }
-    }
-}
-
-enum QueueJobStatus: String, Codable {
-    case pending   = "Pendiente"
-    case running   = "Ejecutando"
-    case completed = "Completado"
-    case failed    = "Fallido"
-    case cancelled = "Cancelado"
-    case paused    = "Pausado"
-
-    var color: String {
-        switch self {
-        case .pending:   return "#6b7280"
-        case .running:   return "#7c6af7"
-        case .completed: return "#34d399"
-        case .failed:    return "#ef4444"
-        case .cancelled: return "#9ca3af"
-        case .paused:    return "#f59e0b"
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .pending:   return "clock"
-        case .running:   return "arrow.triangle.2.circlepath"
-        case .completed: return "checkmark.circle.fill"
-        case .failed:    return "exclamationmark.circle.fill"
-        case .cancelled: return "xmark.circle.fill"
-        case .paused:    return "pause.circle.fill"
-        }
-    }
-}
-
-struct QueueJob: Identifiable, Codable {
-    var id:           UUID         = UUID()
-    var type:         QueueJobType
-    var label:        String
-    var priority:     JobPriority  = .normal
-    var status:       QueueJobStatus = .pending
-    var progress:     Double       = 0
-    var progressText: String       = ""
-    var createdAt:    Date         = Date()
-    var startedAt:    Date?        = nil
-    var completedAt:  Date?        = nil
-    var retryCount:   Int          = 0
-    var maxRetries:   Int          = 3
-    var errorMessage: String?      = nil
-    var metadata:     [String: String] = [:]
-
-    var canRetry: Bool { retryCount < maxRetries && status == .failed }
-    var duration: TimeInterval? {
-        guard let start = startedAt else { return nil }
-        return (completedAt ?? Date()).timeIntervalSince(start)
-    }
-}
-
-// MARK: - JobQueueManager
+// MARK: - JobQueueManager v2
+// Sistema de colas de generación con:
+//   - Prioridad (high / normal / low)
+//   - Retry automático con backoff exponencial (hasta 3 intentos)
+//   - Persistencia de cola en UserDefaults (sobrevive reinicios)
+//   - Concurrencia configurable (1–4 workers simultáneos)
+//   - Cancelación individual y masiva
+//   - Notificaciones de completado por job
 
 @MainActor
 final class JobQueueManager: ObservableObject {
 
     static let shared = JobQueueManager()
-    private init() { loadQueue() }
+    private init() { loadPersistedQueue() }
+
+    // MARK: - Job Model
+
+    struct GenerationJob: Identifiable, Codable {
+        let id:       UUID
+        var name:     String
+        var request:  SDRequest
+        var settings: JobSettings
+        var status:   JobStatus
+        var priority: JobPriority
+        var createdAt: Date
+        var startedAt: Date?
+        var finishedAt: Date?
+        var attempts:  Int
+        var errorLog:  [String]
+        var resultAssetID: UUID?
+
+        // Context
+        var characterID: UUID?
+        var sessionTag:  String?
+        var batchID:     UUID?   // Groups jobs from same batch run
+
+        init(
+            name:        String = "Generation",
+            request:     SDRequest,
+            settings:    JobSettings = .default,
+            priority:    JobPriority = .normal,
+            characterID: UUID? = nil,
+            sessionTag:  String? = nil,
+            batchID:     UUID? = nil
+        ) {
+            self.id          = UUID()
+            self.name        = name
+            self.request     = request
+            self.settings    = settings
+            self.status      = .queued
+            self.priority    = priority
+            self.createdAt   = Date()
+            self.startedAt   = nil
+            self.finishedAt  = nil
+            self.attempts    = 0
+            self.errorLog    = []
+            self.characterID = characterID
+            self.sessionTag  = sessionTag
+            self.batchID     = batchID
+        }
+
+        var durationLabel: String {
+            guard let start = startedAt else { return "—" }
+            let end = finishedAt ?? Date()
+            let secs = Int(end.timeIntervalSince(start))
+            return secs < 60 ? "\(secs)s" : "\(secs / 60)m \(secs % 60)s"
+        }
+
+        var statusIcon: String { status.icon }
+        var priorityIcon: String { priority.icon }
+    }
+
+    struct JobSettings: Codable {
+        var baseURL:        String
+        var autoExport:     Bool
+        var autoNSFWCheck:  Bool
+        var postProcessing: Bool
+
+        static let `default` = JobSettings(
+            baseURL:        "http://127.0.0.1:7860",
+            autoExport:     true,
+            autoNSFWCheck:  true,
+            postProcessing: false
+        )
+    }
+
+    // MARK: - Enums
+
+    enum JobStatus: String, Codable, CaseIterable {
+        case queued     = "Queued"
+        case running    = "Running"
+        case done       = "Done"
+        case failed     = "Failed"
+        case cancelled  = "Cancelled"
+        case retrying   = "Retrying"
+
+        var icon: String {
+            switch self {
+            case .queued:    return "clock"
+            case .running:   return "gearshape.fill"
+            case .done:      return "checkmark.circle.fill"
+            case .failed:    return "xmark.circle.fill"
+            case .cancelled: return "minus.circle.fill"
+            case .retrying:  return "arrow.counterclockwise.circle.fill"
+            }
+        }
+
+        var hexColor: String {
+            switch self {
+            case .queued:    return "#6b7280"
+            case .running:   return "#f97316"
+            case .done:      return "#34d399"
+            case .failed:    return "#ef4444"
+            case .cancelled: return "#6b7280"
+            case .retrying:  return "#fbbf24"
+            }
+        }
+    }
+
+    enum JobPriority: Int, Codable, CaseIterable, Comparable {
+        case high   = 0
+        case normal = 1
+        case low    = 2
+
+        var label: String {
+            switch self {
+            case .high:   return "High"
+            case .normal: return "Normal"
+            case .low:    return "Low"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .high:   return "exclamationmark.triangle.fill"
+            case .normal: return "equal.circle"
+            case .low:    return "arrow.down.circle"
+            }
+        }
+
+        static func < (lhs: JobPriority, rhs: JobPriority) -> Bool {
+            lhs.rawValue < rhs.rawValue
+        }
+    }
 
     // MARK: - State
 
-    @Published var queue:         [QueueJob] = []
-    @Published var completedJobs: [QueueJob] = []
-    @Published var isPaused:      Bool       = false
-    @Published var isRunning:     Bool       = false
-    @Published var activeJobID:   UUID?      = nil
+    @Published var jobs:             [GenerationJob] = []
+    @Published var isProcessing:     Bool = false
+    @Published var maxConcurrent:    Int  = 1         // 1–4 workers
+    @Published var activeJobCount:   Int  = 0
 
-    var maxConcurrency: Int = 1      // Aumentar con cuidado — A1111 no es multi-GPU by default
-    var autoRetry:      Bool = true
+    private var runningTasks: [UUID: Task<Void, Never>] = [:]
+    private let maxRetries = 3
 
-    // MARK: - Public API — Enqueue
+    // MARK: - Computed
 
+    var queuedJobs:    [GenerationJob] { jobs.filter { $0.status == .queued }.sorted { $0.priority < $1.priority } }
+    var runningJobs:   [GenerationJob] { jobs.filter { $0.status == .running } }
+    var completedJobs: [GenerationJob] { jobs.filter { $0.status == .done } }
+    var failedJobs:    [GenerationJob] { jobs.filter { $0.status == .failed } }
+    var cancelledJobs: [GenerationJob] { jobs.filter { $0.status == .cancelled } }
+
+    var totalQueued:    Int { queuedJobs.count }
+    var totalCompleted: Int { completedJobs.count }
+    var totalFailed:    Int { failedJobs.count }
+
+    var estimatedRemainingSeconds: Int {
+        let avgTime = averageJobTime ?? 60
+        return totalQueued * Int(avgTime)
+    }
+
+    var estimatedRemainingLabel: String {
+        let secs = estimatedRemainingSeconds
+        guard secs > 0 else { return "—" }
+        if secs < 60 { return "\(secs)s" }
+        if secs < 3600 { return "\(secs / 60)m" }
+        return "\(secs / 3600)h \((secs % 3600) / 60)m"
+    }
+
+    private var averageJobTime: Double? {
+        let doneTimed = jobs.filter { $0.status == .done && $0.startedAt != nil && $0.finishedAt != nil }
+        guard !doneTimed.isEmpty else { return nil }
+        let total = doneTimed.reduce(0.0) { $0 + $1.finishedAt!.timeIntervalSince($1.startedAt!) }
+        return total / Double(doneTimed.count)
+    }
+
+    // MARK: - Public API
+
+    /// Enqueue a single job.
     @discardableResult
-    func enqueue(
-        type:     QueueJobType,
-        label:    String,
-        priority: JobPriority = .normal,
-        metadata: [String: String] = [:]
-    ) -> QueueJob {
-        var job = QueueJob(type: type, label: label, priority: priority, metadata: metadata)
-        // Insertar por prioridad (mayor prioridad primero, mismo nivel FIFO)
-        let insertIdx = queue.firstIndex { $0.priority < priority } ?? queue.count
-        queue.insert(job, at: insertIdx)
-        saveQueue()
-        processNext()
-        return job
+    func enqueue(_ job: GenerationJob) -> UUID {
+        jobs.append(job)
+        persistQueue()
+        ZeroKnowledgeLog.shared.write(category: .systemEvent, message: "Job enqueued: \(job.name) [\(job.id)]")
+        processQueueIfNeeded()
+        return job.id
     }
 
+    /// Enqueue multiple jobs from a batch (assigns same batchID).
+    func enqueueBatch(_ requests: [(name: String, request: SDRequest)], settings: JobSettings = .default, priority: JobPriority = .normal, sessionTag: String? = nil) {
+        let batchID = UUID()
+        for (name, req) in requests {
+            var job = GenerationJob(name: name, request: req, settings: settings, priority: priority, sessionTag: sessionTag, batchID: batchID)
+            jobs.append(job)
+        }
+        persistQueue()
+        processQueueIfNeeded()
+    }
+
+    /// Cancel a specific job.
     func cancel(jobID: UUID) {
-        if let idx = queue.firstIndex(where: { $0.id == jobID }) {
-            queue[idx].status = .cancelled
-            saveQueue()
+        guard let idx = jobs.firstIndex(where: { $0.id == jobID }) else { return }
+        if jobs[idx].status == .running {
+            runningTasks[jobID]?.cancel()
+            runningTasks.removeValue(forKey: jobID)
         }
+        jobs[idx].status = .cancelled
+        jobs[idx].finishedAt = Date()
+        activeJobCount = max(0, activeJobCount - 1)
+        persistQueue()
+        processQueueIfNeeded()
     }
 
-    func cancelAll() {
-        queue.indices.forEach { queue[$0].status = .cancelled }
-        saveQueue()
+    /// Cancel all queued (not yet running) jobs.
+    func cancelAllQueued() {
+        for i in jobs.indices where jobs[i].status == .queued {
+            jobs[i].status = .cancelled
+            jobs[i].finishedAt = Date()
+        }
+        persistQueue()
     }
 
-    func pause() {
-        isPaused = true
-    }
-
-    func resume() {
-        isPaused = false
-        processNext()
-    }
-
+    /// Retry a failed job.
     func retry(jobID: UUID) {
-        guard let idx = queue.firstIndex(where: { $0.id == jobID }),
-              queue[idx].canRetry
+        guard let idx = jobs.firstIndex(where: { $0.id == jobID }),
+              jobs[idx].status == .failed
         else { return }
-        queue[idx].status    = .pending
-        queue[idx].retryCount += 1
-        queue[idx].errorMessage = nil
-        saveQueue()
-        processNext()
+        jobs[idx].status   = .queued
+        jobs[idx].attempts = 0
+        jobs[idx].errorLog = []
+        jobs[idx].startedAt   = nil
+        jobs[idx].finishedAt  = nil
+        persistQueue()
+        processQueueIfNeeded()
     }
 
-    func clearCompleted() {
-        completedJobs.removeAll()
-        saveQueue()
+    /// Remove completed/cancelled/failed jobs from history.
+    func clearHistory() {
+        jobs.removeAll { $0.status == .done || $0.status == .cancelled || $0.status == .failed }
+        persistQueue()
     }
 
-    // MARK: - Processing Loop
+    /// Start processing the queue.
+    func startQueue() {
+        isProcessing = true
+        processQueueIfNeeded()
+    }
 
-    private func processNext() {
-        guard !isPaused, !isRunning else { return }
-        guard let jobIdx = queue.firstIndex(where: { $0.status == .pending }) else { return }
+    /// Pause — lets current jobs finish but doesn't start new ones.
+    func pauseQueue() {
+        isProcessing = false
+    }
 
-        isRunning          = true
-        activeJobID        = queue[jobIdx].id
-        queue[jobIdx].status    = .running
-        queue[jobIdx].startedAt = Date()
+    // MARK: - Queue Processing
 
-        let job = queue[jobIdx]
-        saveQueue()
+    private func processQueueIfNeeded() {
+        guard isProcessing else { return }
+        guard activeJobCount < maxConcurrent else { return }
+        guard let nextJob = queuedJobs.first else { return }
 
-        Task {
+        let slotsAvailable = maxConcurrent - activeJobCount
+        let toStart = queuedJobs.prefix(slotsAvailable)
+
+        for job in toStart {
+            startJob(job)
+        }
+    }
+
+    private func startJob(_ job: GenerationJob) {
+        guard let idx = jobs.firstIndex(where: { $0.id == job.id }) else { return }
+        jobs[idx].status    = .running
+        jobs[idx].startedAt = Date()
+        activeJobCount += 1
+
+        let task = Task {
             await executeJob(job)
-            isRunning   = false
-            activeJobID = nil
-            processNext()   // Encadenar el siguiente
         }
+        runningTasks[job.id] = task
     }
 
-    private func executeJob(_ job: QueueJob) async {
-        guard let idx = queue.firstIndex(where: { $0.id == job.id }) else { return }
+    private func executeJob(_ job: GenerationJob) async {
+        guard let idx = jobs.firstIndex(where: { $0.id == job.id }) else { return }
 
-        do {
-            switch job.type {
-            case .singleGeneration:
-                await handleSingleGeneration(job: job, idx: idx)
-            case .batchGeneration:
-                await handleBatchGeneration(job: job, idx: idx)
-            case .export:
-                await handleExport(job: job, idx: idx)
-            case .backup:
-                await handleBackup(job: job, idx: idx)
-            case .postProduction:
-                await handlePostProduction(job: job, idx: idx)
-            case .xyPlot:
-                await handleXYPlot(job: job, idx: idx)
-            }
+        let sdService = SDService()
+        await sdService.generate(request: job.request, baseURL: job.settings.baseURL)
 
-            if let currentIdx = queue.firstIndex(where: { $0.id == job.id }) {
-                queue[currentIdx].status      = .completed
-                queue[currentIdx].completedAt = Date()
-                let finished = queue.remove(at: currentIdx)
-                completedJobs.insert(finished, at: 0)
-                if completedJobs.count > 100 { completedJobs.removeLast() }
-            }
-
-        } catch {
-            if let currentIdx = queue.firstIndex(where: { $0.id == job.id }) {
-                queue[currentIdx].status       = .failed
-                queue[currentIdx].errorMessage = error.localizedDescription
-                queue[currentIdx].completedAt  = Date()
-
-                // Auto-retry
-                if autoRetry && queue[currentIdx].canRetry {
-                    queue[currentIdx].status    = .pending
-                    queue[currentIdx].retryCount += 1
-                }
-            }
+        if Task.isCancelled {
+            jobs[idx].status     = .cancelled
+            jobs[idx].finishedAt = Date()
+            activeJobCount = max(0, activeJobCount - 1)
+            runningTasks.removeValue(forKey: job.id)
+            processQueueIfNeeded()
+            return
         }
 
-        saveQueue()
-    }
-
-    // MARK: - Job Handlers
-
-    private func handleSingleGeneration(job: QueueJob, idx: Int) async {
-        // El job metadata debería tener: "prompt", "settings_json"
-        update(idx: idx, progress: 0.0, text: "Generando…")
-        // En producción: reconstruir settings desde metadata y llamar SDService
-        try? await Task.sleep(for: .milliseconds(100)) // placeholder
-        update(idx: idx, progress: 1.0, text: "Generado")
-    }
-
-    private func handleBatchGeneration(job: QueueJob, idx: Int) async {
-        update(idx: idx, progress: 0.0, text: "Ejecutando batch…")
-        // En producción: recuperar BatchJob desde metadata["job_id"] y ejecutar
-        try? await Task.sleep(for: .milliseconds(100))
-        update(idx: idx, progress: 1.0, text: "Batch completado")
-    }
-
-    private func handleExport(job: QueueJob, idx: Int) async {
-        update(idx: idx, progress: 0.0, text: "Exportando…")
-        // En producción: recuperar asset desde metadata["asset_id"] y llamar ExportEngine
-        if let assetIDStr = job.metadata["asset_id"],
-           let assetID = UUID(uuidString: assetIDStr),
-           let asset = AssetStore.shared.recentAssets.first(where: { $0.id == assetID }) {
-            do {
-                _ = try await ExportEngine.shared.export(asset: asset, addWatermark: true)
-                update(idx: idx, progress: 1.0, text: "Export completado")
-            } catch {
-                update(idx: idx, progress: 0, text: "Error: \(error.localizedDescription)")
-                // Note: error is logged above; not re-thrown (function is not 'throws')
-            }
-        }
-    }
-
-    private func handleBackup(job: QueueJob, idx: Int) async {
-        update(idx: idx, progress: 0.1, text: "Iniciando backup…")
-        await BackupManager.shared.runAllBackups()
-        update(idx: idx, progress: 1.0, text: "Backup completado")
-    }
-
-    private func handlePostProduction(job: QueueJob, idx: Int) async {
-        update(idx: idx, progress: 0.0, text: "Post-procesando…")
-        try? await Task.sleep(for: .milliseconds(100))
-        update(idx: idx, progress: 1.0, text: "Post-prod completado")
-    }
-
-    private func handleXYPlot(job: QueueJob, idx: Int) async {
-        update(idx: idx, progress: 0.0, text: "Ejecutando X/Y Plot…")
-        try? await Task.sleep(for: .milliseconds(100))
-        update(idx: idx, progress: 1.0, text: "Plot completado")
-    }
-
-    // MARK: - Helpers
-
-    private func update(idx: Int, progress: Double, text: String) {
-        guard idx < queue.count else { return }
-        queue[idx].progress     = progress
-        queue[idx].progressText = text
-    }
-
-    // MARK: - Queue Convenience
-
-    /// Encolar export de todos los assets aprobados pendientes.
-    func enqueueAllPendingExports() {
-        let pending = AssetStore.shared.recentAssets.filter {
-            $0.statusEnum == .approved && ($0.cleanPath == nil || $0.cleanPath!.isEmpty)
-        }
-        for asset in pending {
-            guard let id = asset.id else { continue }
-            enqueue(
-                type:     .export,
-                label:    "Export · \(asset.baseName ?? id.uuidString.prefix(8).description)",
-                priority: .normal,
-                metadata: ["asset_id": id.uuidString]
+        if let image = sdService.generatedImage {
+            // Save to vault
+            let asset = await AssetStore.shared.saveAsset(
+                image:      image,
+                request:    job.request,
+                seed:       sdService.lastSeed,
+                sessionTag: job.sessionTag
             )
-        }
-    }
+            jobs[idx].resultAssetID = asset?.id
+            jobs[idx].status        = .done
+            jobs[idx].finishedAt    = Date()
 
-    /// Encolar backup programado.
-    func enqueueScheduledBackup() {
-        enqueue(
-            type:     .backup,
-            label:    "Backup programado · \(Date().shortDisplay)",
-            priority: .low
-        )
+            // Post-process if enabled
+            if job.settings.autoNSFWCheck, let asset {
+                let detector = NSFWDetector.shared
+                await detector.analyze(image: image, asset: asset)
+            }
+
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message:  "Job done: \(job.name) seed:\(sdService.lastSeed ?? -1)",
+                metadata: ["jobID": job.id.uuidString]
+            )
+
+        } else {
+            let errMsg = sdService.errorMessage ?? "Unknown error"
+            jobs[idx].errorLog.append("Attempt \(jobs[idx].attempts + 1): \(errMsg)")
+            jobs[idx].attempts += 1
+
+            if jobs[idx].attempts < maxRetries {
+                // Exponential backoff: 2s, 4s, 8s
+                let delay = UInt64(pow(2.0, Double(jobs[idx].attempts))) * 1_000_000_000
+                jobs[idx].status = .retrying
+                try? await Task.sleep(nanoseconds: delay)
+                jobs[idx].status = .queued
+            } else {
+                jobs[idx].status     = .failed
+                jobs[idx].finishedAt = Date()
+                ZeroKnowledgeLog.shared.write(
+                    category: .systemEvent,
+                    message:  "Job FAILED after \(maxRetries) attempts: \(job.name)",
+                    metadata: ["jobID": job.id.uuidString, "error": errMsg]
+                )
+            }
+        }
+
+        activeJobCount = max(0, activeJobCount - 1)
+        runningTasks.removeValue(forKey: job.id)
+        persistQueue()
+        processQueueIfNeeded()
     }
 
     // MARK: - Persistence
 
-    private struct QueuePersistence: Codable {
-        var queue:        [QueueJob]
-        var completedJobs: [QueueJob]
+    private let persistenceKey = "sdpipeline.jobQueue.v2"
+
+    private func persistQueue() {
+        // Only persist non-running jobs (running jobs are transient)
+        let persistable = jobs.filter { $0.status != .running && $0.status != .retrying }
+        guard let data = try? JSONEncoder().encode(persistable) else { return }
+        UserDefaults.standard.set(data, forKey: persistenceKey)
     }
 
-    private var persistenceURL: URL? {
-        VaultManager.shared.vaultMetaURL?.appending(path: "job_queue.json")
-    }
-
-    private func saveQueue() {
-        guard let url = persistenceURL else { return }
-        let payload = QueuePersistence(queue: queue, completedJobs: Array(completedJobs.prefix(50)))
-        if let data = try? JSONEncoder.pretty.encode(payload) {
-            try? data.write(to: url, options: .atomic)
-        }
-    }
-
-    private func loadQueue() {
-        guard let url = persistenceURL,
-              let data = try? Data(contentsOf: url),
-              let payload = try? JSONDecoder.iso8601.decode(QueuePersistence.self, from: data)
+    private func loadPersistedQueue() {
+        guard let data = UserDefaults.standard.data(forKey: persistenceKey),
+              let loaded = try? JSONDecoder().decode([GenerationJob].self, from: data)
         else { return }
-        // Al cargar, marcar jobs en "running" como fallidos (crash recovery)
-        queue = payload.queue.map {
-            var job = $0
-            if job.status == .running { job.status = .failed; job.errorMessage = "App restarted" }
-            return job
+
+        // Reset any previously-running jobs back to queued
+        jobs = loaded.map { job in
+            var j = job
+            if j.status == .running || j.status == .retrying {
+                j.status = .queued
+                j.startedAt = nil
+            }
+            return j
         }
-        completedJobs = payload.completedJobs
+    }
+
+    // MARK: - Statistics
+
+    struct QueueStats {
+        let totalJobs:    Int
+        let completed:    Int
+        let failed:       Int
+        let cancelled:    Int
+        let queued:       Int
+        let avgTimeLabel: String
+        let successRate:  Double   // 0.0–1.0
+    }
+
+    var stats: QueueStats {
+        let total     = jobs.count
+        let done      = completedJobs.count
+        let failed    = failedJobs.count
+        let cancelled = cancelledJobs.count
+        let queued    = queuedJobs.count
+        let finished  = done + failed
+        let rate      = finished > 0 ? Double(done) / Double(finished) : 0
+
+        var avgLabel = "—"
+        if let avg = averageJobTime {
+            avgLabel = avg < 60 ? String(format: "%.0fs", avg) : String(format: "%.0fm", avg / 60)
+        }
+
+        return QueueStats(
+            totalJobs:    total,
+            completed:    done,
+            failed:       failed,
+            cancelled:    cancelled,
+            queued:       queued,
+            avgTimeLabel: avgLabel,
+            successRate:  rate
+        )
     }
 }
 
-// MARK: - JobQueueView
+// MARK: - SDRequest Codable support for job persistence
 
-struct JobQueueView: View {
-
-    @StateObject private var manager = JobQueueManager.shared
-
-    var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider().background(Color.white.opacity(0.06))
-
-            if manager.queue.isEmpty && manager.completedJobs.isEmpty {
-                emptyState
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        if !manager.queue.isEmpty {
-                            sectionHeader("En cola (\(manager.queue.count))")
-                            ForEach(manager.queue) { job in
-                                jobRow(job, isCompleted: false)
-                                Divider().background(Color.white.opacity(0.04))
-                            }
-                        }
-                        if !manager.completedJobs.isEmpty {
-                            sectionHeader("Completados (\(manager.completedJobs.count))")
-                            ForEach(manager.completedJobs.prefix(20)) { job in
-                                jobRow(job, isCompleted: true)
-                                Divider().background(Color.white.opacity(0.04))
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .background(Color(red: 0.09, green: 0.09, blue: 0.12))
-        .cornerRadius(12)
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.07), lineWidth: 1))
-    }
-
-    var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "list.bullet.below.rectangle")
-                .font(.system(size: 12))
-                .foregroundColor(Color(hex: "#7c6af7"))
-            Text("Job Queue")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundColor(.white)
-            Spacer()
-            if manager.isPaused {
-                Button(action: { manager.resume() }) {
-                    Image(systemName: "play.fill").font(.system(size: 11))
-                        .foregroundColor(Color(hex: "#34d399"))
-                }
-                .buttonStyle(.plain)
-            } else {
-                Button(action: { manager.pause() }) {
-                    Image(systemName: "pause.fill").font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-            Button(action: { manager.enqueueAllPendingExports() }) {
-                Image(systemName: "plus.circle").font(.system(size: 12))
-                    .foregroundColor(Color(hex: "#7c6af7"))
-            }
-            .buttonStyle(.plain)
-            .help("Encolar todos los exports pendientes")
-        }
-        .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(Color.white.opacity(0.03))
-    }
-
-    func sectionHeader(_ title: String) -> some View {
-        Text(title)
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundColor(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 14).padding(.vertical, 6)
-            .background(Color.white.opacity(0.02))
-    }
-
-    func jobRow(_ job: QueueJob, isCompleted: Bool) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: job.type.icon)
-                .font(.system(size: 11))
-                .foregroundColor(Color(hex: job.status.color))
-                .frame(width: 18)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(job.label)
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.85))
-                    .lineLimit(1)
-                HStack(spacing: 6) {
-                    Text(job.status.rawValue)
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(Color(hex: job.status.color))
-                    Text("·").font(.system(size: 9)).foregroundColor(.secondary)
-                    Text(job.priority.label)
-                        .font(.system(size: 9))
-                        .foregroundColor(Color(hex: job.priority.color))
-                    if job.status == .running {
-                        Text(job.progressText)
-                            .font(.system(size: 9))
-                            .foregroundColor(.secondary)
-                    }
-                }
-                if job.status == .running {
-                    ProgressView(value: job.progress)
-                        .progressViewStyle(.linear)
-                        .tint(Color(hex: "#7c6af7"))
-                        .frame(maxWidth: 160)
-                }
-                if let err = job.errorMessage {
-                    Text(err.truncated(50))
-                        .font(.system(size: 9))
-                        .foregroundColor(Color(hex: "#ef4444"))
-                }
-            }
-
-            Spacer()
-
-            HStack(spacing: 6) {
-                if job.canRetry {
-                    Button(action: { manager.retry(jobID: job.id) }) {
-                        Image(systemName: "arrow.clockwise").font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                    }.buttonStyle(.plain)
-                }
-                if !isCompleted && job.status == .pending {
-                    Button(action: { manager.cancel(jobID: job.id) }) {
-                        Image(systemName: "xmark").font(.system(size: 10))
-                            .foregroundColor(.secondary.opacity(0.5))
-                    }.buttonStyle(.plain)
-                }
-            }
-        }
-        .padding(.horizontal, 12).padding(.vertical, 7)
-    }
-
-    var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "list.bullet.below.rectangle")
-                .font(.system(size: 28))
-                .foregroundColor(.white.opacity(0.08))
-            Text("La cola está vacía")
-                .font(.system(size: 12))
-                .foregroundColor(.secondary)
-            Button(action: { manager.enqueueAllPendingExports() }) {
-                Text("Encolar exports pendientes")
-                    .font(.system(size: 11))
-                    .foregroundColor(Color(hex: "#7c6af7"))
-            }
-            .buttonStyle(.plain)
-        }
-        .frame(maxWidth: .infinity).padding(30)
-    }
+extension SDRequest: Codable {
+    // Already Codable from Models.swift — no additional implementation needed
 }

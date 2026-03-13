@@ -189,8 +189,11 @@ final class TaggingEngine: ObservableObject {
             index:        index.mapValues { Array($0) },
             tagFrequency: tagFrequency
         )
-        guard let data = try? JSONEncoder.pretty.encode(payload) else { return }
-        try? data.write(to: url, options: .atomic)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting     = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(payload) else { return }
+        try? data.write(to: url, options: Data.WritingOptions.atomic)
     }
 }
 

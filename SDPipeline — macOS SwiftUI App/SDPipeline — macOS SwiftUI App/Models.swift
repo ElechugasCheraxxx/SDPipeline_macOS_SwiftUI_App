@@ -1,9 +1,9 @@
 import Foundation
+import CoreData
 
 // MARK: - SD API Request (Automatic1111 full spec)
 
 struct SDRequest: Codable {
-    // Core
     var prompt: String
     var negative_prompt: String
     var seed: Int
@@ -27,7 +27,7 @@ struct SDRequest: Codable {
     var restore_faces: Bool
     var tiling: Bool
 
-    // Extra metadata (ignored by A1111 but useful for logging)
+    // Extra metadata (ignored by A1111)
     var override_settings: [String: String]?
 
     init(
@@ -85,6 +85,31 @@ struct SDResponseParameters: Codable {
     let steps: Int?
 }
 
+// MARK: - SD Progress Response (polling /sdapi/v1/progress)
+
+struct SDProgressResponse: Codable {
+    let progress: Double
+    let eta_relative: Double
+    let state: SDProgressState?
+    let current_image: String?
+    let textinfo: String?
+
+    struct SDProgressState: Codable {
+        let job: String?
+        let job_count: Int?
+        let job_no: Int?
+        let sampling_step: Int?
+        let sampling_steps: Int?
+    }
+
+    var percentDisplay: String { "\(Int(progress * 100))%" }
+
+    var etaDisplay: String {
+        guard eta_relative > 0 else { return "" }
+        return String(format: "ETA %.0fs", eta_relative)
+    }
+}
+
 // MARK: - Pipeline Stage
 
 enum PipelineStage: String, CaseIterable {
@@ -93,6 +118,8 @@ enum PipelineStage: String, CaseIterable {
     case building   = "Building Prompt"
     case sending    = "Sending to SD"
     case receiving  = "Receiving Image"
+    case postproc   = "Post-Processing"
+    case saving     = "Saving to Vault"
     case done       = "Done"
     case error      = "Error"
 }
@@ -107,7 +134,7 @@ struct GenerationSettings {
     var height: Int             = 768
     var samplerName: String     = "DPM++ 2M Karras"
     var seed: Int               = -1
-    var checkpoint: String      = ""  // ← nuevo campo para el checkpoint del modelo
+    var checkpoint: String      = ""
     var sdBaseURL: String       = "http://127.0.0.1:7860"
 
     // Hires fix
@@ -118,6 +145,11 @@ struct GenerationSettings {
     var denoisingStrength: Double = 0.45
 
     var restoreFaces: Bool      = false
+
+    // Post-generation pipeline flags (new)
+    var autoRunADetailer: Bool  = false
+    var autoRunNSFWCheck: Bool  = true
+    var autoRunPostProd: Bool   = false
 
     var webuiScriptPath: String = {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -141,7 +173,6 @@ struct GenerationSettings {
 
 struct PromptBuilder {
 
-    /// Keys to always skip regardless of context
     private static let metaKeys: Set<String> = [
         "version", "project_name", "character_id", "generation_count",
         "consistency_lock", "enabled", "max_allowed_variation_percent",
@@ -156,23 +187,17 @@ struct PromptBuilder {
         "coverage_protocol", "safety_compliance_layer"
     ]
 
-    /// Ordered sections to extract as positive prompt tokens
-    /// Each tuple: (json_key_path, display_prefix_or_nil)
     private static let positiveMap: [(keys: [String], prefix: String?)] = [
-        // Subject identity
         (["subject_system", "identity", "archetype"],           nil),
         (["subject_system", "identity", "name"],                nil),
         (["subject_system", "identity", "gender"],              nil),
         (["subject_system", "biometrics", "body_type"],         nil),
-        // Expression
         (["subject_system", "expression_engine", "default_expression"], nil),
         (["subject_system", "expression_engine", "smile_type"],         nil),
         (["subject_system", "expression_engine", "editorial_emotion"],  nil),
-        // Style
         (["editorial_style_system", "style_category"],          nil),
         (["editorial_style_system", "visual_tone"],             nil),
         (["editorial_style_system", "target_industry"],         nil),
-        // Wardrobe
         (["wardrobe_engine", "outfit_category"],                nil),
         (["wardrobe_engine", "style_reference"],                nil),
         (["wardrobe_engine", "fabric_physics", "movement_behavior"], nil),
@@ -180,53 +205,39 @@ struct PromptBuilder {
         (["wardrobe_engine", "layering_system", "secondary_layer"], nil),
         (["wardrobe_engine", "layering_system", "outer_layer"], nil),
         (["wardrobe_engine", "layering_system", "accessories"], nil),
-        // Pose
         (["pose_engine", "pose_name"],                          nil),
         (["pose_engine", "pose_style"],                         nil),
         (["pose_engine", "body_orientation"],                   nil),
         (["pose_engine", "arm_positioning"],                    nil),
         (["pose_engine", "editorial_action"],                   nil),
-        // Environment
         (["environment_system", "location_type"],               nil),
         (["environment_system", "setting_style"],               nil),
         (["environment_system", "time_of_day"],                 nil),
         (["environment_system", "ambient_energy"],              nil),
         (["environment_system", "color_grading_reference"],     nil),
         (["environment_system", "prop_interaction"],            nil),
-        // Lighting
         (["lighting_engine", "lighting_style"],                 nil),
         (["lighting_engine", "key_light", "color_temperature"], nil),
-        // Camera
         (["camera_engine", "camera_type"],                      nil),
         (["camera_engine", "framing_type"],                     nil),
         (["camera_engine", "depth_of_field_strength"],          nil),
         (["camera_engine", "camera_angle"],                     nil),
-        // Brand / editorial voice
         (["brand_projection", "editorial_voice"],               nil),
-        // Explicit prompts from generation_engine (highest priority → prepended)
         (["generation_engine", "primary_prompt"],               nil),
     ]
 
-    // MARK: Public API
-
-    /// Smart extraction from the AI Model Builder JSON schema
     static func buildFromEditorialSchema(_ json: Any) -> (positive: String, negative: String) {
-        guard let dict = json as? [String: Any] else {
-            return (buildFlat(from: json), "")
-        }
+        guard let dict = json as? [String: Any] else { return (buildFlat(from: json), "") }
 
-        // 1. Check for explicit primary_prompt first
         var positiveTokens: [String] = []
 
         if let genEngine = dict["generation_engine"] as? [String: Any],
            let primary = genEngine["primary_prompt"] as? String, !primary.isEmpty {
             positiveTokens.append(primary)
-            // Also add variation prompts
             if let variations = genEngine["variation_prompts"] as? [String] {
                 positiveTokens.append(contentsOf: variations.filter { !$0.isEmpty })
             }
         } else {
-            // 2. Walk the priority map and collect tokens
             for entry in positiveMap {
                 if let value = resolvePath(entry.keys, in: dict) {
                     let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -240,10 +251,7 @@ struct PromptBuilder {
             }
         }
 
-        // 3. Append quality boosters based on editorial style scores
         positiveTokens.append(contentsOf: qualityBoosters(from: dict))
-
-        // 4. Negative prompt
         let negative = extractNegative(from: dict)
 
         let positive = positiveTokens
@@ -255,41 +263,33 @@ struct PromptBuilder {
         return (positive, negative)
     }
 
-    /// Fallback for arbitrary / non-editorial JSON
     static func buildFlat(from json: Any, prefix: String = "") -> String {
         var tokens: [String] = []
         extractFlat(value: json, key: prefix, into: &tokens)
         return tokens.joined(separator: ", ")
     }
 
-    /// Check if JSON contains a bare "prompt" key (legacy support)
     static func extractDirectPrompt(from json: Any) -> String? {
         guard let dict = json as? [String: Any] else { return nil }
         if let p = dict["prompt"] as? String, !p.isEmpty { return p }
         return nil
     }
 
-    // MARK: Private helpers
-
-    /// Resolve a dotted key path like ["lighting_engine","key_light","color_temperature"]
     private static func resolvePath(_ keys: [String], in dict: [String: Any]) -> String? {
         var current: Any = dict
         for key in keys {
             guard let d = current as? [String: Any], let next = d[key] else { return nil }
             current = next
         }
-        // Accept strings and booleans (e.g. "enabled": true → "rim light enabled")
         if let s = current as? String { return s.isEmpty ? nil : s }
         if let b = current as? Bool   { return b ? keys.last : nil }
         return nil
     }
 
     private static func extractNegative(from dict: [String: Any]) -> String {
-        // Prefer explicit negative_prompt array
         if let arr = dict["negative_prompt"] as? [String], !arr.isEmpty {
             return arr.joined(separator: ", ")
         }
-        // Try generation_engine negative
         if let gen = dict["generation_engine"] as? [String: Any],
            let neg = gen["negative_prompt"] as? String, !neg.isEmpty {
             return neg
@@ -297,11 +297,9 @@ struct PromptBuilder {
         return ""
     }
 
-    /// Append quality/style tokens based on numeric scores in the schema
     private static func qualityBoosters(from dict: [String: Any]) -> [String] {
         var boosters: [String] = []
-
-        let components = (dict["editorial_style_system"] as? [String: Any])?["components"] as? [String: Any]
+        let components    = (dict["editorial_style_system"] as? [String: Any])?["components"] as? [String: Any]
         let lightingDrama = components?["lighting_drama_0_10"] as? Int ?? 0
         let cameraStory   = components?["camera_storytelling_0_10"] as? Int ?? 0
 
@@ -311,10 +309,9 @@ struct PromptBuilder {
         if cameraStory >= 8 { boosters.append("editorial photography, award-winning composition") }
         else if cameraStory >= 5 { boosters.append("editorial photography") }
 
-        // Camera lens → depth-of-field hint
         if let camEngine = dict["camera_engine"] as? [String: Any] {
-            if let lens = camEngine["lens_mm"] as? Int {
-                if lens >= 85  { boosters.append("shallow depth of field, bokeh") }
+            if let lens = camEngine["lens_mm"] as? Int, lens >= 85 {
+                boosters.append("shallow depth of field, bokeh")
             }
             if let aperture = camEngine["aperture"] as? String,
                ["f/1.4", "f/1.8"].contains(aperture) {
@@ -322,44 +319,34 @@ struct PromptBuilder {
             }
         }
 
-        // Hires indicator
         let aspScore = (dict["brand_projection"] as? [String: Any])?["aspirational_level_0_10"] as? Int ?? 0
         if aspScore >= 8 { boosters.append("ultra high resolution, 8k, masterpiece") }
         else             { boosters.append("high quality, detailed") }
 
-        // Rim light
         if let rimEnabled = (dict["lighting_engine"] as? [String: Any])?["rim_light"] as? [String: Any],
            let on = rimEnabled["enabled"] as? Bool, on {
             boosters.append("rim lighting")
         }
-
         return boosters
     }
 
-    // Flat fallback extraction (skips meta keys)
     private static func extractFlat(value: Any, key: String, into tokens: inout [String]) {
         let lowKey = key.lowercased()
-        // Skip known metadata keys
         if metaKeys.contains(lowKey) { return }
         if lowKey.contains("id") || lowKey.contains("timestamp") ||
-           lowKey.contains("url") || lowKey.contains("hash")     { return }
+           lowKey.contains("url") || lowKey.contains("hash") { return }
 
         switch value {
         case let dict as [String: Any]:
-            for (k, v) in dict.sorted(by: { $0.key < $1.key }) {
-                extractFlat(value: v, key: k, into: &tokens)
-            }
+            for (k, v) in dict.sorted(by: { $0.key < $1.key }) { extractFlat(value: v, key: k, into: &tokens) }
         case let array as [Any]:
             for item in array { extractFlat(value: item, key: key, into: &tokens) }
         case let str as String where !str.isEmpty:
             tokens.append(str)
-        default:
-            break
+        default: break
         }
     }
 }
-
-// MARK: - Array unique helper
 
 private extension Array where Element: Hashable {
     func uniqued() -> [Element] {
