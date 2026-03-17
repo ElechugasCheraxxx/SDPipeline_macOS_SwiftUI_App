@@ -867,7 +867,7 @@ struct RightPanelView: View {
             }.buttonStyle(.plain)
 
             Button(action: { showSavePreset = true }) {
-                Image(systemName: "bookmark.badge.plus").font(.system(size: 11))
+                Image(systemName: "bookmark.fill").font(.system(size: 11))
                     .foregroundColor(Color(hex: "#f59e0b"))
             }.buttonStyle(.plain).help("Guardar como preset")
 

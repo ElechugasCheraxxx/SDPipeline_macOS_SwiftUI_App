@@ -407,11 +407,17 @@ final class AppEnvironment: ObservableObject {
         }
 
         let baseURL = UserDefaults.standard.string(forKey: "a1111.baseURL") ?? "http://127.0.0.1:7860"
-        if let url  = URL(string: "\(baseURL)/sdapi/v1/progress") {
-            let isOnline = (try? await URLSession.shared.data(from: url)) != nil
-            if !isOnline {
-                issues.append("A1111 no está corriendo en \(baseURL) — inicia Stable Diffusion WebUI")
-            }
+        // Usar /internal/ping en lugar de /sdapi/v1/progress para evitar spam en el log
+        // cuando A1111 no está corriendo (la ruta de progreso genera muchos mensajes NSURLError).
+        let pingURL = URL(string: "\(baseURL)/internal/ping")
+        let isOnline: Bool
+        if let url = pingURL {
+            isOnline = (try? await URLSession.shared.data(from: url)) != nil
+        } else {
+            isOnline = false
+        }
+        if !isOnline {
+            issues.append("A1111 no está corriendo en \(baseURL) — inicia Stable Diffusion WebUI")
         }
 
         if GPUMonitor.shared.deviceName == "Detecting…" {
@@ -463,7 +469,7 @@ final class AppEnvironment: ObservableObject {
         report.promptVersioningOK = PromptVersioningStore.shared.versions.count >= 0
 
         let baseURL = UserDefaults.standard.string(forKey: "a1111.baseURL") ?? "http://127.0.0.1:7860"
-        if let url  = URL(string: "\(baseURL)/sdapi/v1/progress") {
+        if let url  = URL(string: "\(baseURL)/internal/ping") {
             report.a1111OK = (try? await URLSession.shared.data(from: url)) != nil
         }
         return report
