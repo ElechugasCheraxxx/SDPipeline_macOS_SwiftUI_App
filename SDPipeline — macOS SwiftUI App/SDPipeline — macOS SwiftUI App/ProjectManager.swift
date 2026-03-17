@@ -349,12 +349,14 @@ extension VaultManager {
         set { _activeProjectDirectory = newValue }
     }
 
-    // Backing storage via associated object pattern
+    // Backing storage via associated object pattern.
+    // Using a UInt8 key avoids the "exposes internal String representation"
+    // warning that arises when taking &String as UnsafeRawPointer.
     private var _activeProjectDirectory: URL? {
         get { objc_getAssociatedObject(self, &VaultManager.projectDirKey) as? URL }
         set { objc_setAssociatedObject(self, &VaultManager.projectDirKey, newValue, .OBJC_ASSOCIATION_RETAIN) }
     }
-    private static var projectDirKey = "activeProjectDirectory"
+    private static var projectDirKey: UInt8 = 0
 
     /// Override generacionesURL para usar el directorio del proyecto activo.
     var projectGeneracionesURL: URL? {
@@ -588,4 +590,5 @@ struct ProjectBadge: View {
         }
     }
 }
+
 

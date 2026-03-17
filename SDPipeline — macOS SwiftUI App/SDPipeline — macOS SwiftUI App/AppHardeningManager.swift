@@ -334,12 +334,14 @@ final class AppHardeningManager: ObservableObject {
 
     private func checkMacOSSecurityFeatures() -> SecurityCheckResult {
         // Verificar Gatekeeper y SIP (informativo)
-        let sipEnabled   = isSIPEnabled()
-        let gatekeeperOK = true   // Si la app está corriendo, Gatekeeper la aprobó
+        let sipEnabled = isSIPEnabled()
+        // gatekeeperOK is always true: if the app is running, Gatekeeper approved it.
+        // A constant is used here instead of a ternary to suppress the
+        // "will never be executed" dead-code warning on the false branch.
 
         let detail = """
         System Integrity Protection: \(sipEnabled ? "✅ Habilitado" : "⚠️ Deshabilitado")
-        Gatekeeper: \(gatekeeperOK ? "✅ App validada" : "⚠️ Sin validar")
+        Gatekeeper: ✅ App validada
         macOS App Sandbox: \(isAppSandboxed() ? "✅ Activo" : "ℹ️ No activo (desarrollo)")
         """
 
@@ -529,4 +531,5 @@ private struct SecurityCheckRow: View {
         .background(result.passed ? Color.clear : icon.1.opacity(0.05))
     }
 }
+
 

@@ -21,10 +21,25 @@ import CryptoKit
 // MARK: - BatchExportConfig / BatchExportResult (top-level — nonisolated)
 
 struct BatchExportConfig: Sendable {
-    var preset:           ExportEngine.ExportPreset          = ExportEngine.ExportPreset(name: "batch")
-    var maxConcurrent:    Int                                = 2
-    var continueOnError:  Bool                               = true
-    var progressCallback: (@Sendable (Int, Int) -> Void)?   = nil  // (completed, total)
+    var preset:           ExportEngine.ExportPreset
+    var maxConcurrent:    Int
+    var continueOnError:  Bool
+    var progressCallback: (@Sendable (Int, Int) -> Void)?
+
+    // Explicit nonisolated init so BatchExportConfig() can be constructed
+    // as a default-parameter expression in nonisolated contexts without
+    // inheriting @MainActor isolation from ExportEngine. (fixes SW6 warning)
+    nonisolated init(
+        preset:           ExportEngine.ExportPreset        = ExportEngine.ExportPreset(name: "batch"),
+        maxConcurrent:    Int                              = 2,
+        continueOnError:  Bool                             = true,
+        progressCallback: (@Sendable (Int, Int) -> Void)? = nil
+    ) {
+        self.preset           = preset
+        self.maxConcurrent    = maxConcurrent
+        self.continueOnError  = continueOnError
+        self.progressCallback = progressCallback
+    }
 }
 
 struct BatchExportResult {
@@ -215,7 +230,10 @@ final class ExportEngine: ObservableObject {
         await withTaskGroup(of: (UncheckedAssetRef, Result<ExportResult, Error>).self) { group in
             for asset in assets {
                 let ref = UncheckedAssetRef(asset: asset)
-                group.addTask {
+                // @MainActor keeps GeneratedAsset on the main-actor executor so it
+                // never crosses a concurrency boundary. Both export() and exportBatch()
+                // are @MainActor-isolated, so this adds no extra serialisation cost.
+                group.addTask { @MainActor in
                     await semaphore.wait()
                     defer { Task { await semaphore.signal() } }
                     do {
@@ -538,4 +556,5 @@ extension DataProtocol {
         return value
     }
 }
+
 
