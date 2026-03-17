@@ -368,6 +368,21 @@ final class PromptDatabase: ObservableObject {
 
     // MARK: - Filter
 
+    // MARK: - Search (FIX: faltaba func search directa, solo existía applyFilter)
+
+    /// Búsqueda textual directa sobre positive, negative, title, tags y notes.
+    /// Retorna resultados ordenados por relevancia (coincidencias en título primero).
+    func search(query: String) -> [PromptEntry] {
+        guard !query.isEmpty else { return entries }
+        let filter = PromptFilter(query: query)
+        return applyFilter(filter, to: entries)
+    }
+
+    /// Búsqueda con filtro completo (checkpoint, rating, tags, favoritos).
+    func search(filter: PromptFilter) -> [PromptEntry] {
+        applyFilter(filter, to: entries)
+    }
+
     func applyFilter(_ f: PromptFilter, to list: [PromptEntry]) -> [PromptEntry] {
         var result = list
 

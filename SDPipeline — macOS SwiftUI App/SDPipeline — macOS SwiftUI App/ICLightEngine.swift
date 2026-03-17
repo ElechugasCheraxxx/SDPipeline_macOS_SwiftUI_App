@@ -99,7 +99,7 @@ final class ICLightEngine: ObservableObject {
     // MARK: - Presets
 
     struct LightingPreset: Identifiable, Codable {
-        let id:          UUID            = UUID()
+        var id:          UUID            = UUID()
         var name:        String
         var mode:        ICLightMode
         var direction:   LightingDirection
@@ -107,6 +107,12 @@ final class ICLightEngine: ObservableObject {
         var strength:    Double
         var tags:        [String]        = []
         var isBuiltIn:   Bool            = true
+
+        /// Short human-readable description shown in preset list rows.
+        /// Returns the custom light prompt when set, otherwise the direction's display name.
+        var description: String {
+            lightPrompt.isEmpty ? direction.displayName : lightPrompt
+        }
     }
 
     // MARK: - State
@@ -215,7 +221,7 @@ final class ICLightEngine: ObservableObject {
         progress     = 0.4
         progressText = "Enviando a img2img…"
 
-        guard let base = SDService.shared.baseURL else { throw ICLightError.sdNotAvailable }
+        guard let base = URL(string: UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860") else { throw ICLightError.sdNotAvailable }
         var req = URLRequest(url: base.appending(path: "sdapi/v1/img2img"), timeoutInterval: 300)
         req.httpMethod = "POST"
         req.httpBody   = try? JSONSerialization.data(withJSONObject: payload)

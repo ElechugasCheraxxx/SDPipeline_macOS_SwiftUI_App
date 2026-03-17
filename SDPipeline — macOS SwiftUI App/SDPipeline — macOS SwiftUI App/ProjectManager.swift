@@ -109,7 +109,7 @@ final class ProjectManager: ObservableObject {
         category:    ProjectCategory = .general,
         color:       String        = "#7c6af7"
     ) -> Project {
-        var project = Project(
+        let project = Project(
             name:        name,
             description: description,
             category:    category,
@@ -588,3 +588,4 @@ struct ProjectBadge: View {
         }
     }
 }
+

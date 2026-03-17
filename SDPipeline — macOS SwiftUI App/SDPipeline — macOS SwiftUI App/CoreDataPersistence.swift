@@ -24,18 +24,16 @@ import Combine
 final class CoreDataPersistence: ObservableObject {
 
     static let shared = CoreDataPersistence()
-    private init() { setup() }
 
     // MARK: - Container
 
     let container: NSPersistentContainer
 
-    private func setup() {
-        // Usar modelo programático para evitar dependencia de .xcdatamodeld
-        // AssetStore.swift ya inicializa el container — aquí extendemos el modelo
-    }
-
-    init(inMemory: Bool = false) {
+    // FIX: Merged private init() + init(inMemory:) into a single designated
+    // initializer so that `container` is always fully initialized before
+    // any instance method (formerly `setup()`) can be called on `self`.
+    // The empty `setup()` helper has been removed.
+    private init(inMemory: Bool = false) {
         container = NSPersistentContainer(
             name: "SDPipelineStudio",
             managedObjectModel: Self.buildFullModel()
@@ -240,12 +238,16 @@ final class CoreDataPersistence: ObservableObject {
         if let store = coordinator.persistentStore(for: storeURL) {
             _ = store // store already loaded
         } else {
-            try? coordinator.addPersistentStore(
-                ofType: NSSQLiteStoreType,
-                configurationName: nil,
-                at: storeURL,
-                options: options
-            )
+            do {
+                try coordinator.addPersistentStore(
+                    ofType: NSSQLiteStoreType,
+                    configurationName: nil,
+                    at: storeURL,
+                    options: options
+                )
+            } catch {
+                print("[CoreData] Failed to add persistent store: \(error)")
+            }
         }
     }
 }

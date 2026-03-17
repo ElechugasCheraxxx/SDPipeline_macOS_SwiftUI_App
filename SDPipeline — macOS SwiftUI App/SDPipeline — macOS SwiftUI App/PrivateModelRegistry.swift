@@ -404,7 +404,7 @@ private struct ModelRegistryDetailView: View {
                         .padding(8)
                         .background(Color.secondary.opacity(0.06))
                         .cornerRadius(8)
-                        .onChange(of: entry.personalNotes) { _ in
+                        .onChange(of: entry.personalNotes) {
                             try? registry.save(entry: entry)
                         }
                 }
@@ -496,3 +496,4 @@ private struct BenchmarkRow: View {
         }
     }
 }
+

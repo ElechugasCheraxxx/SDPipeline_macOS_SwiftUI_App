@@ -4,117 +4,8 @@ import SwiftUI
 import Combine
 import UniformTypeIdentifiers
 
-// MARK: - CharacterProfile
-// Un personaje es una entidad creativa reutilizable que encapsula:
-//   - Descripción física y de estilo
-//   - LoRAs asociados con pesos por defecto
-//   - Seeds favoritos vinculados
-//   - Prompts base (positivo + negativo)
-//   - Imagen de referencia (baseImage) para img2img / ControlNet
-
-struct CharacterProfile: Codable, Identifiable, Hashable {
-
-    var id:          UUID   = UUID()
-    var createdAt:   Date   = Date()
-    var updatedAt:   Date   = Date()
-
-    // ── Identidad ──────────────────────────────────────────────────
-    var name:        String                    // "Valentina", "Aurora", etc.
-    var archetype:   String  = ""             // "Latina businesswoman", "Elven mage"
-    var tags:        [String] = []            // Para búsqueda rápida
-
-    // ── Descripción física (tokens de prompt) ─────────────────────
-    var physicalDescription: PhysicalProfile
-
-    struct PhysicalProfile: Codable, Hashable {
-        var bodyType:    String = ""           // "curvy, hourglass figure"
-        var skinTone:    String = ""           // "warm olive skin"
-        var hairColor:   String = ""           // "dark brown wavy hair"
-        var eyeColor:    String = ""           // "green eyes"
-        var age:         String = ""           // "25 year old woman" (NUNCA menores)
-        var faceFeatures: String = ""          // "sharp jawline, full lips"
-        var extra:       String = ""           // Tokens adicionales libres
-    }
-
-    // ── Prompt base ────────────────────────────────────────────────
-    var basePromptPositive: String = ""       // Descripción de identidad como prompt
-    var basePromptNegative: String = ""       // Negativos específicos del personaje
-
-    // ── LoRAs vinculados ───────────────────────────────────────────
-    var linkedLoRAs: [LinkedLoRA] = []
-
-    struct LinkedLoRA: Codable, Hashable, Identifiable {
-        var id:          UUID   = UUID()
-        var loraName:    String                // Coincide con LoRAEntry.name
-        var defaultWeight: Double = 0.8
-        var triggerWord: String  = ""         // Palabra clave del LoRA (si la tiene)
-
-        var promptToken: String {
-            "<lora:\(loraName.components(separatedBy: "/").last.map { ($0 as NSString).deletingPathExtension } ?? loraName):\(String(format: "%.2f", defaultWeight))>"
-        }
-    }
-
-    // ── Seeds vinculados ───────────────────────────────────────────
-    var pinnedSeeds: [Int] = []               // Seeds que dan buenos resultados con este personaje
-
-    // ── Checkpoint preferido ───────────────────────────────────────
-    var preferredCheckpoint: String = ""      // Nombre del .safetensors preferido
-
-    // ── Imagen base ────────────────────────────────────────────────
-    var baseImageFilename: String? = nil      // Nombre del archivo en Personajes/{id}/base.png
-
-    // ── Stats ──────────────────────────────────────────────────────
-    var totalGenerations: Int = 0
-    var lastUsedAt:       Date? = nil
-    var isFavorite:       Bool  = false
-
-    // ── Computed ───────────────────────────────────────────────────
-
-    /// Construye el prompt positivo completo para este personaje.
-    var fullPositivePrompt: String {
-        let physical = [
-            physicalDescription.age,
-            physicalDescription.bodyType,
-            physicalDescription.skinTone,
-            physicalDescription.hairColor,
-            physicalDescription.eyeColor,
-            physicalDescription.faceFeatures,
-            physicalDescription.extra,
-        ].filter { !$0.isEmpty }.joined(separator: ", ")
-
-        let base = [basePromptPositive, physical]
-            .filter { !$0.isEmpty }
-            .joined(separator: ", ")
-
-        let loraTokens = linkedLoRAs
-            .map { $0.promptToken }
-            .joined(separator: " ")
-
-        let triggerWords = linkedLoRAs
-            .compactMap { $0.triggerWord.isEmpty ? nil : $0.triggerWord }
-            .joined(separator: ", ")
-
-        return [triggerWords, base, loraTokens]
-            .filter { !$0.isEmpty }
-            .joined(separator: ", ")
-    }
-
-    /// Ruta de la carpeta del personaje en el vault.
-    func characterDirectory(vault: VaultManager) -> URL? {
-        vault.personajesURL?.appending(path: id.uuidString)
-    }
-
-    /// Ruta de la imagen base en el vault.
-    func baseImageURL(vault: VaultManager) -> URL? {
-        guard let dir = characterDirectory(vault: vault) else { return nil }
-        return dir.appending(path: "base.png")
-    }
-
-    static func == (lhs: CharacterProfile, rhs: CharacterProfile) -> Bool { lhs.id == rhs.id }
-    func hash(into hasher: inout Hasher) { hasher.combine(id) }
-}
-
 // MARK: - CharacterEngine
+// CharacterProfile is defined in Models.swift (single source of truth)
 
 @MainActor
 final class CharacterEngine: ObservableObject {
@@ -156,18 +47,14 @@ final class CharacterEngine: ObservableObject {
             withIntermediateDirectories: true
         )
         guard let data = try? JSONEncoder.pretty.encode(characters) else { return }
-        try? data.write(to: url, options: .atomic)
+        try? data.write(to: url, options: Data.WritingOptions.atomic)
     }
 
     // MARK: - CRUD
 
     @discardableResult
     func create(name: String) -> CharacterProfile {
-        var c = CharacterProfile(
-            name: name,
-            physicalDescription: .init()
-        )
-        c.id = UUID()
+        let c = CharacterProfile(name: name)
         characters.insert(c, at: 0)
         createCharacterDirectory(c)
         saveAll()
@@ -176,9 +63,7 @@ final class CharacterEngine: ObservableObject {
 
     func save(_ character: CharacterProfile) {
         if let idx = characters.firstIndex(where: { $0.id == character.id }) {
-            var updated = character
-            updated.updatedAt = Date()
-            characters[idx] = updated
+            characters[idx] = character
         } else {
             characters.insert(character, at: 0)
             createCharacterDirectory(character)
@@ -222,7 +107,7 @@ final class CharacterEngine: ObservableObject {
         let imgURL = dir.appending(path: "base.png")
         guard let data = image.pngData() else { return false }
         do {
-            try data.write(to: imgURL, options: .atomic)
+            try data.write(to: imgURL, options: Data.WritingOptions.atomic)
             // Actualizar perfil con el filename
             if let idx = characters.firstIndex(where: { $0.id == character.id }) {
                 characters[idx].baseImageFilename = "base.png"

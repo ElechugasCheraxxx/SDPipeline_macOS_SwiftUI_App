@@ -216,17 +216,19 @@ struct PromptBuilderView: View {
     @StateObject private var vm            = PromptBuilderViewModel()
     @StateObject private var versionStore  = PromptVersioningStore.shared
     @StateObject private var wildcards     = WildcardEngine.shared
+    @StateObject private var autocomplete  = PromptAutoCompleteEngine.shared   // ← NEW
 
     @Binding var positivePrompt: String
     @Binding var negativePrompt: String
 
-    @State private var showNegative    = true
-    @State private var draggedBlock:   PromptBlock?
-    @State private var autoSuggest:    [String] = []
-    @State private var suggestField:   String   = ""
-    @State private var suggestCategory: PromptBlock.BlockCategory = .custom
-    @State private var showVersionPicker = false
+    @State private var showNegative      = true
+    @State private var draggedBlock:     PromptBlock?
+    @State private var autoSuggest:      [String] = []
+    @State private var suggestField:     String   = ""
+    @State private var suggestCategory:  PromptBlock.BlockCategory = .custom
+    @State private var showVersionPicker  = false
     @State private var showWildcardPicker = false
+    @State private var showACOverlay      = false   // autocompletado overlay
 
     var body: some View {
         VStack(spacing: 0) {
@@ -245,14 +247,22 @@ struct PromptBuilderView: View {
                 blockSection(title: "Negativo", blocks: $vm.negativeBlocks, isNegative: true)
             }
 
-            // ── Add Block Bar ───────────────────────────────────────────
-            addBlockBar
+            // ── Add Block Bar + Autocomplete Overlay ────────────────────
+            ZStack(alignment: .bottomLeading) {
+                addBlockBar
+
+                // Autocomplete suggestions overlay
+                if showACOverlay && !autocomplete.suggestions.isEmpty {
+                    autocompleteOverlay
+                        .offset(y: -38)
+                }
+            }
         }
         .background(Color(red: 0.09, green: 0.09, blue: 0.12))
         .cornerRadius(10)
         .onChange(of: vm.assembledPositive) { _, v in positivePrompt = v }
         .onChange(of: vm.assembledNegative) { _, v in negativePrompt = v }
-        .sheet(isPresented: $showVersionPicker) { versionPickerSheet }
+        .sheet(isPresented: $showVersionPicker)  { versionPickerSheet  }
         .sheet(isPresented: $showWildcardPicker) { wildcardPickerSheet }
     }
 
@@ -316,14 +326,12 @@ struct PromptBuilderView: View {
 
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(spacing: 4) {
-                    ForEach(blocks) { block in
+                    ForEach(blocks.wrappedValue.indices, id: \.self) { idx in
                         PromptBlockRow(
-                            block: block,
-                            onDelete: { vm.removeBlock(block, isNegative: isNegative) },
+                            block: blocks.wrappedValue[idx],
+                            onDelete: { vm.removeBlock(blocks.wrappedValue[idx], isNegative: isNegative) },
                             onUpdate: { updated in
-                                if let idx = blocks.wrappedValue.firstIndex(where: { $0.id == block.id }) {
-                                    blocks.wrappedValue[idx] = updated
-                                }
+                                blocks.wrappedValue[idx] = updated
                             }
                         )
                         .padding(.horizontal, 10)
@@ -335,7 +343,70 @@ struct PromptBuilderView: View {
         }
     }
 
-    // MARK: - Add Block Bar
+    // MARK: - Autocomplete Overlay
+
+    private var autocompleteOverlay: some View {
+        VStack(spacing: 0) {
+            // Index status bar
+            if autocomplete.isIndexing {
+                HStack(spacing: 6) {
+                    ProgressView().scaleEffect(0.5)
+                    Text("Indexando tokens SD…")
+                        .font(.system(size: 9)).foregroundColor(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .background(Color.white.opacity(0.04))
+            }
+
+            // Suggestions list
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(autocomplete.suggestions.prefix(8)) { token in
+                        Button(action: { selectToken(token) }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: token.category.icon)
+                                    .font(.system(size: 8))
+                                    .foregroundColor(Color(hex: token.category.color))
+                                Text(token.text)
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.white)
+                                if autocomplete.config.showPostCounts, let pc = token.postCount, pc > 0 {
+                                    Text(pc.compactFormatted)
+                                        .font(.system(size: 8))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .background(Color(hex: "#7c6af7").opacity(0.25))
+                            .cornerRadius(5)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 10).padding(.vertical, 6)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(red: 0.10, green: 0.10, blue: 0.14))
+                    .shadow(color: .black.opacity(0.5), radius: 8, y: -3)
+            )
+        }
+        .frame(maxWidth: .infinity)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+        .animation(.spring(response: 0.2), value: showACOverlay)
+    }
+
+    private func selectToken(_ token: PromptAutoCompleteEngine.Token) {
+        vm.addBlock(category: suggestCategory, text: token.text)
+        autocomplete.recordUsage(token)
+        suggestField    = ""
+        showACOverlay   = false
+        autoSuggest     = []
+        autocomplete.clearSuggestions()
+    }
+
+    // MARK: - Add Block Bar (v2 — wired to PromptAutoCompleteEngine)
 
     private var addBlockBar: some View {
         HStack(spacing: 6) {
@@ -348,19 +419,38 @@ struct PromptBuilderView: View {
             .frame(width: 120)
             .font(.system(size: 10))
 
-            TextField("Agregar token…", text: $suggestField)
-                .textFieldStyle(.plain)
-                .font(.system(size: 11))
-                .foregroundColor(.white)
-                .padding(.horizontal, 8).padding(.vertical, 5)
-                .background(Color.white.opacity(0.06))
-                .cornerRadius(6)
-                .onSubmit { commitBlock() }
-                .onChange(of: suggestField) { _, text in
-                    autoSuggest = suggestCategory.suggestions.filter {
-                        $0.lowercased().contains(text.lowercased()) && !text.isEmpty
-                    }.prefix(6).map { $0 }
+            ZStack(alignment: .trailing) {
+                TextField("Agregar token…", text: $suggestField)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+                    .background(Color.white.opacity(0.06))
+                    .cornerRadius(6)
+                    .onSubmit { commitBlock() }
+                    .onChange(of: suggestField) { _, text in
+                        // 1. Sugerencias de categoría (locales)
+                        autoSuggest = suggestCategory.suggestions.filter {
+                            $0.lowercased().contains(text.lowercased()) && !text.isEmpty
+                        }.prefix(4).map { $0 }
+
+                        // 2. Autocompletado del índice SD (PromptAutoCompleteEngine)
+                        if text.count >= autocomplete.config.minQueryLength {
+                            autocomplete.query(text)
+                            showACOverlay = true
+                        } else {
+                            autocomplete.clearSuggestions()
+                            showACOverlay = false
+                        }
+                    }
+
+                // Indicador indexando
+                if autocomplete.isIndexing {
+                    ProgressView()
+                        .scaleEffect(0.4)
+                        .padding(.trailing, 6)
                 }
+            }
 
             Button(action: commitBlock) {
                 Image(systemName: "plus.circle.fill")
@@ -394,7 +484,7 @@ struct PromptBuilderView: View {
                     showVersionPicker = false
                 } label: {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(version.title.isEmpty ? "(sin título)" : version.title)
+                        Text(version.label.isEmpty ? "(sin título)" : version.label)
                             .font(.system(size: 12, weight: .medium)).foregroundColor(.white)
                         Text(version.positive.prefix(80) + "…")
                             .font(.system(size: 10)).foregroundColor(.secondary).lineLimit(2)

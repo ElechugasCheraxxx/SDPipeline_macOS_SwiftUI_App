@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 import AppKit
 import SwiftUI
 import Combine
@@ -126,7 +127,7 @@ final class IPAdapterEngine: ObservableObject {
     }
 
     func checkInstalled() async -> Bool {
-        guard let base = SDService.shared.baseURL else { return false }
+        guard let base = URL(string: UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860") else { return false }
         let url = base.appending(path: "controlnet/model_list")
         guard let (data, _) = try? await URLSession.shared.data(from: url),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -449,7 +450,7 @@ struct IPAdapterPanel: View {
 
 extension CharacterProfile {
     var baseImagePath: String? {
-        get { UserDefaults.standard.string(forKey: "char.baseImage.\(id?.uuidString ?? "")") }
-        set { UserDefaults.standard.set(newValue, forKey: "char.baseImage.\(id?.uuidString ?? "")") }
+        get { UserDefaults.standard.string(forKey: "char.baseImage.\(id.uuidString)") }
+        set { UserDefaults.standard.set(newValue, forKey: "char.baseImage.\(id.uuidString)") }
     }
 }

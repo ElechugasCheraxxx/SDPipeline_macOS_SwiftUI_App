@@ -104,7 +104,7 @@ final class ACEScgColorEngine: ObservableObject {
     // MARK: - LUT Presets
 
     struct LUTPreset: Identifiable, Codable {
-        let id:          UUID    = UUID()
+        var id:          UUID    = UUID()
         let name:        String
         let description: String
         let isBuiltIn:   Bool
@@ -277,7 +277,7 @@ final class ACEScgColorEngine: ObservableObject {
 
     private struct CubeData { let size: Int; let data: Data }
     private func parseCubeFile(_ url: URL) -> CubeData? {
-        guard let content = try? String(contentsOf: url) else { return nil }
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         var size = 0
         var values: [Float] = []
         for line in content.components(separatedBy: .newlines) {
@@ -330,7 +330,7 @@ final class ACEScgColorEngine: ObservableObject {
         let rChannel = ci.applyingFilter("CIAffineTransform", parameters: [
             kCIInputTransformKey: CGAffineTransform(translationX: offset, y: 0)
         ])
-        let bChannel = ci.applyingFilter("CIAffineTransform", parameters: [
+        let _ = ci.applyingFilter("CIAffineTransform", parameters: [
             kCIInputTransformKey: CGAffineTransform(translationX: -offset, y: 0)
         ])
 
@@ -527,3 +527,4 @@ struct ACEScgPanel: View {
         }
     }
 }
+

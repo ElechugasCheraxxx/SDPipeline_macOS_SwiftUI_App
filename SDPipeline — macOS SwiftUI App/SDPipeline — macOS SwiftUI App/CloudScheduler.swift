@@ -206,7 +206,7 @@ final class CloudScheduler: ObservableObject {
             throw SchedulerError.schedulerDisabled
         }
 
-        var job = DistributedJob(request: request, priority: priority)
+        let job = DistributedJob(request: request, priority: priority)
         activeJobs.append(job)
         let jobIdx = activeJobs.count - 1
 
@@ -503,3 +503,4 @@ final class CloudScheduler: ObservableObject {
         }
     }
 }
+

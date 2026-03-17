@@ -193,7 +193,7 @@ final class ExternalEditorBridge: ObservableObject {
             FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents)
         )
         if let stream = fsEventStream {
-            FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            FSEventStreamSetDispatchQueue(stream, DispatchQueue.main)
             FSEventStreamStart(stream)
         }
     }
@@ -281,12 +281,16 @@ final class ExternalEditorBridge: ObservableObject {
 
 extension AssetVersioningStore {
     func addVersion(for asset: GeneratedAsset, image: NSImage, tag: VersionTag, label: String) async throws {
-        guard let assetID = asset.id else { return }
-        let _ = try await addVersion(
-            assetID: assetID,
-            sourceImage: image,
-            tag: tag,
-            notes: label
+        guard let assetID = asset.id,
+              let tiff    = image.tiffRepresentation,
+              let bmpRep  = NSBitmapImageRep(data: tiff),
+              let pngData = bmpRep.representation(using: .png, properties: [:])
+        else { return }
+        _ = try addVersion(
+            assetID:     assetID,
+            imageData:   pngData,
+            tag:         tag,
+            customLabel: label
         )
     }
 }

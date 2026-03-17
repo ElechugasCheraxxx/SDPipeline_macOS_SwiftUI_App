@@ -198,6 +198,21 @@ final class NSFWDetector: ObservableObject {
         if let url = logURL { try? FileManager.default.removeItem(at: url) }
     }
 
+    /// Alias público para logging desde el pipeline (ContentView, PipelineConnector).
+    /// FIX: ContentView llamaba NSFWDetector.shared.logResultZK(_:) que no existía.
+    func logResultZK(_ result: NSFWDetectionResult) {
+        appendToLog(result)
+        ZeroKnowledgeLog.shared.write(
+            category: result.action == .quarantine ? .nsfwQuarantine : .nsfwDetected,
+            message:  "NSFW [\(result.finalLevel.label)] · action: \(result.action.rawValue)",
+            metadata: [
+                "prompt":    String(result.prompt.prefix(60)),
+                "level":     result.finalLevel.label,
+                "triggers":  result.triggerWords.prefix(3).joined(separator: ",")
+            ]
+        )
+    }
+
     private func appendToLog(_ result: NSFWDetectionResult) {
         log.insert(result, at: 0)
         if log.count > 1000 { log = Array(log.prefix(1000)) }

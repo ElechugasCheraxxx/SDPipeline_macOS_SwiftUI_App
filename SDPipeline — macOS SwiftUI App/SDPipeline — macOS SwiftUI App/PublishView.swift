@@ -23,7 +23,7 @@ struct StudioPublishView: View {
 
     // Usar assets aprobados de la galería + imagen actual si existe
     var exportableAssets: [GeneratedAsset] {
-        var assets = store.recentAssets.filter { $0.statusEnum == .approved || $0.statusEnum == .draft }
+        let assets = store.recentAssets.filter { $0.statusEnum == .approved || $0.statusEnum == .draft }
         return Array(assets.prefix(20))
     }
 
@@ -473,3 +473,4 @@ struct PublishLogView: View {
         .padding(.horizontal, 14).padding(.vertical, 8)
     }
 }
+

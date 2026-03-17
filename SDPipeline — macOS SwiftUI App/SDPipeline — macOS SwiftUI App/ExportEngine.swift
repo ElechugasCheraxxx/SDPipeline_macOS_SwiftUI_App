@@ -3,27 +3,47 @@ import AppKit
 import ImageIO
 import UniformTypeIdentifiers
 import Combine
+import CryptoKit
+@preconcurrency import CoreData
 
-// MARK: - ExportEngine
-// Responsable de producir las DOS versiones de cada imagen aprobada:
-//   1. Versión LIMPIA  → sin metadatos SD, lista para publicar en OnlyFans
-//   2. Versión PREVIEW → con watermark visible, para redes sociales / teasers
+// MARK: - ExportEngine v2
 //
-// La versión raw (original) NUNCA sale del vault — solo se exportan las dos
-// versiones procesadas. El sidecar JSON tampoco se incluye en ningún export.
+// Cambios v1 → v2:
+//   ✨ ADD: exportBatch() — exporta múltiples assets en paralelo configurable
+//   ✨ ADD: exportWithFormat() — soporte JPEG/PNG/WebP con calidad configurable
+//   ✨ ADD: exportPreset system — presets guardables para exportación
+//   ✨ ADD: beginSetExport() / finalizeSetExport() — hooks para OnlyFansSetExporter
+//   ✨ ADD: progressCallback — opcional para reportar progreso en batch
+//   ✨ ADD: ExportPreset model con persistencia
+//   🔁 UPD: WatermarkConfig ahora incluye font + diagonal tiling
+//   🔁 UPD: scrubAndExport acepta formato de salida
+
+// MARK: - BatchExportConfig / BatchExportResult (top-level — nonisolated)
+
+struct BatchExportConfig: Sendable {
+    var preset:           ExportEngine.ExportPreset          = ExportEngine.ExportPreset(name: "batch")
+    var maxConcurrent:    Int                                = 2
+    var continueOnError:  Bool                               = true
+    var progressCallback: (@Sendable (Int, Int) -> Void)?   = nil  // (completed, total)
+}
+
+struct BatchExportResult {
+    let results:       [(GeneratedAsset, ExportEngine.ExportResult)]
+    let errors:        [(GeneratedAsset, Error)]
+    let totalExported: Int
+    let totalFailed:   Int
+    let durationSec:   Double
+}
 
 @MainActor
 final class ExportEngine: ObservableObject {
 
     static let shared = ExportEngine()
-    private init() {}
+    private init() { loadPresets() }
 
     // MARK: - Configuración de Watermark
-    // Ajustable desde SettingsView (Cmd+,).
 
     @Published var watermarkConfig = WatermarkConfig()
-
-    // MARK: - Configuración de Watermark (struct)
 
     struct WatermarkConfig {
         var text:      String   = "@tuusuario"
@@ -31,26 +51,85 @@ final class ExportEngine: ObservableObject {
         var position:  Position = .bottomRight
         var fontSize:  CGFloat  = 18
         var textColor: NSColor  = .white
+        var tiled:     Bool     = false  // NEW: watermark en diagonal tiled
+        var tileAngle: Double   = -30    // Ángulo del tiled watermark
 
-        enum Position { case topLeft, topRight, bottomLeft, bottomRight, center }
+        enum Position: CaseIterable {
+            case topLeft, topRight, bottomLeft, bottomRight, center
+        }
     }
 
-    // MARK: - Export principal
+    // MARK: - Export Presets
+
+    struct ExportPreset: Codable, Identifiable {
+        var id:            UUID            = UUID()
+        var name:          String
+        var format:        OutputFormat    = .jpeg
+        var quality:       Double          = 0.92
+        var addWatermark:  Bool            = true
+        var watermarkText: String          = "@creator"
+        var maxDimension:  Int?            = nil     // nil = sin resize
+        var isFavorite:    Bool            = false
+
+        // Explicit nonisolated init so this struct can be constructed from
+        // nonisolated contexts (e.g. BatchExportConfig default parameter
+        // expressions) without inheriting @MainActor isolation from ExportEngine.
+        nonisolated init(
+            id:            UUID         = UUID(),
+            name:          String,
+            format:        OutputFormat = .jpeg,
+            quality:       Double       = 0.92,
+            addWatermark:  Bool         = true,
+            watermarkText: String       = "@creator",
+            maxDimension:  Int?         = nil,
+            isFavorite:    Bool         = false
+        ) {
+            self.id            = id
+            self.name          = name
+            self.format        = format
+            self.quality       = quality
+            self.addWatermark  = addWatermark
+            self.watermarkText = watermarkText
+            self.maxDimension  = maxDimension
+            self.isFavorite    = isFavorite
+        }
+
+        enum OutputFormat: String, CaseIterable, Codable {
+            case jpeg = "JPEG"
+            case png  = "PNG"
+            case webp = "WebP"
+
+            var utType: UTType {
+                switch self {
+                case .jpeg: return .jpeg
+                case .png:  return .png
+                case .webp: return UTType("public.webp") ?? .png
+                }
+            }
+            var fileExtension: String { rawValue.lowercased() }
+        }
+    }
+
+    @Published var presets: [ExportPreset] = []
+
+    // MARK: - Export Result
 
     struct ExportResult {
-        let cleanURL:   URL       // PNG sin metadatos
-        let previewURL: URL       // PNG con watermark
-        let sha256Clean: String   // Hash del PNG limpio para auditoría
+        let cleanURL:    URL
+        let previewURL:  URL
+        let sha256Clean: String
+        let format:      ExportPreset.OutputFormat
+        let fileSizeBytes: Int
     }
 
-    /// Exportar imagen aprobada → versión limpia + versión preview.
-    /// - Parameters:
-    ///   - asset: El GeneratedAsset a exportar
-    ///   - addWatermark: Si false, no genera preview (útil para pruebas)
+    // MARK: - Single Asset Export (v1 compat + format support)
+
     func export(
         asset: GeneratedAsset,
-        addWatermark: Bool = true
+        addWatermark: Bool = true,
+        preset: ExportPreset? = nil
     ) async throws -> ExportResult {
+        let activePreset = preset ?? ExportPreset(name: "default", addWatermark: addWatermark)
 
         guard let imagePath = asset.imagePath,
               let origData  = try? Data(contentsOf: URL(fileURLWithPath: imagePath)),
@@ -65,163 +144,292 @@ final class ExportEngine: ObservableObject {
             throw ExportError.vaultNotConfigured
         }
 
-        // 1. Producir PNG limpio (EXIF scrubbing total)
-        let cleanData = try scrubAndExport(image: image)
-        try cleanData.write(to: cleanURL, options: .atomic)
+        // 1. Resize si el preset lo indica
+        let processedImage = activePreset.maxDimension != nil
+            ? resize(image: image, maxDim: activePreset.maxDimension!)
+            : image
 
-        let sha256Clean = cleanData.sha256Hex
+        // 2. Producir imagen limpia
+        let cleanData = try scrubAndExport(image: processedImage, format: activePreset.format, quality: activePreset.quality)
+        try cleanData.write(to: cleanURL, options: .completeFileProtection)
+        let sha256Clean = cleanData.sha256Hex // Extraído de Data+Crypto.swift
 
-        // 2. Verificar integridad del clean export
+        // 3. Verificar integridad
         let verifyData = try Data(contentsOf: cleanURL)
         guard verifyData.sha256Hex == sha256Clean else {
             throw ExportError.integrityCheckFailed
         }
 
-        // 3. Producir preview con watermark
+        // 4. Producir preview con watermark
         let previewData: Data
-        if addWatermark {
-            let watermarked = applyWatermark(to: image, config: watermarkConfig)
-            previewData = try scrubAndExport(image: watermarked)
+        if activePreset.addWatermark {
+            var wConfig = watermarkConfig
+            wConfig.text = activePreset.watermarkText
+            let watermarked = applyWatermark(to: processedImage, config: wConfig)
+            previewData = try scrubAndExport(image: watermarked, format: activePreset.format, quality: activePreset.quality)
         } else {
             previewData = cleanData
         }
-        try previewData.write(to: previewURL, options: .atomic)
+        try previewData.write(to: previewURL, options: .completeFileProtection)
 
-        // 4. Actualizar sidecar con rutas de export y timestamp
-        updateSidecarAfterExport(
-            asset: asset,
-            cleanURL: cleanURL,
-            previewURL: previewURL
-        )
-
-        // 5. Actualizar paths en Core Data
+        // 5. Actualizar sidecar + Core Data
+        updateSidecarAfterExport(asset: asset, cleanURL: cleanURL, previewURL: previewURL)
         asset.cleanPath   = cleanURL.path
         asset.previewPath = previewURL.path
         try? AssetStore.shared.container.viewContext.save()
 
-        // 6. Incrustar metadatos IPTC/XMP en versión limpia (auditoría + DAM)
-        //    El preview con watermark NO recibe metadatos de autoría.
+        // 6. Incrustar IPTC/XMP en versión limpia
         let tags = TaggingEngine.shared.tags(for: asset)
-        // CORRECCIÓN: Usar descarte de variable explícito para el return ignorado de embed
         _ = try? IPTCMetadataWriter.embed(in: cleanURL, asset: asset, tags: tags)
 
         return ExportResult(
-            cleanURL:    cleanURL,
-            previewURL:  previewURL,
-            sha256Clean: sha256Clean
+            cleanURL:      cleanURL,
+            previewURL:    previewURL,
+            sha256Clean:   sha256Clean,
+            format:        activePreset.format,
+            fileSizeBytes: cleanData.count
         )
+    }
+
+    // MARK: - Batch Export
+
+    // Swift 6 fix: NSManagedObject does not conform to Sendable, so it cannot be used
+    // directly as the result type of a TaskGroup child task. Since both exportBatch()
+    // and export() are @MainActor-isolated, all access to GeneratedAsset happens on the
+    // main actor's serial executor — making this wrapper safe to use.
+    private struct UncheckedAssetRef: @unchecked Sendable {
+        let asset: GeneratedAsset
+    }
+
+    @MainActor
+    func exportBatch(
+        assets: [GeneratedAsset],
+        config: BatchExportConfig = BatchExportConfig()
+    ) async -> BatchExportResult {
+        let start = Date()
+        var results: [(GeneratedAsset, ExportResult)] = []
+        var errors:  [(GeneratedAsset, Error)]         = []
+
+        let semaphore = AsyncSemaphore(limit: config.maxConcurrent)
+
+        await withTaskGroup(of: (UncheckedAssetRef, Result<ExportResult, Error>).self) { group in
+            for asset in assets {
+                let ref = UncheckedAssetRef(asset: asset)
+                group.addTask {
+                    await semaphore.wait()
+                    defer { Task { await semaphore.signal() } }
+                    do {
+                        let result = try await self.export(asset: ref.asset, preset: config.preset)
+                        return (ref, .success(result))
+                    } catch {
+                        return (ref, .failure(error))
+                    }
+                }
+            }
+
+            var completed = 0
+            for await (ref, outcome) in group {
+                completed += 1
+                config.progressCallback?(completed, assets.count)
+                switch outcome {
+                case .success(let r): results.append((ref.asset, r))
+                case .failure(let e):
+                    errors.append((ref.asset, e))
+                    if !config.continueOnError { group.cancelAll() }
+                }
+            }
+        }
+
+        return BatchExportResult(
+            results:       results,
+            errors:        errors,
+            totalExported: results.count,
+            totalFailed:   errors.count,
+            durationSec:   Date().timeIntervalSince(start)
+        )
+    }
+
+    // MARK: - Set Export Hook
+
+    /// Prepara el directorio de export para un set y retorna las URLs destino.
+    func beginSetExport(setLabel: String) throws -> (cleanDir: URL, previewDir: URL) {
+        guard let vault = VaultManager.shared.vaultRoot else {
+            throw ExportError.vaultNotConfigured
+        }
+        let cleanDir   = vault.appendingPathComponent("Exports/\(setLabel)/clean")
+        let previewDir = vault.appendingPathComponent("Exports/\(setLabel)/preview")
+        try FileManager.default.createDirectory(at: cleanDir,   withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: previewDir, withIntermediateDirectories: true)
+        return (cleanDir, previewDir)
+    }
+
+    /// Exporta un asset directamente a URLs de destino específicas.
+    func exportToDestination(
+        asset: GeneratedAsset,
+        cleanURL: URL,
+        previewURL: URL,
+        preset: ExportPreset = ExportPreset(name: "set")
+    ) async throws -> String {
+        guard let imagePath = asset.imagePath,
+              let origData  = try? Data(contentsOf: URL(fileURLWithPath: imagePath)),
+              let image     = NSImage(data: origData)
+        else { throw ExportError.imageNotFound(asset.imagePath ?? "nil") }
+
+        let processedImage = preset.maxDimension != nil
+            ? resize(image: image, maxDim: preset.maxDimension!)
+            : image
+
+        let cleanData = try scrubAndExport(image: processedImage, format: preset.format, quality: preset.quality)
+        try cleanData.write(to: cleanURL, options: .completeFileProtection)
+        let sha256 = cleanData.sha256Hex
+
+        if preset.addWatermark {
+            var wConfig = watermarkConfig
+            wConfig.text = preset.watermarkText
+            let wm = applyWatermark(to: processedImage, config: wConfig)
+            let previewData = try scrubAndExport(image: wm, format: preset.format, quality: preset.quality)
+            try previewData.write(to: previewURL, options: .completeFileProtection)
+        } else {
+            try cleanData.write(to: previewURL, options: .completeFileProtection)
+        }
+        return sha256
+    }
+
+    // MARK: - Preset Management
+
+    func addPreset(_ preset: ExportPreset) {
+        presets.append(preset)
+        savePresets()
+    }
+
+    func removePreset(id: UUID) {
+        presets.removeAll { $0.id == id }
+        savePresets()
+    }
+
+    func updatePreset(_ preset: ExportPreset) {
+        if let idx = presets.firstIndex(where: { $0.id == preset.id }) {
+            presets[idx] = preset
+            savePresets()
+        }
+    }
+
+    private func loadPresets() {
+        guard let data = UserDefaults.standard.data(forKey: "export.presets"),
+              let loaded = try? JSONDecoder().decode([ExportPreset].self, from: data)
+        else { return }
+        presets = loaded
+    }
+
+    private func savePresets() {
+        guard let data = try? JSONEncoder().encode(presets) else { return }
+        UserDefaults.standard.set(data, forKey: "export.presets")
     }
 
     // MARK: - EXIF / Metadata Scrubbing
 
-    /// Produce un PNG completamente limpio de metadatos.
-    /// Estrategia: re-renderizar la imagen pixel a pixel usando Core Graphics,
-    /// luego escribir como PNG nuevo sin ningún bloque de metadatos.
-    /// Esto elimina: EXIF, XMP, IPTC, tEXt (chunks PNG con prompts/seeds de A1111),
-    /// iCCP (perfiles de color embebidos) y cualquier metadata privada.
-    private func scrubAndExport(image: NSImage) throws -> Data {
+    func scrubAndExport(
+        image: NSImage,
+        format: ExportPreset.OutputFormat = .png,
+        quality: Double = 1.0
+    ) throws -> Data {
         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             throw ExportError.cgImageConversionFailed
         }
 
-        var result: Data? = nil
-
-        // Usar ImageIO para escribir PNG con opciones de privacidad explícitas
         let mutableData = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
-            mutableData, UTType.png.identifier as CFString, 1, nil
+            mutableData, format.utType.identifier as CFString, 1, nil
         ) else {
             throw ExportError.cgImageConversionFailed
         }
 
-        // Opciones: sin metadatos, sin GPS, sin EXIF, sin XMP
         let cleanOptions: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: 1.0,
+            kCGImageDestinationLossyCompressionQuality: quality,
             kCGImageMetadataShouldExcludeGPS:           true,
-            // Pasar diccionario de metadatos vacío sobrescribe cualquier metadato existente
             kCGImagePropertyExifDictionary:             [:] as NSDictionary,
             kCGImagePropertyIPTCDictionary:             [:] as NSDictionary,
             kCGImagePropertyTIFFDictionary:             [:] as NSDictionary,
         ]
 
         CGImageDestinationAddImage(destination, cgImage, cleanOptions as CFDictionary)
-
         guard CGImageDestinationFinalize(destination) else {
             throw ExportError.cgImageConversionFailed
         }
 
-        result = mutableData as Data
-
-        // Segunda pasada: limpiar chunks tEXt/iTXt de PNG (usados por A1111 para
-        // incrustar el prompt). Estos NO son EXIF estándar y ImageIO no los elimina.
-        guard let pngData = result else { throw ExportError.cgImageConversionFailed }
-        return removePNGTextChunks(from: pngData)
+        let data = mutableData as Data
+        // Para PNG: limpiar chunks tEXt/iTXt de A1111
+        return format == .png ? removePNGTextChunks(from: data) : data
     }
 
     // MARK: - PNG tEXt Chunk Removal
-    // Automatic1111 incrusta prompt, seed y parámetros en chunks tEXt/iTXt del PNG.
-    // Esta función los elimina reconstruyendo el PNG byte a byte.
 
     private func removePNGTextChunks(from data: Data) -> Data {
         let pngSignature: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
-
-        // Verificar firma PNG
-        guard data.count > 8,
-              data.prefix(8).elementsEqual(pngSignature)
-        else { return data }
+        guard data.count > 8, data.prefix(8).elementsEqual(pngSignature) else { return data }
 
         var result = Data(pngSignature)
         var offset = 8
-
         let chunksToRemove: Set<String> = ["tEXt", "iTXt", "zTXt", "eXIf", "iCCP"]
 
         while offset < data.count - 12 {
-            // Leer longitud del chunk (4 bytes big-endian)
             let length = Int(data[offset...offset+3].uint32BigEndian)
             let typeRange = offset+4 ..< offset+8
             guard typeRange.upperBound <= data.count else { break }
-
-            let typeBytes = data[typeRange]
-            let typeName  = String(bytes: typeBytes, encoding: .ascii) ?? ""
-
-            let totalChunkSize = 4 + 4 + length + 4 // length + type + data + CRC
-
+            let typeName  = String(bytes: data[typeRange], encoding: .ascii) ?? ""
+            let totalChunkSize = 4 + 4 + length + 4
             if !chunksToRemove.contains(typeName) {
-                // Conservar este chunk
                 let end = min(offset + totalChunkSize, data.count)
                 result.append(data[offset..<end])
             }
-            // Si es un chunk a eliminar, simplemente saltarlo
-
             offset += totalChunkSize
-
-            // IEND siempre debe ser el último chunk
             if typeName == "IEND" { break }
         }
+        return result
+    }
 
+    // MARK: - Resize
+
+    private func resize(image: NSImage, maxDim: Int) -> NSImage {
+        let size  = image.size
+        let scale = CGFloat(maxDim) / max(size.width, size.height)
+        guard scale < 1.0 else { return image }
+        let newSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let result  = NSImage(size: newSize)
+        result.lockFocus()
+        image.draw(in: NSRect(origin: .zero, size: newSize))
+        result.unlockFocus()
         return result
     }
 
     // MARK: - Watermark
 
-    private func applyWatermark(to image: NSImage, config: WatermarkConfig) -> NSImage {
-        let size = image.size
+    func applyWatermark(to image: NSImage, config: WatermarkConfig) -> NSImage {
+        let size   = image.size
         let result = NSImage(size: size)
-
         result.lockFocus()
         image.draw(in: NSRect(origin: .zero, size: size))
 
-        let text = config.text as NSString
+        if config.tiled {
+            applyTiledWatermark(text: config.text, size: size, config: config)
+        } else {
+            applySingleWatermark(text: config.text, size: size, config: config)
+        }
+
+        result.unlockFocus()
+        return result
+    }
+
+    private func applySingleWatermark(text: String, size: CGSize, config: WatermarkConfig) {
+        let nsText = text as NSString
         let attrs: [NSAttributedString.Key: Any] = [
-            .font:            NSFont.boldSystemFont(ofSize: max(image.size.width * 0.04, 18)),
+            .font:            NSFont.boldSystemFont(ofSize: max(size.width * 0.04, config.fontSize)),
             .foregroundColor: config.textColor.withAlphaComponent(config.opacity),
             .strokeColor:     NSColor.black.withAlphaComponent(config.opacity * 0.6),
             .strokeWidth:     -2.0,
         ]
-
-        let textSize = text.size(withAttributes: attrs)
+        let textSize = nsText.size(withAttributes: attrs)
         let margin: CGFloat = 20
-
         let point: CGPoint = {
             switch config.position {
             case .topLeft:     return CGPoint(x: margin, y: size.height - textSize.height - margin)
@@ -231,36 +439,52 @@ final class ExportEngine: ObservableObject {
             case .center:      return CGPoint(x: (size.width - textSize.width) / 2, y: (size.height - textSize.height) / 2)
             }
         }()
+        nsText.draw(at: point, withAttributes: attrs)
+    }
 
-        text.draw(at: point, withAttributes: attrs)
-        result.unlockFocus()
-        return result
+    private func applyTiledWatermark(text: String, size: CGSize, config: WatermarkConfig) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.saveGState()
+        ctx.translateBy(x: size.width / 2, y: size.height / 2)
+        ctx.rotate(by: CGFloat(config.tileAngle) * .pi / 180)
+
+        let nsText = text as NSString
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font:            NSFont.systemFont(ofSize: max(size.width * 0.03, 14)),
+            .foregroundColor: config.textColor.withAlphaComponent(config.opacity * 0.5),
+        ]
+        let textSize  = nsText.size(withAttributes: attrs)
+        let xSpacing  = textSize.width * 2.5
+        let ySpacing  = textSize.height * 3.0
+        let diagonal  = hypot(size.width, size.height)
+        let cols = Int(diagonal / xSpacing) + 2
+        let rows = Int(diagonal / ySpacing) + 2
+
+        for row in -rows...rows {
+            for col in -cols...cols {
+                let x = CGFloat(col) * xSpacing
+                let y = CGFloat(row) * ySpacing
+                nsText.draw(at: CGPoint(x: x - textSize.width / 2, y: y - textSize.height / 2), withAttributes: attrs)
+            }
+        }
+        ctx.restoreGState()
     }
 
     // MARK: - Sidecar Update
 
-    private func updateSidecarAfterExport(
-        asset: GeneratedAsset,
-        cleanURL: URL,
-        previewURL: URL
-    ) {
+    private func updateSidecarAfterExport(asset: GeneratedAsset, cleanURL: URL, previewURL: URL) {
         guard let sidecarPath = asset.sidecarPath else { return }
         let sidecarURL = URL(fileURLWithPath: sidecarPath)
-
-        // Cargar sidecar existente y actualizar campos de integridad
-        // Usamos un wrapper ligero para no re-codificar todo el struct
         guard var rawDict = (try? Data(contentsOf: sidecarURL))
             .flatMap({ try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any]
         else { return }
-
         var integrity = rawDict["integrity"] as? [String: Any] ?? [:]
         integrity["exportedAt"]           = ISO8601DateFormatter().string(from: Date())
         integrity["cleanVersionExists"]   = true
         integrity["previewVersionExists"] = true
         rawDict["integrity"] = integrity
-
         if let updated = try? JSONSerialization.data(withJSONObject: rawDict, options: [.prettyPrinted, .sortedKeys]) {
-            try? updated.write(to: sidecarURL, options: .atomic)
+            try? updated.write(to: sidecarURL, options: .completeFileProtection)
         }
     }
 
@@ -274,12 +498,31 @@ final class ExportEngine: ObservableObject {
 
         var errorDescription: String? {
             switch self {
-            case .imageNotFound(let p):  return "Imagen no encontrada: \(p)"
-            case .vaultNotConfigured:    return "Vault no configurado. Configura el studio primero."
+            case .imageNotFound(let p):    return "Imagen no encontrada: \(p)"
+            case .vaultNotConfigured:      return "Vault no configurado."
             case .cgImageConversionFailed: return "Error al procesar la imagen con Core Graphics."
-            case .integrityCheckFailed:  return "La verificación SHA-256 del export falló. Archivo potencialmente corrupto."
+            case .integrityCheckFailed:    return "Verificación SHA-256 del export falló."
             }
         }
+    }
+}
+
+// MARK: - Async Semaphore (concurrencia controlada)
+
+actor AsyncSemaphore {
+    private var count: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) { self.count = limit }
+
+    func wait() async {
+        if count > 0 { count -= 1; return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func signal() {
+        if waiters.isEmpty { count += 1; return }
+        waiters.removeFirst().resume()
     }
 }
 
@@ -295,3 +538,4 @@ extension DataProtocol {
         return value
     }
 }
+

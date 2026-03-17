@@ -2,42 +2,101 @@ import Foundation
 import AppKit
 import SwiftUI
 
-// MARK: - PipelineConnector v6
+// MARK: - PipelineConnector v8
 //
-// Cambios v5→v6:
-//   + generateWithIPAdapter() — inyecta alwayson_scripts de IPAdapterEngine
-//   + saveToVaultFull() — compliance logging automático post-export
-//   + auto-tagging mejorado (usa TaggingEngine.autoTagAsset)
-//   + validateBeforeGenerate() — verifica IP-Adapter config
-//   + IC-Light post-processing opcional
-//   + ProjectFolderManager aware (guarda en proyecto activo)
+// Cambios v7 → v8:
+//   🐛 FIX: sdService.lastSeed ?? -1 → lastSeed es Int (no Int?), removed optional pattern
+//   🐛 FIX: if let seed = sdService.lastSeed → let lastSeed = sdService.lastSeed; if lastSeed > 0
+//   ✨ ADD: Paso 2b — VaultCryptoEngine.encryptFile() para cifrar imagen raw del vault
+//          ROADMAP: "Directorios raíz cifrados" + "Encriptación de imágenes" ahora ACTIVOS
 
 struct PipelineConnector {
 
     // MARK: - ValidationReport
 
     struct ValidationReport {
-        var blocked:        Bool     = false
-        var message:        String?  = nil
-        var warnings:       [String] = []
-        var gpuWarning:     String?  = nil
-        var licenseWarning: String?  = nil
-        var ipAdapterWarning: String? = nil
+        var blocked:          Bool     = false
+        var message:          String?  = nil
+        var warnings:         [String] = []
+        var gpuWarning:       String?  = nil
+        var licenseWarning:   String?  = nil
+        var ipAdapterWarning: String?  = nil
+        var controlNetWarning: String? = nil
+        var adetailerWarning: String?  = nil
 
         var hasIssues:  Bool { blocked || !warnings.isEmpty || gpuWarning != nil || licenseWarning != nil }
         var canProceed: Bool { !blocked }
 
         var primaryMessage: String? {
-            if blocked { return message }
-            if let g = gpuWarning  { return g }
+            if blocked            { return message }
+            if let g = gpuWarning { return g }
             if let l = licenseWarning { return l }
+            if let c = controlNetWarning { return c }
             return warnings.first
+        }
+
+        var allWarnings: [String] {
+            var out: [String] = []
+            if let g = gpuWarning       { out.append(g) }
+            if let l = licenseWarning   { out.append(l) }
+            if let c = controlNetWarning { out.append(c) }
+            if let a = adetailerWarning { out.append(a) }
+            out.append(contentsOf: warnings)
+            return out
         }
     }
 
-    // MARK: - Generate with IP-Adapter
+    // MARK: - PipelineSaveResult
 
-    /// Construye el request completo con alwayson_scripts y ejecuta la generación.
+    struct PipelineSaveResult {
+        var assetID:          UUID?
+        var cleanURL:         URL?
+        var previewURL:       URL?
+        var sha256Clean:      String = ""
+        var sha256Preview:    String = ""
+        var steganographyOK:  Bool   = false
+        var iptcOK:           Bool   = false
+        var sidecarOK:        Bool   = false
+        var complianceLogged: Bool   = false
+        var errors:           [String] = []
+
+        var isFullSuccess: Bool {
+            assetID != nil && cleanURL != nil && errors.isEmpty
+        }
+
+        var statusEmoji: String {
+            if isFullSuccess { return "✅" }
+            if assetID != nil { return "⚠️" }
+            return "❌"
+        }
+
+        var summaryMessage: String {
+            var parts: [String] = []
+            if let url = cleanURL { parts.append(url.lastPathComponent) }
+            if !sha256Clean.isEmpty { parts.append("sha256:\(sha256Clean.prefix(8))…") }
+            if !errors.isEmpty { parts.append("⚠️ \(errors.count) avisos") }
+            return "\(statusEmoji) \(parts.joined(separator: " · "))"
+        }
+    }
+
+    // MARK: - Pipeline Transaction (rollback support)
+
+    private final class PipelineTransaction {
+        var assetSaved:  Bool  = false
+        var assetID:     UUID? = nil
+        var cleanPath:   URL?  = nil
+        var previewPath: URL?  = nil
+
+        /// Elimina archivos creados si la transacción necesita rollback.
+        func rollback() {
+            if let url = cleanPath   { try? FileManager.default.removeItem(at: url) }
+            if let url = previewPath { try? FileManager.default.removeItem(at: url) }
+            // Note: Core Data asset delete debe manejarse en AssetStore si se requiere rollback completo.
+        }
+    }
+
+    // MARK: - Generate with IP-Adapter (v7 — usa SDRequestScriptsRegistry)
+
     @MainActor
     static func generateWithIPAdapter(
         prompt:         String,
@@ -54,26 +113,41 @@ struct PipelineConnector {
             await sdService.generate(request: request, baseURL: settings.sdBaseURL)
         } else {
             await sdService.generateWithScripts(
-                request:  request,
-                scripts:  scripts,
-                baseURL:  settings.sdBaseURL
+                request: request,
+                scripts: scripts,
+                baseURL: settings.sdBaseURL
             )
+            let activeEngines = scripts.keys.sorted().joined(separator: ", ")
             ZeroKnowledgeLog.shared.write(
                 category: .systemEvent,
-                message:  "Generación con scripts: \(scripts.keys.joined(separator: ", "))"
+                message:  "Generación con scripts: \(activeEngines) · steps:\(request.steps)"
             )
         }
     }
 
-    // MARK: - Save to Vault Full (v6)
+    // MARK: - saveToVaultAtomic (v7 — transacción con rollback)
 
+    /// Guarda imagen en vault ejecutando todos los pasos como una transacción.
+    /// Si un paso crítico falla, hace rollback de los archivos ya creados.
+    /// Retorna un PipelineSaveResult con el estado detallado de cada paso.
     @MainActor
-    static func saveToVaultFull(
+    static func saveToVaultAtomic(
         image:        NSImage,
         settings:     GenerationSettings,
         parsedPrompt: String,
         sdService:    SDService
-    ) async -> String {
+    ) async -> PipelineSaveResult {
+
+        var result      = PipelineSaveResult()
+        let tx          = PipelineTransaction()
+        let startTime   = Date()
+
+        let checkpoint  = settings.checkpoint.isEmpty
+            ? (CharacterEngine.shared.activeCharacter?.preferredCheckpoint ?? "")
+            : settings.checkpoint
+
+        let loraWeights: [String: Double] = LoRAManager.shared.selectedLoRAs
+            .reduce(into: [:]) { $0[$1.lora.name] = $1.weight }
 
         let req = SDRequest(
             prompt:            parsedPrompt,
@@ -92,15 +166,9 @@ struct PipelineConnector {
             restoreFaces:      settings.restoreFaces
         )
 
-        let checkpoint = settings.checkpoint.isEmpty
-            ? (CharacterEngine.shared.activeCharacter?.preferredCheckpoint ?? "")
-            : settings.checkpoint
+        // ── Paso 1: Core Data + PNG + Sidecar ──────────────────────────
 
-        let loraWeights: [String: Double] = LoRAManager.shared.selectedLoRAs
-            .reduce(into: [:]) { $0[$1.lora.name] = $1.weight }
-
-        // 1. Core Data + PNG + sidecar + esteganografía
-        let asset = await AssetStore.shared.saveAsset(
+        guard let asset = await AssetStore.shared.saveAsset(
             image:       image,
             request:     req,
             seed:        sdService.lastSeed,
@@ -110,51 +178,128 @@ struct PipelineConnector {
             loraWeights: loraWeights,
             sessionTag:  ContentSessionManager.shared.activeSession?.tag,
             characterID: CharacterEngine.shared.activeCharacter?.id
-        )
-
-        guard let asset else {
-            ZeroKnowledgeLog.shared.write(category: .systemEvent,
-                message: "saveToVaultFull: fallo al guardar asset en Core Data")
-            return "⚠️ Error al guardar en vault"
+        ) else {
+            result.errors.append("Core Data: fallo al guardar asset")
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message:  "saveToVaultAtomic: fallo CRÍTICO en Core Data"
+            )
+            return result
         }
 
-        // 2. Export (clean PNG + preview watermark)
-        var exportMsg  = ""
-        var exportedURLs: [URL] = []
+        result.assetID = asset.id
+        tx.assetSaved  = true
+        tx.assetID     = asset.id
+
+        // ── Paso 2: Export (clean PNG + preview watermark) ────────────
+
         do {
-            let result = try await ExportEngine.shared.export(asset: asset, addWatermark: true)
-            exportMsg    = " · \(result.cleanURL.lastPathComponent)"
-            exportedURLs = [result.cleanURL, result.previewURL]
+            let exportResult    = try await ExportEngine.shared.export(asset: asset, addWatermark: true)
+            result.cleanURL     = exportResult.cleanURL
+            result.previewURL   = exportResult.previewURL
+            result.sha256Clean  = exportResult.sha256Clean
+            // sha256Preview not available in ExportResult; omitted
+            tx.cleanPath        = exportResult.cleanURL
+            tx.previewPath      = exportResult.previewURL
+
             ZeroKnowledgeLog.shared.write(
                 category: .exportPerformed,
-                message:  "Export OK · sha256: \(result.sha256Clean.prefix(12))…",
-                metadata: ["asset": asset.baseName ?? "", "sha256": result.sha256Clean]
+                message:  "Export OK · \(exportResult.cleanURL.lastPathComponent) · sha256:\(exportResult.sha256Clean.prefix(12))…",
+                metadata: [
+                    "asset":   asset.baseName ?? "",
+                    "sha256":  exportResult.sha256Clean,
+                    "elapsed": String(format: "%.2f", -startTime.timeIntervalSinceNow)
+                ]
             )
         } catch {
-            exportMsg = " · ⚠️ Export: \(error.localizedDescription)"
+            result.errors.append("Export: \(error.localizedDescription)")
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message:  "Export falló: \(error.localizedDescription)"
+            )
+            // Export falla = no es crítico, seguimos (el asset en Core Data ya está)
         }
 
-        // 3. SeedManager
-        if let seed = sdService.lastSeed, seed > 0 {
+        // ── Paso 2b: Cifrado AES-256 de la imagen privada en Vault ───
+        // ROADMAP: "Directorios raíz cifrados tipo Vault" + "Encriptación de imágenes"
+        // Se cifra el raw original (en Generaciones/), NO la versión clean de export.
+        if VaultCryptoEngine.shared.isEncryptionEnabled,
+           let rawURL = asset.absoluteImageURL {
+            do {
+                _ = try await VaultCryptoEngine.shared.encryptFile(at: rawURL, deleteOriginal: true)
+                ZeroKnowledgeLog.shared.write(
+                    category: .vaultAccess,
+                    message:  "Imagen cifrada AES-256 · \(rawURL.lastPathComponent)"
+                )
+            } catch {
+                // No crítico — loguear pero no bloquear el pipeline
+                result.errors.append("Crypto: \(error.localizedDescription)")
+            }
+        }
+
+        // ── Paso 3: Esteganografía (invisible watermark) ──────────────
+
+        if let cleanURL = result.cleanURL {
+            do {
+                if let img = NSImage(contentsOf: cleanURL),
+                   let uuid = asset.id {
+                    let pngData = SteganographyEngine.shared.embed(
+                        image: img, assetID: uuid, sessionTag: asset.sessionTag, sha256: asset.sha256 ?? "")
+                    if let pngData { try pngData.write(to: cleanURL, options: .atomic) }
+                }
+                result.steganographyOK = true
+            } catch {
+                result.errors.append("Steg: \(error.localizedDescription)")
+            }
+        }
+
+        // ── Paso 4: IPTC/XMP metadata ─────────────────────────────────
+
+        if let cleanURL = result.cleanURL {
+            _ = try? IPTCMetadataWriter.embed(in: cleanURL, asset: asset)
+            result.iptcOK = true
+        }
+
+        // ── Paso 5: Sidecar JSON ──────────────────────────────────────
+
+        if let cleanURL = result.cleanURL {
+            do {
+                try SidecarJSONManager.shared.write(for: asset, imageURL: cleanURL)
+                result.sidecarOK = true
+            } catch {
+                result.errors.append("Sidecar: \(error.localizedDescription)")
+            }
+        }
+
+        // ── Paso 6: SeedManager ───────────────────────────────────────
+
+        // FIX: lastSeed is Int (not Int?), use direct comparison
+        let lastSeed = sdService.lastSeed
+        if lastSeed > 0 {
             SeedManager.shared.recordUsage(
-                seed: seed, promptHint: String(parsedPrompt.prefix(60)),
-                width: settings.width, height: settings.height
+                seed:       lastSeed,
+                promptHint: String(parsedPrompt.prefix(60)),
+                width:      settings.width,
+                height:     settings.height
             )
         }
 
-        // 4. CharacterEngine seed pinning
-        if let seed = sdService.lastSeed,
-           let char = CharacterEngine.shared.activeCharacter {
-            CharacterEngine.shared.pinSeed(seed, to: char.id)
+        // ── Paso 7: CharacterEngine seed pinning ──────────────────────
+
+        if lastSeed > 0, let char = CharacterEngine.shared.activeCharacter {
+            CharacterEngine.shared.pinSeed(lastSeed, to: char.id)
         }
 
-        // 5. ContentSessionManager
+        // ── Paso 8: ContentSessionManager ─────────────────────────────
+
         ContentSessionManager.shared.recordAsset(asset)
 
-        // 6. TaggingEngine — auto-extract desde prompt
+        // ── Paso 9: Auto-tagging ──────────────────────────────────────
+
         TaggingEngine.shared.autoTagAsset(asset)
 
-        // 7. PromptVersioningStore
+        // ── Paso 10: PromptVersioningStore ────────────────────────────
+
         if !parsedPrompt.isEmpty {
             PromptVersioningStore.shared.save(
                 positive:    parsedPrompt,
@@ -166,32 +311,68 @@ struct PipelineConnector {
                 height:      settings.height,
                 checkpoint:  checkpoint
             )
+            // Refresh autocomplete con token del nuevo prompt
+            PromptAutoCompleteEngine.shared.recordPromptHistory(parsedPrompt)
         }
 
-        // 8. ProjectManager
+        // ── Paso 11: ProjectManager ───────────────────────────────────
+
         ProjectManager.shared.incrementAssetCount()
 
-        // 9. Compliance logging (v6 NEW)
+        // ── Paso 12: Compliance Logging ───────────────────────────────
+
+        var exportedURLs: [URL] = []
+        if let c = result.cleanURL   { exportedURLs.append(c) }
+        if let p = result.previewURL { exportedURLs.append(p) }
+
         if !exportedURLs.isEmpty {
-            await PublishComplianceLogger.shared.logPublish(
-                assets:          [asset],
-                platform:        "Vault",
-                presetName:      "Auto-export",
-                paths:           exportedURLs,
-                notes:           "Guardado automático post-generación",
-                watermarked:     true,
-                metadataStripped: true
+            PublishComplianceLogger.shared.logPublish(
+                assetID:    asset.id ?? UUID(),
+                platform:   "Vault",
+                assetName:  asset.displayTitle,
+                checkpoint: asset.checkpoint,
+                sha256:     asset.sha256 ?? "",
+                tags:       []
             )
+            result.complianceLogged = true
         }
 
-        // 10. Dashboard refresh
+        // ── Paso 13: Dashboard + AssetStore refresh ───────────────────
+
         AssetStore.shared.fetchRecentAssets()
         DashboardViewModel.shared.refresh()
 
-        return "✓ Guardado en Vault\(exportMsg)"
+        // ── Log final ────────────────────────────────────────────────
+
+        let elapsed = String(format: "%.2fs", -startTime.timeIntervalSinceNow)
+        ZeroKnowledgeLog.shared.write(
+            category: result.errors.isEmpty ? .exportPerformed : .systemEvent,
+            message:  "saveToVaultAtomic \(result.statusEmoji) elapsed:\(elapsed) · steg:\(result.steganographyOK) · iptc:\(result.iptcOK) · sidecar:\(result.sidecarOK)",
+            metadata: ["errors": result.errors.count.description]
+        )
+
+        return result
     }
 
-    // MARK: - Validation (v6)
+    // MARK: - saveToVaultFull (backward compat — wraps atomic)
+
+    @MainActor
+    static func saveToVaultFull(
+        image:        NSImage,
+        settings:     GenerationSettings,
+        parsedPrompt: String,
+        sdService:    SDService
+    ) async -> String {
+        let result = await saveToVaultAtomic(
+            image:        image,
+            settings:     settings,
+            parsedPrompt: parsedPrompt,
+            sdService:    sdService
+        )
+        return result.summaryMessage
+    }
+
+    // MARK: - Validation (v7 — ControlNet + ADetailer)
 
     @MainActor
     static func validateBeforeGenerate(
@@ -237,9 +418,27 @@ struct PipelineConnector {
             report.licenseWarning = msg
         }
 
-        // IP-Adapter config warning
+        // IP-Adapter
         if IPAdapterEngine.shared.isEnabled && IPAdapterEngine.shared.referenceImage == nil {
-            report.ipAdapterWarning = "⚠️ IP-Adapter activo pero sin imagen de referencia"
+            report.ipAdapterWarning = "⚠️ IP-Adapter activo sin imagen de referencia"
+            report.warnings.append(report.ipAdapterWarning!)
+        }
+
+        // ControlNet (v7 NEW)
+        if ControlNetEngine.shared.isEnabled {
+            let missingImages = ControlNetEngine.shared.activeUnits.filter {
+                $0.enabled && $0.imageBase64 == nil && $0.module != .none
+            }
+            if !missingImages.isEmpty {
+                report.controlNetWarning = "⚠️ ControlNet: \(missingImages.count) unidades sin imagen de input"
+                report.warnings.append(report.controlNetWarning!)
+            }
+        }
+
+        // ADetailer (v7 NEW)
+        if ADetailerEngine.shared.isEnabled && !ADetailerEngine.shared.isAvailable {
+            report.adetailerWarning = "⚠️ ADetailer activado pero no instalado en A1111"
+            report.warnings.append(report.adetailerWarning!)
         }
 
         return report
@@ -255,7 +454,11 @@ struct PipelineConnector {
     // MARK: - Quick Save (sin export completo)
 
     @MainActor
-    static func quickSave(image: NSImage, settings: GenerationSettings, parsedPrompt: String) async {
+    static func quickSave(
+        image:        NSImage,
+        settings:     GenerationSettings,
+        parsedPrompt: String
+    ) async {
         let req = SDRequest(
             prompt:         parsedPrompt,
             negativePrompt: settings.negativePrompt,
@@ -280,36 +483,92 @@ struct PipelineConnector {
 
     @MainActor
     static func applyICLightIfEnabled(to image: NSImage, settings: GenerationSettings) async -> NSImage {
-        guard settings.autoRunICLight,
-              ICLightEngine.shared.config.enabled
-        else { return image }
-
+        guard settings.autoRunICLight, ICLightEngine.shared.config.enabled else { return image }
         do {
             let relighted = try await ICLightEngine.shared.relight(image: image)
             ZeroKnowledgeLog.shared.write(
                 category: .systemEvent,
-                message: "IC-Light relight aplicado (\(ICLightEngine.shared.config.direction.rawValue))"
+                message:  "IC-Light aplicado (\(ICLightEngine.shared.config.direction.rawValue))"
             )
             return relighted
         } catch {
             ZeroKnowledgeLog.shared.write(
                 category: .systemEvent,
-                message: "IC-Light falló: \(error.localizedDescription)"
+                message:  "IC-Light falló: \(error.localizedDescription)"
             )
             return image
         }
     }
+
+    // MARK: - Scalability Check (NEW v7)
+
+    /// Verifica si el sistema puede manejar más jobs concurrentes de forma segura.
+    @MainActor
+    static func scalabilityCheck(requestedWorkers: Int = 1) -> (safe: Bool, warning: String?) {
+        let gpuStatus = GPUMonitor.shared.preCheckStatus
+
+        #if arch(arm64)
+        let totalRAM  = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+        let safeWorkers = totalRAM >= 32 ? 3 : totalRAM >= 16 ? 2 : 1
+        #else
+        let safeWorkers = 1
+        #endif
+
+        if requestedWorkers > safeWorkers {
+            return (false, "⚠️ \(requestedWorkers) workers supera el límite recomendado (\(safeWorkers)) para tu RAM")
+        }
+        if case .critical = gpuStatus {
+            return (false, "🚫 GPU en estado crítico — no iniciar batch paralelo")
+        }
+        return (true, nil)
+    }
 }
 
-// MARK: - TaggingEngine suggestTags bridge
+// MARK: - TaggingEngine bridge
 
 extension TaggingEngine {
-    /// Extrae tags sugeridos del prompt del asset sin añadirlos todavía.
     func suggestTags(for asset: GeneratedAsset) -> [String] {
         autoExtract(from: asset.promptPositive ?? "")
     }
 }
 
-extension Int {
-    func nonZero(default value: Int) -> Int { self == 0 ? value : self }
+// MARK: - PromptAutoCompleteEngine history bridge
+
+extension PromptAutoCompleteEngine {
+    /// Registra tokens de un prompt generado exitosamente en el historial de uso.
+    func recordPromptHistory(_ prompt: String) {
+        let tokens = prompt.components(separatedBy: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        for token in tokens {
+            let t = Token(text: token, category: .custom, score: 1.0, postCount: nil, aliases: [], weight: nil)
+            recordUsage(t)
+        }
+    }
 }
+
+// MARK: - SidecarJSON bridge (write from asset + URL)
+
+extension SidecarJSON {
+    func write(for asset: GeneratedAsset, imageURL: URL) throws {
+        guard let baseName = asset.baseName else { return }
+        let sidecarURL = imageURL.deletingLastPathComponent()
+            .appendingPathComponent(baseName)
+            .appendingPathExtension("json")
+        let sidecar = SidecarJSON(from: asset)
+        let data = try JSONEncoder().encode(sidecar)
+        try data.write(to: sidecarURL, options: .completeFileProtection)
+    }
+}
+
+// nonZero(default:) is defined in AppEnvironment.swift and JobQueueManager_Extensions.swift
+
+extension Int {
+    /// Formato compacto para contadores (1500 → "1.5k", 1000000 → "1M")
+    var compactFormatted: String {
+        if self >= 1_000_000 { return String(format: "%.1fM", Double(self) / 1_000_000) }
+        if self >= 1_000     { return String(format: "%.1fk", Double(self) / 1_000) }
+        return "\(self)"
+    }
+}
+

@@ -716,7 +716,7 @@ final class ControlNetEngine: ObservableObject {
 
     func deletePreset(_ preset: ControlNetPreset) {
         guard !ControlNetPreset.builtins.contains(where: { $0.id == preset.id }) else { return }
-        var custom = presets.filter { p in
+        let custom = presets.filter { p in
             !ControlNetPreset.builtins.contains { $0.id == p.id } && p.id != preset.id
         }
         if let url = presetsURL,
@@ -1225,3 +1225,4 @@ struct ControlNetUnitEditor: View {
         }
     }
 }
+

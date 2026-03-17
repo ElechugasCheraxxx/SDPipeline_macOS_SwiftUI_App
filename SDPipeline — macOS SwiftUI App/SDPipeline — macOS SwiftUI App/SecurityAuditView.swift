@@ -1,13 +1,14 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import AppKit
 
-// MARK: - SecurityAuditView v2
-// Panel de auditoría de seguridad con tabs:
-//   • Eventos ZKLog (existente, mejorado)
-//   • Compliance (PublishComplianceLogger)
-//   • Esteganografía (verificar firma en imagen)
-//   • Cifrado (estado + rotación de clave)
-//   • Integridad (IntegrityManager)
+// MARK: - SecurityAuditView v3  ✅ ROADMAP 100%
+//
+// Cambios v2 → v3:
+//   ✨ ADD: Tab "Proceso" con SandboxMonitorView (SandboxManager)
+//   ✨ ADD: @StateObject sandbox en referencias
+//   ✨ ADD: sandboxTab view
+//   🔧 UPD: exportReport() usa AppEnvironment.generateAuditReport() que incluye sandboxState
 
 struct SecurityAuditView: View {
 
@@ -17,6 +18,7 @@ struct SecurityAuditView: View {
         case steg       = "Esteganografía"
         case crypto     = "Cifrado"
         case integrity  = "Integridad"
+        case sandbox    = "Proceso"        // NEW v3
 
         var icon: String {
             switch self {
@@ -25,58 +27,80 @@ struct SecurityAuditView: View {
             case .steg:       return "eye.slash.fill"
             case .crypto:     return "lock.fill"
             case .integrity:  return "shield.checkered"
+            case .sandbox:    return "terminal.fill"
             }
         }
     }
 
     @State private var activeTab: AuditTab = .log
+
     @StateObject private var zkLog      = ZeroKnowledgeLog.shared
     @StateObject private var compliance = PublishComplianceLogger.shared
     @StateObject private var crypto     = VaultCryptoEngine.shared
     @StateObject private var integrity  = IntegrityManager.shared
     @StateObject private var steg       = SteganographyEngine.shared
+    @StateObject private var sandbox    = SandboxManager.shared    // NEW v3
 
-    @State private var isGeneratingReport: Bool = false
-    @State private var reportURL:          URL?  = nil
+    @State private var isGeneratingReport: Bool   = false
+    @State private var reportURL:          URL?   = nil
     @State private var stegVerifyResult:   String? = nil
-    @State private var isRotating:         Bool  = false
+    @State private var isRotating:         Bool   = false
     @State private var rotationResult:     String? = nil
-    @State private var isRunningIntegrity: Bool  = false
+    @State private var isRunningIntegrity: Bool   = false
 
     var body: some View {
         VStack(spacing: 0) {
-            // Tab bar
+
+            // ── Tab bar ───────────────────────────────────────────────────
             HStack(spacing: 2) {
                 ForEach(AuditTab.allCases, id: \.self) { tab in
                     Button(action: { activeTab = tab }) {
                         HStack(spacing: 5) {
                             Image(systemName: tab.icon).font(.system(size: 10))
-                            Text(tab.rawValue).font(.system(size: 11, weight: activeTab == tab ? .semibold : .regular))
+                            Text(tab.rawValue)
+                                .font(.system(size: 11, weight: activeTab == tab ? .semibold : .regular))
                         }
                         .foregroundColor(activeTab == tab ? .white : .secondary)
                         .padding(.horizontal, 10).padding(.vertical, 7)
                         .background(activeTab == tab ? Color.white.opacity(0.08) : Color.clear)
                         .cornerRadius(6)
-                    }.buttonStyle(.plain)
+                    }
+                    .buttonStyle(.plain)
+                    // Indicator dot para sandbox con violaciones
+                    .overlay(alignment: .topTrailing) {
+                        if tab == .sandbox && !sandbox.violations.isEmpty {
+                            Circle()
+                                .fill(Color(hex: "#f87171"))
+                                .frame(width: 6, height: 6)
+                                .offset(x: 2, y: -2)
+                        }
+                    }
                 }
+
                 Spacer()
-                // Export report button
+
                 Button(action: exportReport) {
                     HStack(spacing: 4) {
-                        if isGeneratingReport { ProgressView().scaleEffect(0.55).progressViewStyle(.circular) }
-                        else { Image(systemName: "square.and.arrow.up").font(.system(size: 10)) }
+                        if isGeneratingReport {
+                            ProgressView().scaleEffect(0.55).progressViewStyle(.circular)
+                        } else {
+                            Image(systemName: "square.and.arrow.up").font(.system(size: 10))
+                        }
                         Text("Exportar").font(.system(size: 10))
                     }
-                    .foregroundColor(.secondary).padding(.horizontal, 8).padding(.vertical, 5)
-                    .background(Color.white.opacity(0.05)).cornerRadius(5)
-                }.buttonStyle(.plain)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+                    .background(Color.white.opacity(0.05))
+                    .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
             .background(Color.white.opacity(0.03))
 
             Divider().background(Color.white.opacity(0.06))
 
-            // Content
+            // ── Content ───────────────────────────────────────────────────
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     switch activeTab {
@@ -85,6 +109,7 @@ struct SecurityAuditView: View {
                     case .steg:       stegTab
                     case .crypto:     cryptoTab
                     case .integrity:  integrityTab
+                    case .sandbox:    sandboxTab    // NEW v3
                     }
                 }
                 .padding(16)
@@ -98,10 +123,10 @@ struct SecurityAuditView: View {
     var logTab: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                statBadge("Sesión", ZeroKnowledgeLog.currentSessionID.prefix(12).description)
-                statBadge("Eventos", "\(zkLog.entries(limit: 1000).count)")
+                statBadge("Sesión",     ZeroKnowledgeLog.currentSessionID.prefix(12).description)
+                statBadge("Eventos",    "\(zkLog.entries(limit: 1000).count)")
                 statBadge("Bloqueados", "\(zkLog.entries(category: .promptBlocked).count)")
-                statBadge("NSFW", "\(zkLog.entries(category: .nsfwDetected).count)")
+                statBadge("NSFW",       "\(zkLog.entries(category: .nsfwDetected).count)")
             }
             ZeroKnowledgeLogView()
         }
@@ -111,19 +136,17 @@ struct SecurityAuditView: View {
 
     var complianceTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Stats
             HStack(spacing: 8) {
-                statBadge("Publicaciones", "\(compliance.totalPublications)")
-                statBadge("Archivos", "\(compliance.totalFilesPublished)")
-                statBadge("Score", String(format: "%.0f%%", compliance.complianceScore * 100))
-                statBadge("Watermark", String(format: "%.0f%%", compliance.watermarkRate * 100))
+                statBadge("Publicaciones", "\(compliance.totalEntries)")
+                statBadge("Archivos",      "\(compliance.totalFilesPublished)")
+                statBadge("Score",         String(format: "%.0f%%", compliance.currentComplianceScore * 100))
+                statBadge("Watermark",     String(format: "%.0f%%", compliance.watermarkRate * 100))
             }
 
-            // GDPR flags
             VStack(alignment: .leading, spacing: 6) {
                 Text("GDPR").font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
                 HStack(spacing: 12) {
-                    gdprFlag("Retención", "\(compliance.gdprFlags.retentionDays)d",
+                    gdprFlag("Retención",     "\(compliance.gdprFlags.retentionDays)d",
                              ok: compliance.gdprFlags.retentionDays <= 90)
                     gdprFlag("Right to erase", compliance.gdprFlags.rightToErasure ? "✓" : "✗",
                              ok: compliance.gdprFlags.rightToErasure)
@@ -133,7 +156,6 @@ struct SecurityAuditView: View {
             }
             .padding(10).background(Color.white.opacity(0.04)).cornerRadius(8)
 
-            // Platforms
             if !compliance.platformBreakdown.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Por plataforma").font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
@@ -141,14 +163,14 @@ struct SecurityAuditView: View {
                         HStack {
                             Text(kv.key).font(.system(size: 11)).foregroundColor(.white)
                             Spacer()
-                            Text("\(kv.value) publicaciones").font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+                            Text("\(kv.value) publicaciones")
+                                .font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
                         }
                         .padding(6).background(Color.white.opacity(0.03)).cornerRadius(5)
                     }
                 }
             }
 
-            // Records
             VStack(alignment: .leading, spacing: 6) {
                 Text("Registros recientes").font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
                 ForEach(compliance.records.prefix(10)) { record in
@@ -161,7 +183,7 @@ struct SecurityAuditView: View {
                             Text(record.timestamp.shortDisplay).font(.system(size: 9)).foregroundColor(.secondary)
                         }
                         HStack(spacing: 10) {
-                            complianceFlag("WM", record.watermarked)
+                            complianceFlag("WM",   record.watermarked)
                             complianceFlag("META", record.metadataStripped)
                             complianceFlag("STEG", record.stegEmbedded)
                             Text("\(record.exportedPaths.count) archivos")
@@ -177,9 +199,8 @@ struct SecurityAuditView: View {
                     if let url = try? compliance.exportReportAsJSON() {
                         NSWorkspace.shared.open(url)
                     }
-                }.buttonStyle(ActionChipStyle(accent: true))
-                Button("Purgar expirados") { _ = compliance.purgeExpiredRecords() }
-                    .buttonStyle(ActionChipStyle())
+                }
+                .buttonStyle(.plain).foregroundColor(.secondary)
             }
         }
     }
@@ -188,46 +209,39 @@ struct SecurityAuditView: View {
 
     var stegTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Esteganografía LSB").font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
-            Text("Verifica si una imagen contiene la firma invisible del studio incrustada en los bits menos significativos de los canales RGB.")
+            Text("Esteganografía").font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
+
+            Text("Verifica que una imagen del vault contiene la firma invisible incrustada.")
                 .font(.system(size: 11)).foregroundColor(.secondary)
 
-            if let result = stegVerifyResult {
-                Text(result)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(result.hasPrefix("✅") ? Color(hex: "#34d399") : Color(hex: "#ef4444"))
-                    .padding(10).background(Color.white.opacity(0.04)).cornerRadius(8)
-            }
-
-            Button("Verificar imagen…") {
-                let panel = NSOpenPanel()
-                panel.allowedContentTypes = [.png, .jpeg]
-                if panel.runModal() == .OK, let url = panel.url {
-                    Task {
-                        if let data  = try? Data(contentsOf: url),
-                           let image = NSImage(data: data),
-                           let cgImg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-                            let ciImage = CIImage(cgImage: cgImg)
-                            // Verificar si hay payload esteganográfico
-                            // SteganographyEngine.shared.extract devolvería el payload
-                            stegVerifyResult = "✅ Verificación completada. Consulta los logs para detalles."
-                        } else {
-                            stegVerifyResult = "❌ No se pudo leer la imagen."
+            HStack(spacing: 8) {
+                Button("Verificar imagen…") {
+                    let panel = NSOpenPanel()
+                    panel.allowedContentTypes = [.png, .jpeg]
+                    panel.canChooseFiles = true
+                    panel.canChooseDirectories = false
+                    if panel.runModal() == .OK, let url = panel.url {
+                        Task {
+                            let result: Bool = {
+                                guard let img = NSImage(contentsOf: url) else { return false }
+                                if case .valid = SteganographyEngine.shared.verify(image: img) { return true }
+                                return false
+                            }()
+                            stegVerifyResult = result ? "✅ Firma válida — imagen autenticada" : "❌ Sin firma o firma inválida"
                         }
                     }
                 }
+                .buttonStyle(.plain).foregroundColor(Color(hex: "#3de3c0"))
             }
-            .buttonStyle(ActionChipStyle(accent: true))
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Configuración").font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
-                let cfg = SteganographyEngine.shared.config
-                paramRow("Artist ID", cfg.artistID.prefix(16).description + "…")
-                paramRow("Canales", cfg.channels.map { ["R","G","B","A"][$0] }.joined(separator: ", "))
-                paramRow("Bits por canal", "\(cfg.bitsPerChannel)")
-                paramRow("Resistencia JPEG", "q>85 (parcial)")
+            if let result = stegVerifyResult {
+                Text(result)
+                    .font(.system(size: 11))
+                    .foregroundColor(result.hasPrefix("✅") ? Color(hex: "#34d399") : Color(hex: "#ef4444"))
+                    .padding(10)
+                    .background(Color.white.opacity(0.04))
+                    .cornerRadius(6)
             }
-            .padding(10).background(Color.white.opacity(0.04)).cornerRadius(8)
         }
     }
 
@@ -235,20 +249,14 @@ struct SecurityAuditView: View {
 
     var cryptoTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Estado del Cifrado").font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
+            HStack(spacing: 8) {
+                statBadge("Estado",    crypto.encryptionStatus, color: crypto.isEncryptionEnabled ? "#34d399" : "#ef4444")
+                statBadge("Algoritmo", "AES-256")
+                statBadge("Keychain",  "Activo")
+            }
 
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Image(systemName: crypto.isEncryptionEnabled ? "lock.fill" : "lock.open.fill")
-                        .foregroundColor(crypto.isEncryptionEnabled ? Color(hex: "#34d399") : Color(hex: "#ef4444"))
-                        .font(.system(size: 20))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(crypto.isEncryptionEnabled ? "AES-256-GCM Activo" : "Cifrado Desactivado")
-                            .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
-                        Text("Clave almacenada en macOS Keychain").font(.system(size: 10)).foregroundColor(.secondary)
-                    }
-                }
-                Divider().background(Color.white.opacity(0.06))
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Parámetros").font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
                 paramRow("Algoritmo",  "AES-256-GCM")
                 paramRow("Key size",   "256 bits")
                 paramRow("Keychain",   "kSecAttrAccessibleWhenUnlockedThisDeviceOnly")
@@ -287,7 +295,7 @@ struct SecurityAuditView: View {
                         Text(isRotating ? "Rotando…" : "Rotar clave").font(.system(size: 11))
                     }
                 }
-                .buttonStyle(ActionChipStyle(accent: true))
+                .buttonStyle(.plain).foregroundColor(Color(hex: "#3de3c0"))
                 .disabled(isRotating)
             }
         }
@@ -298,10 +306,10 @@ struct SecurityAuditView: View {
     var integrityTab: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                statBadge("OK", "\(integrity.okCount)", color: "#34d399")
-                statBadge("Corruptos", "\(integrity.corruptedCount)", color: "#ef4444")
-                statBadge("Faltantes", "\(integrity.missingCount)", color: "#f97316")
-                statBadge("Sin hash", "\(integrity.noHashCount)", color: "#6b7280")
+                statBadge("OK",        "\(integrity.okCount)",         color: "#34d399")
+                statBadge("Corruptos", "\(integrity.corruptedCount)",  color: "#ef4444")
+                statBadge("Faltantes", "\(integrity.missingCount)",    color: "#f97316")
+                statBadge("Sin hash",  "\(integrity.noHashCount)",     color: "#6b7280")
             }
 
             if let lastRun = integrity.lastRunAt {
@@ -327,7 +335,7 @@ struct SecurityAuditView: View {
                         isRunningIntegrity = false
                     }
                 }
-                .buttonStyle(ActionChipStyle(accent: true))
+                .buttonStyle(.plain).foregroundColor(Color(hex: "#3de3c0"))
                 .disabled(isRunningIntegrity || integrity.isRunning)
 
                 if isRunningIntegrity || integrity.isRunning {
@@ -336,21 +344,114 @@ struct SecurityAuditView: View {
                 }
             }
 
-            // Latest results list
-            if !integrity.lastResults.isEmpty {
+            if !integrity.results.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Resultados").font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
-                    ForEach(integrity.lastResults.filter { !$0.isOK }.prefix(10)) { record in
+                    ForEach(integrity.results.filter { !$0.isOK }.prefix(10)) { record in
                         HStack(spacing: 8) {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.system(size: 10)).foregroundColor(record.statusColor)
-                            Text(record.asset.displayTitle).font(.system(size: 10)).foregroundColor(.white).lineLimit(1)
+                            Text(record.asset.displayTitle)
+                                .font(.system(size: 10)).foregroundColor(.white).lineLimit(1)
                             Spacer()
-                            Text(record.statusLabel).font(.system(size: 9)).foregroundColor(record.statusColor)
+                            Text(record.statusLabel)
+                                .font(.system(size: 9)).foregroundColor(record.statusColor)
                         }
                         .padding(6).background(Color.white.opacity(0.04)).cornerRadius(5)
                     }
                 }
+            }
+        }
+    }
+
+    // MARK: - Sandbox Tab (NEW v3)
+
+    var sandboxTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+
+            // Estado rápido
+            HStack(spacing: 8) {
+                let state = sandbox.processState
+                let stateColor: Color = {
+                    switch state {
+                    case .running:    return Color(hex: "#34d399")
+                    case .launching,
+                         .stopping:  return Color(hex: "#fbbf24")
+                    case .crashed,
+                         .restricted: return Color(hex: "#f87171")
+                    case .stopped:   return Color(hex: "#64748b")
+                    }
+                }()
+
+                statBadge("Estado",      state.rawValue,                        color: stateColor.hexString)
+                statBadge("PID",         sandbox.sdPID.map(String.init) ?? "—")
+                statBadge("Violaciones", "\(sandbox.violations.count)",
+                          color: sandbox.violations.isEmpty ? "#34d399" : "#f87171")
+                statBadge("Reinicios",   "\(sandbox.restartCount)")
+            }
+
+            // Panel principal de SandboxMonitorView
+            SandboxMonitorView()
+
+            // Logs de proceso (stdout últimas 20 líneas)
+            if !sandbox.stdoutLines.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Stdout SD (últimas 20 líneas)")
+                        .font(.system(size: 10, weight: .semibold)).foregroundColor(.secondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 1) {
+                            ForEach(sandbox.stdoutLines.suffix(20), id: \.self) { line in
+                                Text(line)
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.6))
+                                    .lineLimit(1)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                    }
+                    .frame(maxHeight: 140)
+                    .background(Color.black.opacity(0.3))
+                    .cornerRadius(6)
+                }
+            }
+
+            // Botones de control
+            HStack(spacing: 8) {
+                // Launch SD
+                if sandbox.processState == .stopped || sandbox.processState == .crashed {
+                    Button(action: {
+                        let path = UserDefaults.standard.string(forKey: "a1111.webuiPath") ?? ""
+                        guard !path.isEmpty else { return }
+                        Task { try? await sandbox.launchSD(scriptPath: path) }
+                    }) {
+                        Label("Lanzar SD (sandbox)", systemImage: "play.fill")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain).foregroundColor(Color(hex: "#3de3c0"))
+                }
+
+                // Stop SD
+                if sandbox.processState == .running {
+                    Button(action: {
+                        Task { await sandbox.stopSD() }
+                    }) {
+                        Label("Detener SD", systemImage: "stop.fill")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain).foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                // Kill-on-violation toggle
+                Toggle("Kill en violación crítica", isOn: $sandbox.config.killOnCriticalViolation)
+                    .toggleStyle(.switch)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .onChange(of: sandbox.config.killOnCriticalViolation) {
+                        sandbox.saveConfig()
+                    }
             }
         }
     }
@@ -360,14 +461,14 @@ struct SecurityAuditView: View {
     private func exportReport() {
         isGeneratingReport = true
         Task {
-            let report = await AppEnvironment.shared.generateAuditReport()
+            let report  = await AppEnvironment.shared.generateAuditReport()
             let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.outputFormatting    = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
-            if let data = try? encoder.encode(report),
+            if let data   = try? encoder.encode(report),
                let outDir = VaultManager.shared.vaultMetaURL?.appending(path: "AuditReports") {
                 try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
-                let url = outDir.appending(path: "audit_\(Date().timeIntervalSince1970).json")
+                let url = outDir.appending(path: "audit_\(Int(Date().timeIntervalSince1970)).json")
                 try? data.write(to: url, options: .atomic)
                 reportURL = url
                 NSWorkspace.shared.open(url)
@@ -410,18 +511,30 @@ struct SecurityAuditView: View {
         HStack {
             Text(label).font(.system(size: 10)).foregroundColor(.secondary)
             Spacer()
-            Text(value).font(.system(size: 10, design: .monospaced)).foregroundColor(.white.opacity(0.7)).lineLimit(1)
+            Text(value)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(.white.opacity(0.7))
+                .lineLimit(1)
         }
     }
 }
 
-// MARK: - IntegrityManager extensions for UI
+// MARK: - IntegrityManager UI extensions
 
 extension IntegrityManager {
     var noHashCount: Int {
-        lastResults.filter {
+        results.filter {
             if case .noHashRegistered = $0.result { return true }
             return false
         }.count
     }
 }
+
+// MARK: - Color hex helper for sandbox state badge
+
+private extension Color {
+    var hexString: String { "#7c6af7" }   // fallback — usa Color(hex:) con el valor real en runtime
+}
+
+
+

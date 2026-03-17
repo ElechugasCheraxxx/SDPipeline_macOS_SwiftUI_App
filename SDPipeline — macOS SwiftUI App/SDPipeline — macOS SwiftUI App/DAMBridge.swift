@@ -115,7 +115,7 @@ final class DAMBridge: ObservableObject {
     func export(asset: GeneratedAsset, to dam: DAMConfig.DAMType? = nil) async throws {
         let targetDAM = dam ?? config.activeDAM
 
-        var job = ExportJob(asset: asset, targetDAM: targetDAM)
+        let job = ExportJob(asset: asset, targetDAM: targetDAM)
         exportQueue.append(job)
         let jobIdx = exportQueue.count - 1
 
@@ -166,7 +166,7 @@ final class DAMBridge: ObservableObject {
             throw DAMError.damNotRunning("Eagle")
         }
 
-        let (_, pingResp, _) = try await URLSession.shared.data(from: pingURL)
+        let (_, pingResp) = try await URLSession.shared.data(from: pingURL)
         guard (pingResp as? HTTPURLResponse)?.statusCode == 200 else {
             throw DAMError.damNotRunning("Eagle")
         }
@@ -543,3 +543,4 @@ extension GeneratedAsset {
         return nil
     }
 }
+

@@ -108,9 +108,9 @@ struct StatusBadge: View {
             Image(systemName: status.icon).font(.system(size: 9))
             Text(status.rawValue).font(.system(size: 9, weight: .medium))
         }
-        .foregroundColor(Color(hex: status.hexColor))
+        .foregroundColor(status.color)
         .padding(.horizontal, 6).padding(.vertical, 2)
-        .background(Color(hex: status.hexColor).opacity(0.15))
+        .background(status.color.opacity(0.15))
         .cornerRadius(4)
     }
 }
@@ -269,4 +269,11 @@ extension View {
                 .stroke(Color(hex: color), lineWidth: width)
         )
     }
+}
+
+// MARK: - IdentifiableUUID
+/// Wraps UUID to make it Identifiable, needed for .popover(item:) bindings.
+struct IdentifiableUUID: Identifiable {
+    let id: UUID
+    init(_ id: UUID) { self.id = id }
 }

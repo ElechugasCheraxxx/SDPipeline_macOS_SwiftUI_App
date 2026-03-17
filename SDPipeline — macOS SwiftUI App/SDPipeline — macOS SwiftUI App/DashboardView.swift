@@ -145,7 +145,7 @@ final class DashboardViewModel: ObservableObject {
         snap.encryptionActive = VaultCryptoEngine.shared.isEncryptionEnabled
 
         // ── NEW v4: Compliance ──────────────────────────────────────────
-        snap.complianceScore  = PublishComplianceLogger.shared.complianceScore
+        snap.complianceScore  = PublishComplianceLogger.shared.currentComplianceScore
         snap.publishedTotal   = PublishComplianceLogger.shared.totalFilesPublished
 
         // ── NEW v4: Projects ────────────────────────────────────────────
@@ -384,7 +384,7 @@ struct DashboardView: View {
             Text("TOP PROMPTS".uppercased()).font(.system(size: 9, weight: .semibold)).foregroundColor(.secondary)
             ForEach(vm.snapshot.topPromptVersions) { version in
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(version.title.isEmpty ? "(sin título)" : version.title)
+                    Text(version.label.isEmpty ? "(sin título)" : version.label)
                         .font(.system(size: 11, weight: .medium)).foregroundColor(.white)
                     Text(version.positive.prefix(100) + (version.positive.count > 100 ? "…" : ""))
                         .font(.system(size: 10)).foregroundColor(.secondary).lineLimit(2)

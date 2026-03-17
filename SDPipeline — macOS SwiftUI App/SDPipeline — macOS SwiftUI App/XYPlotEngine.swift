@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 import AppKit
 import SwiftUI
 import Combine
@@ -170,6 +171,7 @@ final class XYPlotEngine: ObservableObject {
         // Componer grilla en imagen única
         progressText = "Componiendo grilla…"
         let composite = await Task.detached(priority: .userInitiated) {
+            await MainActor.run {
             composeGrid(
                 images:  grid,
                 xLabels: config.xValues,
@@ -177,6 +179,7 @@ final class XYPlotEngine: ObservableObject {
                 xAxisLabel: config.xAxis.rawValue,
                 yAxisLabel: config.yAxis.rawValue
             )
+            }
         }.value
 
         let result = XYPlotResult(

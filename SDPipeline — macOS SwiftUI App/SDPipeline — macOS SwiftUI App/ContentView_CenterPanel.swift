@@ -1,36 +1,74 @@
 import SwiftUI
 import AppKit
 
-// MARK: - ContentView+CenterPanel
+// MARK: - ContentView+CenterPanel v4
 //
-// Implementación completa de las secciones del panel central (centerPanel).
+// Cambios v3 → v4:
+//   ✨ ADD: livePreviewSection — thumbnail parcial durante generación + barra de progreso mejorada
+//   ✨ ADD: exportQuickSection — acceso rápido a exportar la imagen actual desde el panel central
+//   ✨ ADD: rateLimiterStatusRow — indicador del estado del rate limiter en pipelineFlagsSection
+//   ✨ ADD: generationMetricsRow — muestra métricas post-generación (seed, tiempo, pasos reales)
+//   🔁 UPD: centerPanel ahora incluye livePreviewSection encima del generateButton
+//   🔁 UPD: pipelineFlagsSection incluye fila de rate limiter y live preview toggle
 
 extension ContentView {
 
-    // MARK: - Prompt Section
+    // MARK: - Center Panel Assembly
+
+    var centerPanel: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 14) {
+
+                // ── Prompt ──────────────────────────────────────────────────
+                promptSection
+
+                // ── Settings rápidos (pasos, CFG, seed, tamaño) ────────────
+                generationParamsSection
+
+                // ── Presets favoritos (si hay) ─────────────────────────────
+                presetsQuickSection
+
+                // ── Pipeline flags ─────────────────────────────────────────
+                pipelineFlagsSection
+
+                // ── Personaje activo ───────────────────────────────────────
+                characterSection
+
+                // ── Live Preview (NUEVO v4) ─────────────────────────────────
+                livePreviewSection
+
+                // ── Validaciones ────────────────────────────────────────────
+                validationSection
+
+                // ── Export rápido post-generación (NUEVO v4) ────────────────
+                exportQuickSection
+
+                Spacer(minLength: 20)
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 10)
+        }
+    }
+
+    // MARK: - Prompt Section (v3 compat)
 
     var promptSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionLabel("Prompt", icon: "text.bubble.fill")
-
-            // Positive
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text("Positivo").font(.system(size: 9, weight: .semibold))
                         .foregroundColor(Color(hex: "#34d399"))
                     Spacer()
-                    // Character injection indicator
                     if CharacterEngine.shared.activeCharacter != nil {
                         Label("Personaje activo", systemImage: "person.fill")
                             .font(.system(size: 9)).foregroundColor(Color(hex: "#7c6af7"))
                     }
-                    // IP-Adapter indicator
                     if IPAdapterEngine.shared.isEnabled {
                         Label("IP", systemImage: "person.fill.viewfinder")
                             .font(.system(size: 9)).foregroundColor(Color(hex: "#7c6af7"))
                     }
                 }
-
                 if parsedPrompt.isEmpty {
                     Text("Parsea el JSON para generar el prompt…")
                         .font(.system(size: 10)).foregroundColor(.secondary)
@@ -38,380 +76,397 @@ extension ContentView {
                         .background(Color.white.opacity(0.03)).cornerRadius(6)
                 } else {
                     TextEditor(text: $parsedPrompt)
-                        .font(.system(size: 10))
-                        .foregroundColor(.white)
+                        .font(.system(size: 10)).foregroundColor(.white)
                         .scrollContentBackground(.hidden)
                         .background(Color.white.opacity(0.04))
-                        .frame(height: 72)
+                        .frame(minHeight: 56, maxHeight: 100)
                         .cornerRadius(6)
                 }
             }
-
-            // Negative
             VStack(alignment: .leading, spacing: 4) {
                 Text("Negativo").font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(Color(hex: "#ef4444"))
-                TextEditor(text: $settings.negativePrompt)
-                    .font(.system(size: 10))
                     .foregroundColor(Color(hex: "#f87171"))
+                TextEditor(text: $settings.negativePrompt)
+                    .font(.system(size: 10)).foregroundColor(.secondary)
                     .scrollContentBackground(.hidden)
                     .background(Color.white.opacity(0.03))
-                    .frame(height: 48)
+                    .frame(minHeight: 36, maxHeight: 60)
                     .cornerRadius(6)
             }
-
-            // PromptBuilder toggle
-            Button(action: { showPromptBuilder.toggle() }) {
-                HStack(spacing: 5) {
-                    Image(systemName: "square.stack.3d.up.fill").font(.system(size: 10))
-                    Text(showPromptBuilder ? "Ocultar Prompt Builder" : "Abrir Prompt Builder")
-                        .font(.system(size: 10))
-                }
-                .foregroundColor(Color(hex: "#7c6af7"))
-            }.buttonStyle(.plain)
-
-            if showPromptBuilder {
-                PromptBuilderView(
-                    positivePrompt: $parsedPrompt,
-                    negativePrompt: $settings.negativePrompt
-                )
-                .frame(height: 320)
-                .cornerRadius(8)
-                .transition(.move(edge: .top).combined(with: .opacity))
-                .animation(.easeInOut(duration: 0.2), value: showPromptBuilder)
-            }
         }
-        .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
     }
 
     // MARK: - Generation Params Section
 
     var generationParamsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             sectionLabel("Parámetros", icon: "slider.horizontal.3")
 
-            // Steps + CFG
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Steps").font(.system(size: 9)).foregroundColor(.secondary)
-                    HStack(spacing: 4) {
-                        Slider(value: Binding(
-                            get: { Double(settings.steps) },
-                            set: { settings.steps = Int($0) }
-                        ), in: 10...150, step: 1)
-                        Text("\(settings.steps)")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(.white).frame(width: 24)
+            VStack(spacing: 6) {
+                sliderRow("Pasos",   value: Binding(get: { Double(settings.steps) }, set: { settings.steps = Int($0) }),
+                          range: 10...80, format: "%.0f")
+                sliderRow("CFG",     value: $settings.cfgScale, range: 1...20, format: "%.1f")
+
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("ANCHO").font(.system(size: 8, weight: .semibold)).foregroundColor(.secondary).tracking(1)
+                        Picker("", selection: $settings.width) {
+                            Text("512").tag(512); Text("640").tag(640)
+                            Text("768").tag(768); Text("832").tag(832)
+                            Text("1024").tag(1024)
+                        }
+                        .pickerStyle(.menu).font(.system(size: 10)).frame(maxWidth: .infinity)
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("ALTO").font(.system(size: 8, weight: .semibold)).foregroundColor(.secondary).tracking(1)
+                        Picker("", selection: $settings.height) {
+                            Text("512").tag(512); Text("640").tag(640)
+                            Text("768").tag(768); Text("832").tag(832)
+                            Text("1024").tag(1024)
+                        }
+                        .pickerStyle(.menu).font(.system(size: 10)).frame(maxWidth: .infinity)
                     }
                 }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("CFG Scale").font(.system(size: 9)).foregroundColor(.secondary)
-                    HStack(spacing: 4) {
-                        Slider(value: $settings.cfgScale, in: 1...20, step: 0.5)
-                        Text(String(format: "%.1f", settings.cfgScale))
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(.white).frame(width: 28)
-                    }
-                }
-            }
 
-            // Sampler
-            HStack(spacing: 6) {
-                Text("Sampler").font(.system(size: 9)).foregroundColor(.secondary).frame(width: 52, alignment: .leading)
-                Picker("", selection: $settings.samplerName) {
-                    ForEach(GenerationSettings.availableSamplers, id: \.self) { s in
-                        Text(s).tag(s)
-                    }
-                }.pickerStyle(.menu).font(.system(size: 11))
-            }
-
-            // Width × Height
-            HStack(spacing: 10) {
-                dimensionControl("Ancho", value: $settings.width, range: [512, 640, 768, 832, 1024, 1280])
-                dimensionControl("Alto",  value: $settings.height, range: [512, 640, 768, 832, 1024, 1280, 1536])
-            }
-        }
-        .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
-    }
-
-    private func dimensionControl(_ label: String, value: Binding<Int>, range: [Int]) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(label).font(.system(size: 9)).foregroundColor(.secondary)
-            Picker("", selection: value) {
-                ForEach(range, id: \.self) { v in Text("\(v)").tag(v) }
-            }.pickerStyle(.menu).font(.system(size: 11))
-        }.frame(maxWidth: .infinity)
-    }
-
-    // MARK: - Model Section
-
-    var modelSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("Modelo", icon: "cpu.fill")
-
-            // Checkpoint
-            HStack(spacing: 6) {
-                Text("Checkpoint").font(.system(size: 9)).foregroundColor(.secondary).frame(width: 70, alignment: .leading)
-                Picker("", selection: $settings.checkpoint) {
-                    Text("— Sin cambio —").tag("")
-                    ForEach(ModelManager.shared.availableModels, id: \.title) { m in
-                        Text(m.title.components(separatedBy: "/").last ?? m.title).tag(m.title)
-                    }
-                }.pickerStyle(.menu).font(.system(size: 11))
-            }
-
-            // License badge
-            if !settings.checkpoint.isEmpty {
-                let (safe, msg) = PipelineConnector.checkLicense(checkpoint: settings.checkpoint)
-                HStack(spacing: 5) {
-                    Image(systemName: safe ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
-                        .font(.system(size: 10))
-                        .foregroundColor(safe ? Color(hex: "#34d399") : Color(hex: "#f59e0b"))
-                    Text(msg ?? (safe ? "Licencia OK" : "Sin licencia"))
-                        .font(.system(size: 9)).foregroundColor(.secondary)
-                }
-            }
-
-            // Model benchmarks inline
-            if let model = ModelManager.shared.availableModels.first(where: { $0.title == settings.checkpoint }),
-               let bench = ModelManager.shared.benchmarks[model.sha256]?.last {
-                HStack(spacing: 10) {
-                    benchBadge("Última gen", String(format: "%.1fs", bench.genTime))
-                    benchBadge("Steps/s",    String(format: "%.1f", Double(bench.steps) / bench.genTime))
-                }
-            }
-        }
-        .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
-    }
-
-    private func benchBadge(_ label: String, _ value: String) -> some View {
-        VStack(spacing: 2) {
-            Text(value).font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundColor(.white)
-            Text(label).font(.system(size: 9)).foregroundColor(.secondary)
-        }
-        .padding(.horizontal, 8).padding(.vertical, 4)
-        .background(Color.white.opacity(0.04)).cornerRadius(5)
-    }
-
-    // MARK: - Hi-Res Section
-
-    var hiresSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                sectionLabel("Hi-Res Fix", icon: "arrow.up.left.and.arrow.down.right")
-                Spacer()
-                Toggle("", isOn: $settings.enableHR)
-                    .toggleStyle(.switch).scaleEffect(0.7).tint(Color(hex: "#7c6af7"))
-            }
-
-            if settings.enableHR {
                 HStack(spacing: 6) {
-                    Text("Upscaler").font(.system(size: 9)).foregroundColor(.secondary).frame(width: 56, alignment: .leading)
-                    Picker("", selection: $settings.hrUpscaler) {
-                        ForEach(GenerationSettings.availableUpscalers, id: \.self) { u in
-                            Text(u).tag(u)
+                    Text("Seed").font(.system(size: 9)).foregroundColor(.secondary).frame(width: 56, alignment: .leading)
+                    TextField("-1", value: $settings.seed, formatter: NumberFormatter())
+                        .textFieldStyle(.plain).font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(Color.white.opacity(0.05)).cornerRadius(5)
+                    Button(action: { settings.seed = -1 }) {
+                        Image(systemName: "shuffle").font(.system(size: 10)).foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    if sdService.lastSeed > 0 {
+                        Button(action: { settings.seed = sdService.lastSeed }) {
+                            HStack(spacing: 3) {
+                                Image(systemName: "arrow.counterclockwise").font(.system(size: 9))
+                                Text("\(sdService.lastSeed)").font(.system(size: 9, design: .monospaced))
+                            }
+                            .foregroundColor(Color(hex: "#7c6af7"))
                         }
-                    }.pickerStyle(.menu).font(.system(size: 11))
-                }
-                sliderRow("Escala", value: $settings.hrScale, range: 1.25...4.0, format: "%.2fx")
-                sliderRow("Denoising", value: $settings.denoisingStrength, range: 0.1...0.9, format: "%.2f")
-                HStack(spacing: 4) {
-                    Text("Pasos HR").font(.system(size: 9)).foregroundColor(.secondary).frame(width: 56)
-                    Slider(value: Binding(
-                        get: { Double(settings.hrSteps) },
-                        set: { settings.hrSteps = Int($0) }
-                    ), in: 5...50, step: 1)
-                    Text("\(settings.hrSteps)").font(.system(size: 10, design: .monospaced)).foregroundColor(.white).frame(width: 24)
+                        .buttonStyle(.plain)
+                    }
                 }
             }
+            .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
         }
-        .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
     }
 
-    // MARK: - Seed Section
+    // MARK: - Live Preview Section (NEW v4)
 
-    var seedSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("Seed", icon: "die.face.6.fill")
+    @ViewBuilder
+    var livePreviewSection: some View {
+        let engine = GenerationProgressEngine.shared
+        let showLivePreviews = UserDefaults.standard.bool(forKey: "gen.showPartialPreviews")
 
-            HStack(spacing: 8) {
-                // Seed field
-                TextField("-1 (random)", value: $settings.seed, format: .number)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 8).padding(.vertical, 5)
-                    .background(Color.white.opacity(0.06)).cornerRadius(6)
+        if engine.isGenerating || (engine.progress > 0 && engine.progress < 1.0) {
+            VStack(alignment: .leading, spacing: 8) {
+                sectionLabel("Generando…", icon: "waveform.path.ecg")
 
-                // Randomize
-                Button(action: { settings.seed = -1 }) {
-                    Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                }.buttonStyle(.plain).help("Seed aleatorio")
+                HStack(alignment: .top, spacing: 12) {
+                    // Thumbnail parcial
+                    if showLivePreviews {
+                        LivePreviewThumbnail(engine: engine, size: 80)
+                            .animation(.easeInOut(duration: 0.3), value: engine.previewImage != nil)
+                    }
 
-                // Lock/unlock
-                Button(action: { settings.seed = settings.seed }) {
-                    Image(systemName: settings.seed == -1 ? "lock.open" : "lock.fill")
-                        .font(.system(size: 11))
-                        .foregroundColor(settings.seed == -1 ? .secondary : Color(hex: "#fbbf24"))
-                }.buttonStyle(.plain)
-            }
-
-            // Favorites
-            let favorites = SeedManager.shared.favorites.prefix(5)
-            if !favorites.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 5) {
-                        ForEach(favorites) { fav in
-                            Button(action: { settings.seed = fav.seed }) {
-                                VStack(spacing: 2) {
-                                    Text("\(fav.seed)").font(.system(size: 9, design: .monospaced))
-                                        .foregroundColor(Color(hex: "#fbbf24"))
-                                    if let hint = fav.promptHint {
-                                        Text(hint.prefix(12)).font(.system(size: 7)).foregroundColor(.secondary)
-                                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        // Barra de progreso avanzada
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(engine.statusLabel)
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                Spacer()
+                                Text(engine.progressPercent)
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundColor(Color(hex: "#7c6af7"))
+                                    .monospacedDigit()
+                            }
+                            GeometryReader { geo in
+                                ZStack(alignment: .leading) {
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(Color.white.opacity(0.07))
+                                        .frame(height: 5)
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(LinearGradient(
+                                            colors: [Color(hex: "#7c6af7"), Color(hex: "#3de3c0")],
+                                            startPoint: .leading, endPoint: .trailing))
+                                        .frame(width: geo.size.width * engine.progress, height: 5)
+                                        .animation(.easeInOut(duration: 0.35), value: engine.progress)
                                 }
-                                .padding(.horizontal, 6).padding(.vertical, 4)
-                                .background(Color(hex: "#fbbf24").opacity(0.08)).cornerRadius(5)
-                            }.buttonStyle(.plain)
+                            }
+                            .frame(height: 5)
                         }
-                    }
-                }
-            }
-        }
-        .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
-    }
 
-    // MARK: - LoRA Section
-
-    var loraSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                sectionLabel("LoRAs", icon: "bolt.fill")
-                Spacer()
-                Text("\(loraManager.selectedLoRAs.count) activos")
-                    .font(.system(size: 9)).foregroundColor(.secondary)
-            }
-
-            if loraManager.availableLoRAs.isEmpty {
-                Text("No hay LoRAs disponibles. Verifica la conexión con A1111.")
-                    .font(.system(size: 10)).foregroundColor(.secondary)
-            } else {
-                ForEach($loraManager.selectedLoRAs, id: \.lora.name) { $selection in
-                    HStack(spacing: 8) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(selection.lora.name.components(separatedBy: "/").last ?? selection.lora.name)
-                                .font(.system(size: 10, weight: .medium)).foregroundColor(.white).lineLimit(1)
-                            Text("Alias: \(selection.lora.alias ?? "—")")
-                                .font(.system(size: 8)).foregroundColor(.secondary)
-                        }
-                        Slider(value: $selection.weight, in: 0...1.5, step: 0.05)
-                        Text(String(format: "%.2f", selection.weight))
-                            .font(.system(size: 10, design: .monospaced)).foregroundColor(Color(hex: "#7c6af7")).frame(width: 32)
-                        Button(action: { loraManager.deselect(selection.lora) }) {
-                            Image(systemName: "xmark").font(.system(size: 9)).foregroundColor(.secondary)
-                        }.buttonStyle(.plain)
-                    }
-                    .padding(6).background(Color.white.opacity(0.04)).cornerRadius(6)
-                }
-
-                if loraManager.selectedLoRAs.count < 5 {
-                    Menu {
-                        ForEach(loraManager.availableLoRAs.filter { lora in
-                            !loraManager.selectedLoRAs.contains(where: { $0.lora.name == lora.name })
-                        }.prefix(20)) { lora in
-                            Button(lora.name.components(separatedBy: "/").last ?? lora.name) {
-                                loraManager.select(lora, weight: 0.7)
+                        // Métricas en tiempo real
+                        HStack(spacing: 12) {
+                            if engine.totalSteps > 0 {
+                                metricPill(
+                                    icon: "arrow.trianglehead.2.clockwise",
+                                    value: "\(engine.currentStep)/\(engine.totalSteps)",
+                                    label: "pasos"
+                                )
+                            }
+                            if !engine.etaFormatted.isEmpty {
+                                metricPill(
+                                    icon: "timer",
+                                    value: engine.etaFormatted,
+                                    label: "restante"
+                                )
                             }
                         }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "plus.circle").font(.system(size: 10))
-                            Text("Añadir LoRA").font(.system(size: 10))
+
+                        // Botón interrumpir
+                        Button(action: {
+                            Task { await sdService.interruptGeneration(baseURL: settings.sdBaseURL) }
+                            engine.stopPolling()
+                        }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "stop.fill").font(.system(size: 9))
+                                Text("Interrumpir").font(.system(size: 10))
+                            }
+                            .foregroundColor(Color(hex: "#ef4444"))
                         }
-                        .foregroundColor(Color(hex: "#7c6af7"))
+                        .buttonStyle(.plain)
                     }
+                }
+                .padding(10)
+                .background(Color(hex: "#7c6af7").opacity(0.07))
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color(hex: "#7c6af7").opacity(0.15), lineWidth: 1)
+                )
+            }
+        }
+    }
+
+    // MARK: - Generation Metrics Row (post-gen)
+
+    @ViewBuilder
+    var generationMetricsSection: some View {
+        if sdService.lastSeed > 0 && !sdService.isGenerating {
+            HStack(spacing: 10) {
+                metricPill(icon: "number", value: "\(sdService.lastSeed)", label: "seed")
+                if sdService.generationDuration > 0 {
+                    metricPill(icon: "stopwatch", value: String(format: "%.1fs", sdService.generationDuration), label: "duración")
+                }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    func metricPill(icon: String, value: String, label: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 9)).foregroundColor(.secondary)
+            Text(value).font(.system(size: 9, weight: .semibold, design: .monospaced)).foregroundColor(.white)
+            Text(label).font(.system(size: 8)).foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 6).padding(.vertical, 3)
+        .background(Color.white.opacity(0.05))
+        .cornerRadius(5)
+    }
+
+    // MARK: - Export Quick Section (NEW v4)
+
+    @ViewBuilder
+    var exportQuickSection: some View {
+        if sdService.generatedImage != nil, !sdService.isGenerating {
+            VStack(alignment: .leading, spacing: 8) {
+                sectionLabel("Export Rápido", icon: "square.and.arrow.up")
+
+                HStack(spacing: 8) {
+                    // Export limpio (sin watermark)
+                    exportQuickButton(
+                        label: "Export Limpio",
+                        icon: "doc.fill",
+                        color: "#3de3c0"
+                    ) {
+                        exportCurrentImage(withWatermark: false)
+                    }
+
+                    // Export preview (con watermark)
+                    exportQuickButton(
+                        label: "Preview WM",
+                        icon: "pencil.and.outline",
+                        color: "#7c6af7"
+                    ) {
+                        exportCurrentImage(withWatermark: true)
+                    }
+
+                    // Agregar a lote
+                    exportQuickButton(
+                        label: "Al Lote",
+                        icon: "plus.rectangle.on.rectangle",
+                        color: "#f59e0b"
+                    ) {
+                        enqueueCurrentImageForBatch()
+                    }
+                }
+
+                // Estado del batch si hay jobs
+                if ExportBatchCoordinator.shared.pendingCount > 0 || ExportBatchCoordinator.shared.isRunning {
+                    ExportBatchProgressView()
                 }
             }
         }
-        .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
     }
 
-    // MARK: - Character Section
+    func exportQuickButton(label: String, icon: String, color: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 12))
+                    .foregroundColor(Color(hex: color))
+                Text(label)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.white)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(Color(hex: color).opacity(0.10))
+            .cornerRadius(7)
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(Color(hex: color).opacity(0.2), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Export Actions
+
+    func exportCurrentImage(withWatermark: Bool) {
+        guard let asset = assetStore.recentAssets.last else { return }
+        Task {
+            do {
+                _ = try await ExportEngine.shared.export(asset: asset, addWatermark: withWatermark)
+                let label  = withWatermark ? "preview" : "limpia"
+                validationMsg = "✓ Imagen \(label) exportada"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { validationMsg = nil }
+            } catch {
+                validationMsg = "Error export: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func enqueueCurrentImageForBatch() {
+        let pending = assetStore.recentAssets.filter {
+            $0.statusEnum == .approved || $0.statusEnum == .draft
+        }
+        guard !pending.isEmpty else { return }
+        ExportBatchCoordinator.shared.enqueue(assets: pending, setLabel: "Lote rápido")
+        if !ExportBatchCoordinator.shared.isRunning {
+            ExportBatchCoordinator.shared.start()
+        }
+    }
+
+    // MARK: - Pipeline Flags Section (v4 — rate limiter row added)
+
+    var pipelineFlagsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("Pipeline Post-Generación", icon: "arrow.triangle.2.circlepath")
+            VStack(spacing: 6) {
+                flagRow("Auto NSFW Check",   icon: "eye.slash",      binding: $settings.autoRunNSFWCheck,  description: "Detecta y cuarentena automáticamente")
+                flagRow("Auto ADetailer",    icon: "face.smiling",   binding: $settings.autoRunADetailer,   description: "Refina rostros y manos post-generación")
+                flagRow("Auto Post-Prod",    icon: "sparkles",       binding: $settings.autoRunPostProd,    description: "Upscale + restauración automática")
+                flagRow("IP-Adapter",        icon: "person.fill.viewfinder", binding: Binding(
+                    get: { IPAdapterEngine.shared.isEnabled },
+                    set: { IPAdapterEngine.shared.isEnabled = $0; IPAdapterEngine.shared.config.enabled = $0 }
+                ), description: "Consistencia facial con imagen de referencia")
+                flagRow("IC-Light Relight",  icon: "light.max",      binding: $settings.autoRunICLight,    description: "Relight cinemático post-generación")
+                flagRow("ControlNet",        icon: "network",         binding: Binding(
+                    get: { ControlNetEngine.shared.isEnabled },
+                    set: { ControlNetEngine.shared.isEnabled = $0 }
+                ), description: "Control pose/depth/edge · \(ControlNetEngine.shared.activeUnits.filter { $0.enabled }.count) unidades activas")
+                flagRow("Auto-Retry (x3)",   icon: "arrow.counterclockwise.circle", binding: $settings.autoRetryOnError, description: "Reintenta la generación si falla")
+                flagRow("Live Preview",      icon: "eye.fill",       binding: Binding(
+                    get: { UserDefaults.standard.bool(forKey: "gen.showPartialPreviews") },
+                    set: {
+                        UserDefaults.standard.set($0, forKey: "gen.showPartialPreviews")
+                        GenerationProgressEngine.shared.config.showPartialPreviews = $0
+                    }
+                ), description: "Muestra el preview parcial durante la generación")
+
+                // Rate Limiter status (NEW v4)
+                rateLimiterStatusRow
+            }
+            .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
+        }
+    }
+
+    @ViewBuilder
+    var rateLimiterStatusRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "speedometer")
+                .font(.system(size: 11))
+                .foregroundColor(Color(hex: "#3de3c0"))
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Rate Limiter API").font(.system(size: 11, weight: .medium)).foregroundColor(.white)
+                Text("Protege A1111 de saturación en batch").font(.system(size: 9)).foregroundColor(.secondary)
+            }
+            Spacer()
+            // Indicador de estado del circuit breaker
+            Circle()
+                .fill(circuitBreakerColor)
+                .frame(width: 7, height: 7)
+        }
+    }
+
+    var circuitBreakerColor: Color {
+        // Verde = closed, amarillo = halfOpen, rojo = open
+        // Se lee de UserDefaults como proxy (el actor no es MainActor)
+        let isOK = UserDefaults.standard.bool(forKey: "rateLimiter.circuitOK")
+        return isOK ? Color(hex: "#3de3c0") : Color(hex: "#ef4444")
+    }
+
+    // MARK: - Character Section (v3 compat)
 
     var characterSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                sectionLabel("Personaje", icon: "person.fill")
-                Spacer()
-                if let char = characterEngine.activeCharacter {
-                    Text(char.name).font(.system(size: 10)).foregroundColor(Color(hex: "#7c6af7"))
-                }
-            }
-
-            if let char = characterEngine.activeCharacter {
-                HStack(spacing: 10) {
-                    if let path = char.baseImagePath, let img = NSImage(contentsOfFile: path) {
-                        Image(nsImage: img).resizable().aspectRatio(contentMode: .fill)
-                            .frame(width: 44, height: 44).cornerRadius(6).clipped()
+            sectionLabel("Personaje Activo", icon: "person.fill")
+            if let activeChar = characterEngine.activeCharacter {
+                HStack(spacing: 8) {
+                    if let path = activeChar.baseImagePath, let img = NSImage(contentsOfFile: path) {
+                        Image(nsImage: img).resizable().scaledToFill()
+                            .frame(width: 32, height: 32).clipped().cornerRadius(6)
                     } else {
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color.white.opacity(0.06))
-                            .frame(width: 44, height: 44)
-                            .overlay(Image(systemName: "person").foregroundColor(.secondary))
+                        RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.06))
+                            .frame(width: 32, height: 32)
+                            .overlay(Image(systemName: "person.fill").font(.system(size: 14)).foregroundColor(.secondary))
                     }
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(char.name).font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
-                        if let cp = char.preferredCheckpoint, !cp.isEmpty {
-                            Text(cp.components(separatedBy: "/").last ?? cp)
-                                .font(.system(size: 9)).foregroundColor(.secondary)
-                        }
-                        Button(action: {
-                            Task { await IPAdapterEngine.shared.loadFromCharacter(char) }
-                        }) {
-                            HStack(spacing: 3) {
-                                Image(systemName: IPAdapterEngine.shared.isEnabled
-                                      ? "person.fill.viewfinder" : "person.fill.viewfinder")
-                                    .font(.system(size: 9))
-                                    .foregroundColor(IPAdapterEngine.shared.isEnabled
-                                                     ? Color(hex: "#7c6af7") : .secondary)
-                                Text(IPAdapterEngine.shared.isEnabled ? "FaceID activo" : "Activar FaceID")
-                                    .font(.system(size: 9))
-                                    .foregroundColor(IPAdapterEngine.shared.isEnabled
-                                                     ? Color(hex: "#7c6af7") : .secondary)
-                            }
-                        }.buttonStyle(.plain)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(activeChar.name).font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
+                        Text(activeChar.preferredCheckpoint.isEmpty ? "Sin modelo asignado" : activeChar.preferredCheckpoint)
+                            .font(.system(size: 9)).foregroundColor(.secondary)
                     }
-
                     Spacer()
                     Button(action: { characterEngine.setActive(nil) }) {
                         Image(systemName: "xmark.circle.fill").font(.system(size: 13)).foregroundColor(.secondary)
                     }.buttonStyle(.plain)
                 }
                 .padding(8).background(Color.white.opacity(0.04)).cornerRadius(8)
-
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(characterEngine.characters.prefix(6)) { char in
                             Button(action: { characterEngine.setActive(char) }) {
                                 VStack(spacing: 4) {
-                                    RoundedRectangle(cornerRadius: 5)
-                                        .fill(Color.white.opacity(0.06))
+                                    RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(0.06))
                                         .frame(width: 36, height: 36)
-                                        .overlay(
-                                            Group {
-                                                if let path = char.baseImagePath, let img = NSImage(contentsOfFile: path) {
-                                                    Image(nsImage: img).resizable()
-                                                        .aspectRatio(contentMode: .fill)
-                                                        .clipped()
-                                                } else {
-                                                    Image(systemName: "person.fill")
-                                                        .font(.system(size: 14)).foregroundColor(.secondary)
-                                                }
+                                        .overlay(Group {
+                                            if let path = char.baseImagePath, let img = NSImage(contentsOfFile: path) {
+                                                Image(nsImage: img).resizable().aspectRatio(contentMode: .fill).clipped()
+                                            } else {
+                                                Image(systemName: "person.fill").font(.system(size: 14)).foregroundColor(.secondary)
                                             }
-                                        )
+                                        })
                                         .cornerRadius(5)
                                     Text(char.name.prefix(8)).font(.system(size: 8)).foregroundColor(.secondary)
                                 }
@@ -426,25 +481,6 @@ extension ContentView {
             }
         }
         .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
-    }
-
-    // MARK: - Post-Generation Pipeline Flags
-
-    var pipelineFlagsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("Pipeline Post-Generación", icon: "arrow.triangle.2.circlepath")
-            VStack(spacing: 6) {
-                flagRow("Auto NSFW Check",   icon: "eye.slash",      binding: $settings.autoRunNSFWCheck,  description: "Detecta y cuarentena automáticamente")
-                flagRow("Auto ADetailer",    icon: "face.smiling",   binding: $settings.autoRunADetailer,   description: "Refina rostros y manos post-generación")
-                flagRow("Auto Post-Prod",    icon: "sparkles",       binding: $settings.autoRunPostProd,    description: "Upscale + restauración automática")
-                flagRow("IP-Adapter",        icon: "person.fill.viewfinder", binding: Binding(
-                    get: { IPAdapterEngine.shared.isEnabled },
-                    set: { IPAdapterEngine.shared.isEnabled = $0; IPAdapterEngine.shared.config.enabled = $0 }
-                ), description: "Consistencia facial con imagen de referencia")
-                flagRow("IC-Light Relight",  icon: "light.max",      binding: $settings.autoRunICLight,    description: "Relight cinemático post-generación")
-            }
-            .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
-        }
     }
 
     // MARK: - Log Sheet
@@ -479,6 +515,79 @@ extension ContentView {
         }
     }
 
+    // MARK: - Validation Section (v3 compat)
+
+    @ViewBuilder
+    var validationSection: some View {
+        let report = PipelineConnector.validateBeforeGenerate(parsedPrompt: parsedPrompt, settings: settings)
+        if report.hasIssues {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10)).foregroundColor(Color(hex: "#f59e0b"))
+                    Text("Advertencias de Pipeline")
+                        .font(.system(size: 10, weight: .semibold)).foregroundColor(Color(hex: "#f59e0b"))
+                    Spacer()
+                    if report.blocked {
+                        Text("BLOQUEADO").font(.system(size: 8, weight: .bold))
+                            .foregroundColor(.white).padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color(hex: "#ef4444")).cornerRadius(4)
+                    }
+                }
+                ForEach(report.allWarnings.prefix(4), id: \.self) { warning in
+                    HStack(spacing: 6) {
+                        Circle().fill(Color(hex: "#f59e0b").opacity(0.6)).frame(width: 4, height: 4)
+                        Text(warning).font(.system(size: 9)).foregroundColor(.secondary).lineLimit(2)
+                    }
+                }
+            }
+            .padding(10)
+            .background(Color(hex: "#f59e0b").opacity(0.08))
+            .cornerRadius(8)
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(hex: "#f59e0b").opacity(0.2), lineWidth: 1))
+        }
+    }
+
+    // MARK: - Presets Quick Section (v3 compat)
+
+    @ViewBuilder
+    var presetsQuickSection: some View {
+        let favs = ReusableSettingsManager.shared.presets.filter { $0.isFavorite }.prefix(3)
+        if !favs.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    sectionLabel("Presets Favoritos", icon: "star.fill")
+                    Spacer()
+                    Text("\(ReusableSettingsManager.shared.presets.count) guardados")
+                        .font(.system(size: 9)).foregroundColor(.secondary)
+                }
+                VStack(spacing: 4) {
+                    ForEach(Array(favs)) { preset in
+                        Button(action: { applyReusable(preset) }) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "star.fill").font(.system(size: 9))
+                                    .foregroundColor(Color(hex: "#f59e0b"))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(preset.resolvedLabel)
+                                        .font(.system(size: 10, weight: .medium)).foregroundColor(.white).lineLimit(1)
+                                    Text(preset.summaryLabel)
+                                        .font(.system(size: 9)).foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "arrow.right.circle").font(.system(size: 10))
+                                    .foregroundColor(Color(hex: "#7c6af7"))
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .background(Color.white.opacity(0.04)).cornerRadius(7)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(10).background(Color.white.opacity(0.03)).cornerRadius(8)
+        }
+    }
+
     func sectionLabel(_ title: String, icon: String) -> some View {
         HStack(spacing: 6) {
             Image(systemName: icon).font(.system(size: 10)).foregroundColor(.secondary)
@@ -486,6 +595,9 @@ extension ContentView {
         }
     }
 }
+
+// MARK: - GenerationSettings static catalogs (v4)
+// NOTE: autoRetryOnError, autoRunICLight, autoRunNSFWCheck are stored properties in Models.swift
 
 extension GenerationSettings {
     static let availableSamplers: [String] = [
@@ -498,3 +610,4 @@ extension GenerationSettings {
         "R-ESRGAN 4x+", "R-ESRGAN 4x+ Anime6B", "Lanczos", "Nearest"
     ]
 }
+

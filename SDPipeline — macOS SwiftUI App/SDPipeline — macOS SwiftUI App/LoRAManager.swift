@@ -3,54 +3,8 @@ import AppKit
 import SwiftUI
 import Combine
 
-// MARK: - LoRA Types
-
-struct LoRAEntry: Codable, Identifiable, Hashable {
-    let id:       UUID   = UUID()
-    let name:     String           // Filename sin extensión (A1111 key)
-    let alias:    String?          // Nombre amigable si lo tiene
-    let path:     String?          // Ruta completa en disco
-    let metadata: LoRAMetadata?
-
-    enum CodingKeys: String, CodingKey {
-        case name, alias, path, metadata
-    }
-
-    struct LoRAMetadata: Codable, Hashable {
-        let ss_base_model_version: String?   // "SD 1.5", "SDXL 1.0", etc.
-        let ss_network_module:     String?
-        let ss_output_name:        String?
-    }
-
-    // El nombre que A1111 usa en la sintaxis <lora:NAME:weight>
-    var promptKey: String {
-        // A1111 acepta el nombre sin extensión y sin path
-        let base = name.components(separatedBy: "/").last ?? name
-        return (base as NSString).deletingPathExtension
-    }
-
-    // Nombre display: alias > promptKey
-    var displayName: String { alias?.isEmpty == false ? alias! : promptKey }
-
-    // BaseModel legible
-    var baseModelTag: String? { metadata?.ss_base_model_version }
-
-    static func == (lhs: LoRAEntry, rhs: LoRAEntry) -> Bool { lhs.name == rhs.name }
-    func hash(into hasher: inout Hasher) { hasher.combine(name) }
-}
-
-// Un LoRA seleccionado con su peso para la generación actual
-struct SelectedLoRA: Identifiable {
-    var id:     UUID     = UUID()
-    var lora:   LoRAEntry
-    var weight: Double   = 0.8  // Rango A1111: 0.0–1.5 (>1 puede oversaturar)
-
-    var promptToken: String {
-        "<lora:\(lora.promptKey):\(String(format: "%.2f", weight))>"
-    }
-}
-
 // MARK: - LoRAManager
+// LoRAEntry and SelectedLoRA are defined in Models.swift (single source of truth)
 
 @MainActor
 final class LoRAManager: ObservableObject {
@@ -194,8 +148,8 @@ final class LoRAManager: ObservableObject {
             let q = searchText.lowercased()
             list = list.filter {
                 $0.displayName.lowercased().contains(q) ||
-                $0.promptKey.lowercased().contains(q)   ||
-                ($0.baseModelTag?.lowercased().contains(q) ?? false)
+                $0.name.lowercased().contains(q)   ||
+                (($0.metadata?.tags?.first)?.lowercased().contains(q) ?? false)
             }
         }
 
@@ -486,7 +440,7 @@ struct LoRARowView: View {
                     .foregroundColor(isSelected ? .white : Color.white.opacity(0.75))
                     .lineLimit(1)
 
-                if let base = lora.baseModelTag {
+                if let base = lora.metadata?.tags?.first {
                     Text(base)
                         .font(.system(size: 9))
                         .foregroundColor(.secondary)

@@ -219,7 +219,7 @@ struct GalleryView: View {
             // Top tags as filter chips
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
-                    ForEach(tagging.topTags(limit: 24), id: \.tag) { item in
+                    ForEach(Array(tagging.topTags.prefix(24)), id: \.tag) { item in
                         let active = activeTags.contains(item.tag)
                         Button(action: {
                             if active { activeTags.removeAll { $0 == item.tag } }
@@ -328,7 +328,7 @@ struct GalleryView: View {
 
     private func bulkAutoTag() {
         let assets = store.fetchAllAssets(limit: 500).filter { selectedIDs.contains($0.id ?? UUID()) }
-        tagging.autoTagUntagged(assets: assets)
+        TaggingEngine.shared.autoTagUntagged(assets: assets)
         selectedIDs.removeAll()
     }
 }

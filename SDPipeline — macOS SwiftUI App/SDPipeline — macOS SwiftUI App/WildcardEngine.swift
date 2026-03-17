@@ -211,112 +211,27 @@ struct WildcardEditorView: View {
     @State private var newTerms: String = ""
     @State private var showAddSheet = false
 
+    @ViewBuilder private var wildcardHeader: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "shuffle").font(.system(size: 12)).foregroundColor(Color(hex: "#7c6af7"))
+            Text("Wildcards").font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
+            Spacer()
+            Button(action: { showAddSheet = true }) {
+                Image(systemName: "plus.circle").font(.system(size: 13)).foregroundColor(Color(hex: "#7c6af7"))
+            }.buttonStyle(.plain).help("Nuevo grupo wildcard")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(Color.white.opacity(0.03))
+        Divider().background(Color.white.opacity(0.06))
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header
-            HStack(spacing: 8) {
-                Image(systemName: "shuffle")
-                    .font(.system(size: 12))
-                    .foregroundColor(Color(hex: "#7c6af7"))
-                Text("Wildcards")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.white)
-                Spacer()
-                Button(action: { showAddSheet = true }) {
-                    Image(systemName: "plus.circle")
-                        .font(.system(size: 13))
-                        .foregroundColor(Color(hex: "#7c6af7"))
-                }
-                .buttonStyle(.plain)
-                .help("Nuevo grupo wildcard")
-            }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            .background(Color.white.opacity(0.03))
-
-            Divider().background(Color.white.opacity(0.06))
-
+            wildcardHeader
             HStack(spacing: 0) {
-                // Keys list
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(engine.allKeys, id: \.self) { key in
-                            HStack(spacing: 6) {
-                                Circle()
-                                    .fill(engine.customGroups[key] != nil
-                                          ? Color(hex: "#7c6af7") : Color.white.opacity(0.2))
-                                    .frame(width: 5, height: 5)
-                                Text("__\(key)__")
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(selectedKey == key ? .white : .secondary)
-                                    .lineLimit(1)
-                                Spacer()
-                                Text("\(engine.terms(for: key).count)")
-                                    .font(.system(size: 9))
-                                    .foregroundColor(.secondary)
-                            }
-                            .padding(.horizontal, 8).padding(.vertical, 4)
-                            .background(selectedKey == key ? Color.white.opacity(0.07) : Color.clear)
-                            .cornerRadius(4)
-                            .contentShape(Rectangle())
-                            .onTapGesture { selectedKey = key }
-                        }
-                    }
-                    .padding(6)
-                }
-                .frame(width: 150)
-                .background(Color.white.opacity(0.02))
-
+                keysListPanel
                 Divider().background(Color.white.opacity(0.06))
-
-                // Terms for selected key
-                if let key = selectedKey {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("__\(key)__")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(Color(hex: "#7c6af7"))
-                            Spacer()
-                            if engine.customGroups[key] != nil {
-                                Button(action: { engine.removeCustomGroup(key: key); selectedKey = nil }) {
-                                    Image(systemName: "trash")
-                                        .font(.system(size: 10))
-                                        .foregroundColor(.red.opacity(0.7))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 2) {
-                                ForEach(engine.terms(for: key), id: \.self) { term in
-                                    Text("• \(term)")
-                                        .font(.system(size: 10))
-                                        .foregroundColor(.white.opacity(0.75))
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                            }
-                        }
-
-                        // Live preview
-                        Button(action: {}) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "dice")
-                                    .font(.system(size: 10))
-                                Text("→ \(engine.terms(for: key).randomElement() ?? "—")")
-                                    .font(.system(size: 10, design: .monospaced))
-                            }
-                            .foregroundColor(Color(hex: "#3de3c0"))
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                } else {
-                    Text("Selecciona un wildcard")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
+                termsPanel
             }
         }
         .background(Color(red: 0.09, green: 0.09, blue: 0.12))
@@ -325,6 +240,98 @@ struct WildcardEditorView: View {
         .sheet(isPresented: $showAddSheet) {
             addGroupSheet
         }
+    }
+
+    // MARK: - Keys List Panel
+
+    @ViewBuilder private var keysListPanel: some View {
+        ScrollView {
+            LazyVStack(spacing: 2) {
+                ForEach(engine.allKeys, id: \.self) { key in
+                    keyRow(for: key)
+                }
+            }
+            .padding(6)
+        }
+        .frame(width: 150)
+        .background(Color.white.opacity(0.02))
+    }
+
+    @ViewBuilder private func keyRow(for key: String) -> some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(engine.customGroups[key] != nil
+                      ? Color(hex: "#7c6af7") : Color.white.opacity(0.2))
+                .frame(width: 5, height: 5)
+            Text("__\(key)__")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(selectedKey == key ? .white : .secondary)
+                .lineLimit(1)
+            Spacer()
+            Text("\(engine.terms(for: key).count)")
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(selectedKey == key ? Color.white.opacity(0.07) : Color.clear)
+        .cornerRadius(4)
+        .contentShape(Rectangle())
+        .onTapGesture { selectedKey = key }
+    }
+
+    // MARK: - Terms Panel
+
+    @ViewBuilder private var termsPanel: some View {
+        if let key = selectedKey {
+            selectedKeyPanel(for: key)
+        } else {
+            Text("Selecciona un wildcard")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder private func selectedKeyPanel(for key: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("__\(key)__")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(Color(hex: "#7c6af7"))
+                Spacer()
+                if engine.customGroups[key] != nil {
+                    Button(action: { engine.removeCustomGroup(key: key); selectedKey = nil }) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 10))
+                            .foregroundColor(.red.opacity(0.7))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(engine.terms(for: key), id: \.self) { term in
+                        Text("• \(term)")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.75))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+
+            Button(action: {}) {
+                HStack(spacing: 4) {
+                    Image(systemName: "dice").font(.system(size: 10))
+                    Text("→ \(engine.terms(for: key).randomElement() ?? "—")")
+                        .font(.system(size: 10, design: .monospaced))
+                }
+                .foregroundColor(Color(hex: "#3de3c0"))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     var addGroupSheet: some View {
@@ -372,3 +379,4 @@ struct WildcardEditorView: View {
         .background(Color(red: 0.1, green: 0.1, blue: 0.13))
     }
 }
+

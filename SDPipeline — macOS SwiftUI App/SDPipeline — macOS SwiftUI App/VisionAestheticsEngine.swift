@@ -218,9 +218,9 @@ final class VisionAestheticsEngine: ObservableObject {
 
         let context   = CIContext()
         let extent    = output.extent
-        let bitmap    = context.render(output, toBitmap: UnsafeMutableRawPointer.allocate(byteCount: 4, alignment: 1),
-                                       rowBytes: Int(extent.width) * 4, bounds: CGRect(x: extent.midX, y: extent.midY, width: 1, height: 1),
-                                       format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
+        context.render(output, toBitmap: UnsafeMutableRawPointer.allocate(byteCount: 4, alignment: 1),
+                       rowBytes: Int(extent.width) * 4, bounds: CGRect(x: extent.midX, y: extent.midY, width: 1, height: 1),
+                       format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
 
         // Use average pixel brightness of edge image as sharpness proxy
         let averageFilter = CIFilter(name: "CIAreaAverage",
@@ -240,7 +240,6 @@ final class VisionAestheticsEngine: ObservableObject {
             sharpnessProxy = 0.5
         }
 
-        _ = bitmap
         let score = min(100, sharpnessProxy * 200)   // High edge density = sharp
         return SharpnessResult(score: score, blurRadius: (1 - sharpnessProxy) * 10)
     }
@@ -402,7 +401,8 @@ final class VisionAestheticsEngine: ObservableObject {
         // Generate saliency visualization
         let context = CIContext()
         var saliencyImage: NSImage?
-        if let pixelBuffer = obs.pixelBuffer {
+        let pixelBuffer = obs.pixelBuffer
+        if true {
             let ciImg = CIImage(cvPixelBuffer: pixelBuffer)
             if let cgOut = context.createCGImage(ciImg, from: ciImg.extent) {
                 saliencyImage = NSImage(cgImage: cgOut, size: NSSize(width: cgOut.width, height: cgOut.height))
@@ -565,3 +565,5 @@ final class VisionAestheticsEngine: ObservableObject {
 extension CGRect {
     var center: CGPoint { CGPoint(x: midX, y: midY) }
 }
+
+

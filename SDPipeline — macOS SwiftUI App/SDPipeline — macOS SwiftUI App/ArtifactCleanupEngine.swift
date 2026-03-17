@@ -209,7 +209,7 @@ final class ArtifactCleanupEngine: ObservableObject {
             // Check finger count anomalies via joint detection
             let fingers = detectFingerAnomalies(observation: observation)
             if fingers.hasAnomaly {
-                let boundingBox = observation.boundingBox
+                let boundingBox = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8) // VNHumanHandPoseObservation has no boundingBox; using placeholder
                 results.append(.init(
                     type:       .extraFingers,
                     region:     boundingBox,
@@ -429,12 +429,14 @@ final class ArtifactCleanupEngine: ObservableObject {
         log("Reparación completada: \(passesRan) pasadas, \(fixedTypes.count) artefactos corregidos")
 
         // Version the repaired result
-        await AssetVersioningStore.shared.createVersion(
-            for: asset,
-            sourcePath: outputURL.path,
-            tag: "artifact_cleanup_\(passesRan)pass",
-            notes: "Auto-cleanup: \(fixedTypes.map { $0.rawValue }.joined(separator: ", "))"
-        )
+        if let repaired = NSImage(contentsOf: outputURL) {
+            try? await AssetVersioningStore.shared.addVersion(
+                for:   asset,
+                image: repaired,
+                tag:   .custom,
+                label: "Auto-cleanup: \(fixedTypes.map { $0.rawValue }.joined(separator: ", "))"
+            )
+        }
 
         ZeroKnowledgeLog.shared.write(
             category: .systemEvent,

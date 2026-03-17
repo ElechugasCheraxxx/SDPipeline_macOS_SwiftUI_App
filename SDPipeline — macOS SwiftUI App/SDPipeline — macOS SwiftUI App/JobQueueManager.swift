@@ -2,14 +2,12 @@ import Foundation
 import SwiftUI
 import Combine
 
-// MARK: - JobQueueManager v2
-// Sistema de colas de generación con:
-//   - Prioridad (high / normal / low)
-//   - Retry automático con backoff exponencial (hasta 3 intentos)
-//   - Persistencia de cola en UserDefaults (sobrevive reinicios)
-//   - Concurrencia configurable (1–4 workers simultáneos)
-//   - Cancelación individual y masiva
-//   - Notificaciones de completado por job
+// MARK: - JobQueueManager v5
+//
+// Cambios para escalabilidad masiva:
+//   - Delegación de requests al SDAPIRateLimiter para no saturar A1111
+//   - Backoff Exponencial
+//   - Transacciones Atómicas: si un asset se rompe guardando, no ensucia la base de datos
 
 @MainActor
 final class JobQueueManager: ObservableObject {
@@ -41,7 +39,7 @@ final class JobQueueManager: ObservableObject {
         init(
             name:        String = "Generation",
             request:     SDRequest,
-            settings:    JobSettings = .default,
+            settings:    JobSettings? = nil,
             priority:    JobPriority = .normal,
             characterID: UUID? = nil,
             sessionTag:  String? = nil,
@@ -50,7 +48,7 @@ final class JobQueueManager: ObservableObject {
             self.id          = UUID()
             self.name        = name
             self.request     = request
-            self.settings    = settings
+            self.settings    = settings ?? JobSettings(baseURL: "http://127.0.0.1:7860", autoExport: true, autoNSFWCheck: true, postProcessing: false)
             self.status      = .queued
             self.priority    = priority
             self.createdAt   = Date()
@@ -79,14 +77,21 @@ final class JobQueueManager: ObservableObject {
         var autoExport:     Bool
         var autoNSFWCheck:  Bool
         var postProcessing: Bool
+        var useAtomicSave:  Bool   = true
+        var maxRetryAttempts: Int  = 3
+        var retryDelayBase:   Int  = 1500
 
-        // CORRECCIÓN: Agregado nonisolated a default para el acceso cross-context en Task
-        nonisolated static let `default` = JobSettings(
-            baseURL:        "http://127.0.0.1:7860",
-            autoExport:     true,
-            autoNSFWCheck:  true,
-            postProcessing: false
-        )
+        static var `default`: JobSettings {
+            JobSettings(
+                baseURL:          UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860",
+                autoExport:       true,
+                autoNSFWCheck:    true,
+                postProcessing:   false,
+                useAtomicSave:    UserDefaults.standard.object(forKey: "gen.useAtomicSave") as? Bool ?? true,
+                maxRetryAttempts: max(1, UserDefaults.standard.integer(forKey: "gen.retryMaxAttempts") > 0 ? UserDefaults.standard.integer(forKey: "gen.retryMaxAttempts") : 3),
+                retryDelayBase:   1500
+            )
+        }
     }
 
     // MARK: - Enums
@@ -152,7 +157,7 @@ final class JobQueueManager: ObservableObject {
 
     @Published var jobs:            [GenerationJob] = []
     @Published var isProcessing:     Bool = false
-    @Published var maxConcurrent:    Int  = 1         // 1–4 workers
+    @Published var maxConcurrent:    Int  = 1
     @Published var activeJobCount:   Int  = 0
 
     private var runningTasks: [UUID: Task<Void, Never>] = [:]
@@ -200,15 +205,19 @@ final class JobQueueManager: ObservableObject {
         processQueueIfNeeded()
         return job.id
     }
-
-    func enqueueBatch(_ requests: [(name: String, request: SDRequest)], settings: JobSettings = .default, priority: JobPriority = .normal, sessionTag: String? = nil) {
+    
+    // Compatibility wrapper for string-based enqueuing logic
+    @discardableResult
+    func enqueueBatchItems(_ items: [BatchItem], baseURL: String, priority: JobPriority = .normal, sessionTag: String? = nil) -> UUID {
         let batchID = UUID()
-        for (name, req) in requests {
-            let job = GenerationJob(name: name, request: req, settings: settings, priority: priority, sessionTag: sessionTag, batchID: batchID)
+        let settings = JobSettings.default
+        for item in items {
+            let job = GenerationJob(name: item.label, request: item.asSDRequest, settings: settings, priority: priority, sessionTag: sessionTag, batchID: batchID)
             jobs.append(job)
         }
         persistQueue()
         processQueueIfNeeded()
+        return batchID
     }
 
     func cancel(jobID: UUID) {
@@ -290,7 +299,36 @@ final class JobQueueManager: ObservableObject {
         guard let idx = jobs.firstIndex(where: { $0.id == job.id }) else { return }
 
         let sdService = SDService()
-        await sdService.generate(request: job.request, baseURL: job.settings.baseURL)
+        let baseURL   = job.settings.baseURL
+        let policy    = PipelineRetryPolicy(
+            maxAttempts:    job.settings.maxRetryAttempts,
+            baseDelayMs:    job.settings.retryDelayBase,
+            maxDelayMs:     30_000
+        )
+
+        var genSettings = GenerationSettings()
+        genSettings.sdBaseURL          = job.settings.baseURL
+        genSettings.autoRunNSFWCheck   = job.settings.autoNSFWCheck
+        genSettings.autoRunPostProd    = job.settings.postProcessing
+        let (_, scripts) = genSettings.buildRequestWithScripts(
+            prompt:         job.request.prompt,
+            negativePrompt: job.request.negative_prompt
+        )
+
+        if scripts.isEmpty {
+            await sdService.generateWithBatchRetry(
+                request: job.request,
+                baseURL: baseURL,
+                policy:  policy
+            )
+        } else {
+            await sdService.generateWithRetry(
+                request: job.request,
+                baseURL: baseURL,
+                scripts: scripts,
+                policy:  policy
+            )
+        }
 
         if Task.isCancelled {
             jobs[idx].status     = .cancelled
@@ -302,54 +340,67 @@ final class JobQueueManager: ObservableObject {
         }
 
         if let image = sdService.generatedImage {
-            // Save to vault
-            let asset = await AssetStore.shared.saveAsset(
-                image:      image,
-                request:    job.request,
-                seed:       sdService.lastSeed,
-                sessionTag: job.sessionTag
-            )
-            jobs[idx].resultAssetID = asset?.id
-            jobs[idx].status        = .done
-            jobs[idx].finishedAt    = Date()
 
-            // Post-process if enabled
-            if job.settings.autoNSFWCheck, let asset {
-                let detector = NSFWDetector.shared
-                _ = await detector.detect(
-                    prompt: job.request.prompt,
-                    image: image,
-                    imagePath: asset.imagePath,
-                    baseURL: job.settings.baseURL
+            if job.settings.useAtomicSave {
+                let result = await PipelineConnector.saveToVaultAtomic(
+                    image:        image,
+                    settings:     genSettings,
+                    parsedPrompt: job.request.prompt,
+                    sdService:    sdService
                 )
-            }
+                jobs[idx].resultAssetID = result.assetID
+                jobs[idx].status        = .done
+                jobs[idx].finishedAt    = Date()
 
-            ZeroKnowledgeLog.shared.write(
-                category: .systemEvent,
-                message:  "Job done: \(job.name) seed:\(sdService.lastSeed ?? -1)",
-                metadata: ["jobID": job.id.uuidString]
-            )
+                if !result.errors.isEmpty {
+                    jobs[idx].errorLog.append(contentsOf: result.errors.map { "Save: \($0)" })
+                }
 
-        } else {
-            let errMsg = sdService.errorMessage ?? "Unknown error"
-            jobs[idx].errorLog.append("Attempt \(jobs[idx].attempts + 1): \(errMsg)")
-            jobs[idx].attempts += 1
-
-            if jobs[idx].attempts < maxRetries {
-                // Exponential backoff: 2s, 4s, 8s
-                let delay = UInt64(pow(2.0, Double(jobs[idx].attempts))) * 1_000_000_000
-                jobs[idx].status = .retrying
-                try? await Task.sleep(nanoseconds: delay)
-                jobs[idx].status = .queued
+                ZeroKnowledgeLog.shared.write(
+                    category: .exportPerformed,
+                    message:  "Job done [atomic] \(job.name) \(result.statusEmoji) seed:\(sdService.lastSeed)",
+                    metadata: ["jobID": job.id.uuidString, "sha256": result.sha256Clean.prefix(12).description]
+                )
             } else {
-                jobs[idx].status     = .failed
-                jobs[idx].finishedAt = Date()
+                let asset = await AssetStore.shared.saveAsset(
+                    image:      image,
+                    request:    job.request,
+                    seed:       sdService.lastSeed,
+                    sessionTag: job.sessionTag
+                )
+                jobs[idx].resultAssetID = asset?.id
+                jobs[idx].status        = .done
+                jobs[idx].finishedAt    = Date()
                 ZeroKnowledgeLog.shared.write(
                     category: .systemEvent,
-                    message:  "Job FAILED after \(maxRetries) attempts: \(job.name)",
-                    metadata: ["jobID": job.id.uuidString, "error": errMsg]
+                    message:  "Job done [basic] \(job.name) seed:\(sdService.lastSeed)",
+                    metadata: ["jobID": job.id.uuidString]
                 )
             }
+
+            if job.settings.autoNSFWCheck {
+                if let assetID = jobs[idx].resultAssetID,
+                   let asset   = AssetStore.shared.fetchAllAssets(limit: 1).first(where: { $0.id == assetID }) {
+                    _ = await NSFWDetector.shared.detect(
+                        prompt:    job.request.prompt,
+                        image:     image,
+                        imagePath: asset.imagePath,
+                        baseURL:   baseURL
+                    )
+                }
+            }
+
+        } else {
+            let errMsg = sdService.errorMessage ?? "Error desconocido"
+            jobs[idx].errorLog.append("Fallo tras \(policy.maxAttempts) intentos: \(errMsg)")
+            jobs[idx].attempts   = policy.maxAttempts
+            jobs[idx].status     = .failed
+            jobs[idx].finishedAt = Date()
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message:  "Job FAILED: \(job.name) — \(errMsg)",
+                metadata: ["jobID": job.id.uuidString, "attempts": policy.maxAttempts.description]
+            )
         }
 
         activeJobCount = max(0, activeJobCount - 1)
@@ -381,42 +432,5 @@ final class JobQueueManager: ObservableObject {
             }
             return j
         }
-    }
-
-    // MARK: - Statistics
-
-    struct QueueStats {
-        let totalJobs:    Int
-        let completed:    Int
-        let failed:       Int
-        let cancelled:    Int
-        let queued:       Int
-        let avgTimeLabel: String
-        let successRate:  Double   // 0.0–1.0
-    }
-
-    var stats: QueueStats {
-        let total     = jobs.count
-        let done      = completedJobs.count
-        let failed    = failedJobs.count
-        let cancelled = cancelledJobs.count
-        let queued    = queuedJobs.count
-        let finished  = done + failed
-        let rate      = finished > 0 ? Double(done) / Double(finished) : 0
-
-        var avgLabel = "—"
-        if let avg = averageJobTime {
-            avgLabel = avg < 60 ? String(format: "%.0fs", avg) : String(format: "%.0fm", avg / 60)
-        }
-
-        return QueueStats(
-            totalJobs:    total,
-            completed:    done,
-            failed:       failed,
-            cancelled:    cancelled,
-            queued:       queued,
-            avgTimeLabel: avgLabel,
-            successRate:  rate
-        )
     }
 }

@@ -86,7 +86,7 @@ struct PromptSafetyFilter {
         }
 
         // Extraer todo el texto del JSON y validar contra blacklist
-        var allText = extractAllStrings(from: json).joined(separator: " ").lowercased()
+        let allText = extractAllStrings(from: json).joined(separator: " ").lowercased()
 
         // Validar contra hard blocks
         for (category, terms) in hardBlocks {

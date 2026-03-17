@@ -320,7 +320,7 @@ final class TaggingEngine: ObservableObject {
             "frequency":  tagFrequency
         ]
         if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) {
-            try? data.write(to: url, options: .atomic)
+            try? data.write(to: url, options: .completeFileProtection)
         }
     }
 
@@ -388,6 +388,26 @@ extension TaggingEngine {
         return all.filter { asset in
             guard let id = asset.id?.uuidString else { return false }
             return matchingIDs.contains(id)
+        }
+    }
+}
+
+// MARK: - Public boot API
+
+extension TaggingEngine {
+    /// Public wrapper for loadIndex — called from AppEnvironment.boot()
+    func loadIndexPublic() {
+        loadIndex()
+    }
+
+    // MARK: - Auto-tag untagged assets
+    func autoTagUntagged(assets: [GeneratedAsset]) {
+        for asset in assets {
+            guard let id = asset.id?.uuidString,
+                  (self.index[id] == nil || self.index[id]!.isEmpty)
+            else { continue }
+            let suggested = self.autoExtract(from: asset.promptPositive ?? "")
+            for tag in suggested { _ = self.addTag(tag, to: asset) }
         }
     }
 }

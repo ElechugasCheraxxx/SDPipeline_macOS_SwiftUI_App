@@ -326,7 +326,7 @@ struct BatchRatingView: View {
             ForEach(shortcuts, id: \.key) { item in
                 HStack(spacing: 8) {
                     Text(item.key)
-                        .font(.system(size: 10, design: .monospaced, weight: .bold))
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(Color(hex: item.color))
                         .frame(width: 50)
                         .padding(.horizontal, 6).padding(.vertical, 2)

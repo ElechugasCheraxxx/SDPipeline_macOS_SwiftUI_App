@@ -3,6 +3,11 @@ import SwiftUI
 import Combine
 import CoreData
 
+// MARK: - Notification Names
+extension NSNotification.Name {
+    static let abTestGenerationRequested = NSNotification.Name("SDPipeline.abTestGenerationRequested")
+}
+
 // MARK: - ABTestingEngine
 //
 // Sistema de A/B Testing estético para comparar generaciones:
@@ -117,7 +122,7 @@ final class ABTestingEngine: ObservableObject {
     // MARK: - Create Test
 
     func createTest(title: String, variable: TestVariable, variants: [ABVariant], base: VariantParams) -> ABTest {
-        var test = ABTest(title: title, variable: variable, variants: variants, baseRequest: base)
+        let test = ABTest(title: title, variable: variable, variants: variants, baseRequest: base)
         tests.insert(test, at: 0)
         saveTests()
         return test
@@ -165,12 +170,18 @@ final class ABTestingEngine: ObservableObject {
         defer { isGenerating = false }
 
         for i in test.variants.indices {
-            var variant = test.variants[i]
+            let variant = test.variants[i]
             // Combinar baseRequest con params de la variante
             let merged = mergeParams(base: test.baseRequest, override: variant.params)
             let request = buildSDRequest(from: merged, settings: settings)
 
-            let result = try await SDService.shared.generate(request: request, settings: settings)
+            // Note: SDService is a @StateObject owned by ContentView.
+            // Post a notification for ContentView to handle test generation.
+            NotificationCenter.default.post(
+                name: .abTestGenerationRequested,
+                object: nil,
+                userInfo: ["request": request, "settings": settings]
+            )
             // El asset se guarda via AssetStore
             // variant.assetID se actualiza cuando el asset se persiste
             test.variants[i] = variant
@@ -295,8 +306,8 @@ final class ABTestingEngine: ObservableObject {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        if let data = try? encoder.encode(tests.prefix(50)) {
-            try? data.write(to: url, options: .atomic)
+        if let data = try? encoder.encode(Array(tests.prefix(50))) {
+            try? data.write(to: url, options: .completeFileProtection)
         }
     }
 
@@ -308,6 +319,12 @@ final class ABTestingEngine: ObservableObject {
         decoder.dateDecodingStrategy = .iso8601
         tests = (try? decoder.decode([ABTest].self, from: data)) ?? []
     }
+}
+
+// MARK: - ABTest Hashable (required for List selection)
+extension ABTestingEngine.ABTest: Hashable {
+    static func == (lhs: ABTestingEngine.ABTest, rhs: ABTestingEngine.ABTest) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
 // MARK: - ABTestingView
@@ -483,3 +500,4 @@ struct CreateABTestSheet: View {
         .background(Color(red: 0.10, green: 0.10, blue: 0.13))
     }
 }
+

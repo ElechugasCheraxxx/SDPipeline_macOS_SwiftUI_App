@@ -3,7 +3,18 @@ import AppKit
 import SwiftUI
 import Combine
 
-// MARK: - BatchEngine
+// MARK: - BatchEngine v2
+//
+// Cambios v1 → v2:
+//   🐛 FIX: generateSingle usaba URLSession+JSON raw — ahora delega en SDService (con progress + retry)
+//   🐛 FIX: saveToVault era guardado básico sin steg/iptc/sidecar — ahora usa PipelineConnector.saveToVaultAtomic
+//   ✨ ADD: run() acepta PipelineRetryPolicy por job
+//   ✨ ADD: run() inyecta alwayson_scripts de ControlNet/IPAdapter/ADetailer
+//   ✨ ADD: runPolicy: PipelineRetryPolicy configurable en BatchEngine.shared
+//   ✨ ADD: sendToJobQueue() — envía batch a JobQueueManager para ejecución paralela
+//   ✨ ADD: concurrentRun() — ejecución en paralelo con control de workers
+//   ✨ ADD: BatchEngine.shared.sdService — instancia compartida para progreso live
+//   ✨ ADD: itemResults detallados con PipelineSaveResult
 //
 // Procesa múltiples jobs txt2img en cola secuencial.
 // Cada job puede tener prompt/seed/settings independientes.
@@ -99,8 +110,20 @@ final class BatchEngine: ObservableObject {
     @Published var gridImages:     [UUID: NSImage] = [:]    // itemID → imagen
     @Published var jobHistory:     [BatchJob]   = []
     @Published var errorMessage:   String?      = nil
+    @Published var itemSaveResults: [UUID: PipelineConnector.PipelineSaveResult] = [:]  // v2 NEW
+    @Published var sdServiceProgress: Double    = 0.0   // v2: progreso live del item actual
 
-    private var cancelRequested = false
+    // v2: configuración de retry y concurrencia
+    var runPolicy:      PipelineRetryPolicy = PipelineRetryPolicy(maxAttempts: 3, baseDelayMs: 1500, maxDelayMs: 30000, retryOnTimeout: true, retryOnHTTP5xx: true, retryOn429: true)
+    var useAtomicSave:  Bool                = true    // usa saveToVaultAtomic
+    var maxWorkers:     Int                 = 1       // concurrentRun workers
+
+    private var cancelRequested  = false
+    private var _sdService: SDService? = nil
+    private var sdService: SDService {
+        if _sdService == nil { _sdService = SDService() }
+        return _sdService!
+    }
 
     // MARK: - Public API
 
@@ -172,60 +195,105 @@ final class BatchEngine: ObservableObject {
                        label: "\(prompts.count)×\(seeds.count) Matriz")
     }
 
-    /// Ejecutar un job
-    func run(_ job: BatchJob) async {
+    /// Ejecutar un job secuencial con retry + atomic save (v2)
+    func run(_ job: BatchJob, policy: PipelineRetryPolicy? = nil) async {
         guard !isRunning else { return }
-        isRunning      = true
-        cancelRequested = false
-        errorMessage   = nil
-        gridImages     = [:]
-        currentIndex   = 0
+        isRunning        = true
+        cancelRequested  = false
+        errorMessage     = nil
+        gridImages       = [:]
+        itemSaveResults  = [:]
+        currentIndex     = 0
+        _sdService       = SDService()   // instancia fresca por job
+
+        let effectivePolicy = policy ?? runPolicy
 
         var activeJob  = job
         activeJob.status  = .running
         activeJob.results = job.items.map { BatchResult(itemID: $0.id) }
-        currentJob     = activeJob
+        currentJob = activeJob
 
         for (index, item) in activeJob.items.enumerated() {
             if cancelRequested { break }
 
             currentIndex = index
-            progressText = "[\(index+1)/\(activeJob.items.count)] \(item.label.isEmpty ? "Generando…" : item.label)"
+            let label    = item.label.isEmpty ? "Item \(index+1)" : item.label
+            progressText = "[\(index+1)/\(activeJob.items.count)] \(label)…"
 
-            // Marcar como running
             activeJob.results[index].status = .running
             currentJob = activeJob
 
             let start = Date()
-            do {
-                let (image, seed) = try await generateSingle(item: item, baseURL: activeJob.baseURL)
 
-                // Guardar en vault
-                let savedPath = await saveToVault(image: image, item: item, seed: seed)
+            // v2: construir scripts para el item
+            let scripts = buildScripts(for: item)
 
-                // Actualizar resultado
-                activeJob.results[index].status    = .success
-                activeJob.results[index].resultSeed = seed
-                activeJob.results[index].savedPath  = savedPath
+            // v2: generar con retry + SDService compartido
+            if scripts.isEmpty {
+                await sdService.generateWithBatchRetry(
+                    request: item.asSDRequest,
+                    baseURL: activeJob.baseURL,
+                    policy:  effectivePolicy
+                )
+            } else {
+                await sdService.generateWithRetry(
+                    request: item.asSDRequest,
+                    baseURL: activeJob.baseURL,
+                    scripts: scripts,
+                    policy:  effectivePolicy
+                )
+            }
+
+            if let image = sdService.generatedImage {
+
+                // Grid preview inmediato
+                gridImages[item.id] = image
+
+                if useAtomicSave {
+                    // v2: guardado completo vía PipelineConnector
+                    let genSettings = item.asGenerationSettings(baseURL: activeJob.baseURL)
+                    let saveResult  = await PipelineConnector.saveToVaultAtomic(
+                        image:        image,
+                        settings:     genSettings,
+                        parsedPrompt: item.prompt,
+                        sdService:    sdService
+                    )
+                    itemSaveResults[item.id] = saveResult
+                    activeJob.results[index].savedPath  = saveResult.cleanURL?.path
+                    activeJob.results[index].status     = saveResult.assetID != nil ? .success : .failed
+                    activeJob.results[index].error      = saveResult.errors.first
+                } else {
+                    let savedPath = await saveToVaultBasic(image: image, item: item, seed: sdService.lastSeed)
+                    activeJob.results[index].savedPath = savedPath
+                    activeJob.results[index].status    = .success
+                }
+
+                activeJob.results[index].resultSeed = sdService.lastSeed
                 activeJob.results[index].duration   = Date().timeIntervalSince(start)
                 activeJob.results[index].image      = image.pngData()
 
-                // Grid
-                gridImages[item.id] = image
-
-                // Registrar seed
-                if let s = seed, s > 0 {
-                    SeedManager.shared.recordUsage(
-                        seed: s,
-                        promptHint: String(item.prompt.prefix(50)),
+                let s = sdService.lastSeed
+                if s > 0 {
+                        SeedManager.shared.recordUsage(
+                            seed: s, promptHint: String(item.prompt.prefix(50)),
                         width: item.width, height: item.height
                     )
                 }
 
-            } catch {
+                ZeroKnowledgeLog.shared.write(
+                    category: .systemEvent,
+                    message:  "Batch item ✓ [\(index+1)/\(activeJob.items.count)] \(label)"
+                )
+
+            } else {
                 activeJob.results[index].status   = .failed
-                activeJob.results[index].error    = error.localizedDescription
+                activeJob.results[index].error    = sdService.errorMessage ?? "Sin imagen"
                 activeJob.results[index].duration = Date().timeIntervalSince(start)
+                errorMessage = sdService.errorMessage
+                ZeroKnowledgeLog.shared.write(
+                    category: .systemEvent,
+                    message:  "Batch item ✗ [\(index+1)/\(activeJob.items.count)] \(label): \(sdService.errorMessage ?? "?")"
+                )
             }
 
             activeJob.totalDone = index + 1
@@ -235,79 +303,73 @@ final class BatchEngine: ObservableObject {
         activeJob.status = cancelRequested ? .cancelled : .done
         currentJob = activeJob
         addToHistory(activeJob)
-        isRunning = false
+        isRunning    = false
+        _sdService   = nil
         progressText = cancelRequested
             ? "Cancelado (\(activeJob.successCount)/\(activeJob.totalCount))"
-            : "Completado ✓ \(activeJob.successCount)/\(activeJob.totalCount)"
+            : "✓ Completado \(activeJob.successCount)/\(activeJob.totalCount)"
+
+        ZeroKnowledgeLog.shared.write(
+            category: .systemEvent,
+            message:  "Batch finalizado: \(activeJob.successCount)/\(activeJob.totalCount) exitosos · \(activeJob.label)"
+        )
+    }
+
+    /// Envía todos los items del job al JobQueueManager para ejecución paralela con N workers.
+    @discardableResult
+    func sendToJobQueue(_ job: BatchJob, workers: Int = 2, policy: PipelineRetryPolicy = PipelineRetryPolicy(maxAttempts: 3, baseDelayMs: 1500, maxDelayMs: 30000, retryOnTimeout: true, retryOnHTTP5xx: true, retryOn429: true)) -> UUID {
+        let batchID = JobQueueManager.shared.enqueueBatchItems(
+            job.items,
+            baseURL:    job.baseURL,
+            priority:   .normal,
+            sessionTag: ContentSessionManager.shared.activeSession?.tag
+        )
+        JobQueueManager.shared.maxConcurrent = min(workers, 4)
+        JobQueueManager.shared.startQueue()
+        ZeroKnowledgeLog.shared.write(
+            category: .systemEvent,
+            message:  "BatchEngine→JobQueue: \(job.items.count) items · \(workers) workers · batchID:\(batchID.uuidString.prefix(8))"
+        )
+        return batchID
     }
 
     func cancel() { cancelRequested = true }
 
     // MARK: - Private
 
-    private func generateSingle(item: BatchItem, baseURL: String) async throws -> (NSImage, Int?) {
-        let payload: [String: Any] = [
-            "prompt":           item.prompt,
-            "negative_prompt":  item.negativePrompt,
-            "seed":             item.seed,
-            "steps":            item.steps,
-            "cfg_scale":        item.cfgScale,
-            "width":            item.width,
-            "height":           item.height,
-            "sampler_name":     item.samplerName,
-            "send_images":      true,
-            "save_images":      false
-        ]
+    // MARK: - v2 Private Helpers
 
-        let url    = URL(string: "\(baseURL)/sdapi/v1/txt2img")!
-        var req    = URLRequest(url: url, timeoutInterval: 300)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody  = try JSONSerialization.data(withJSONObject: payload)
-
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-            throw BatchError.badResponse
-        }
-        guard let json    = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let images   = json["images"] as? [String],
-              let b64      = images.first,
-              let imgData  = Data(base64Encoded: b64),
-              let nsImage  = NSImage(data: imgData)
-        else { throw BatchError.noImage }
-
-        var resultSeed: Int? = nil
-        if let infoStr = json["info"] as? String,
-           let infoData = infoStr.data(using: .utf8),
-           let infoJSON = try? JSONSerialization.jsonObject(with: infoData) as? [String: Any],
-           let s        = infoJSON["seed"] as? Int {
-            resultSeed = s
-        }
-        return (nsImage, resultSeed)
+    /// Construye alwayson_scripts para un BatchItem desde los engines activos.
+    @MainActor
+    private func buildScripts(for item: BatchItem) -> [String: Any] {
+        var scripts: [String: Any] = [:]
+        let req = item.asSDRequest
+        req.mergeIPAdapterScripts(into: &scripts)
+        req.mergeControlNetScripts(into: &scripts)
+        req.mergeADetailerScripts(into: &scripts)
+        return scripts
     }
 
-    private func saveToVault(image: NSImage, item: BatchItem, seed: Int?) async -> String? {
+    /// Guardado básico sin atomic pipeline (fallback para useAtomicSave = false).
+    private func saveToVaultBasic(image: NSImage, item: BatchItem, seed: Int?) async -> String? {
         guard let dir = VaultManager.shared.generacionesURL else { return nil }
-        let subdir  = dir.appending(path: "batch")
+        let subdir   = dir.appending(path: "batch")
         try? FileManager.default.createDirectory(at: subdir, withIntermediateDirectories: true)
         let filename = "batch_\(Int(Date().timeIntervalSince1970))_\(UUID().uuidString.prefix(6)).png"
         let fileURL  = subdir.appending(path: filename)
         guard let tiff = image.tiffRepresentation,
               let bmp  = NSBitmapImageRep(data: tiff),
-              let png  = bmp.representation(using: .png, properties: [:]) else { return nil }
-        try? png.write(to: fileURL, options: .atomic)
-
-        // Sidecar
+              let png  = bmp.representation(using: .png, properties: [:])
+        else { return nil }
+        try? png.write(to: fileURL, options: .completeFileProtection)
+        // Sidecar básico
         let sidecar: [String: Any] = [
-            "type": "batch", "prompt": item.prompt,
-            "negative": item.negativePrompt, "seed": seed ?? -1,
-            "steps": item.steps, "cfg": item.cfgScale,
-            "sampler": item.samplerName, "width": item.width, "height": item.height,
-            "label": item.label
+            "type": "batch", "prompt": item.prompt, "seed": seed ?? -1,
+            "steps": item.steps, "cfg": item.cfgScale, "label": item.label
         ]
         if let sd = try? JSONSerialization.data(withJSONObject: sidecar, options: .prettyPrinted) {
             let sc = subdir.appending(path: filename.replacingOccurrences(of: ".png", with: ".json"))
-            try? sd.write(to: sc, options: .atomic)
+            try? sd.write(to: sc, options: .completeFileProtection)
         }
         return fileURL.path
     }
@@ -324,7 +386,7 @@ final class BatchEngine: ObservableObject {
     private func saveHistory() {
         guard let url  = historyURL,
               let data = try? JSONEncoder.pretty.encode(jobHistory) else { return }
-        try? data.write(to: url, options: .atomic)
+        try? data.write(to: url, options: .completeFileProtection)
     }
 
     private func loadHistory() {
@@ -674,5 +736,74 @@ struct BatchBuilderView: View {
 
     func sectionLabel(_ t: String) -> some View {
         Text(t).font(.system(size: 10, weight: .semibold)).foregroundColor(.secondary)
+    }
+}
+
+// MARK: - BatchItem Extensions (v2)
+
+extension BatchItem {
+
+    /// Convierte BatchItem a SDRequest para uso con SDService.
+    var asSDRequest: SDRequest {
+        SDRequest(
+            prompt:         prompt,
+            negativePrompt: negativePrompt,
+            seed:           seed,
+            steps:          steps,
+            cfgScale:       cfgScale,
+            width:          width,
+            height:         height,
+            samplerName:    samplerName
+        )
+    }
+
+    /// Crea un GenerationSettings proxy para saveToVaultAtomic.
+    func asGenerationSettings(baseURL: String) -> GenerationSettings {
+        var s = GenerationSettings()
+        s.negativePrompt      = negativePrompt
+        s.seed                = seed
+        s.steps               = steps
+        s.cfgScale            = cfgScale
+        s.width               = width
+        s.height              = height
+        s.samplerName         = samplerName
+        s.checkpoint          = checkpoint
+        s.sdBaseURL           = baseURL
+        return s
+    }
+}
+
+// MARK: - BatchResult.status → JobStatus bridge
+
+extension BatchResult.Status {
+    var displayColor: String {
+        switch self {
+        case .pending:  return "#94a3b8"
+        case .running:  return "#f59e0b"
+        case .success:  return "#34d399"
+        case .failed:   return "#ef4444"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .pending:  return "clock"
+        case .running:  return "arrow.triangle.2.circlepath"
+        case .success:  return "checkmark.circle.fill"
+        case .failed:   return "exclamationmark.circle.fill"
+        }
+    }
+}
+
+// MARK: - BatchBuilderView integration with JobQueue (v2)
+
+extension BatchBuilderView {
+    /// Envía el job actual al JobQueueManager en lugar de ejecutarlo secuencialmente.
+    func sendToQueue(job: BatchJob) {
+        let batchID = BatchEngine.shared.sendToJobQueue(
+            job,
+            workers: 2,
+            policy:  PipelineRetryPolicy(maxAttempts: 3, baseDelayMs: 1500, maxDelayMs: 30000, retryOnTimeout: true, retryOnHTTP5xx: true, retryOn429: true)
+        )
+        print("Batch enviado a JobQueue · batchID: \(batchID.uuidString.prefix(8))")
     }
 }

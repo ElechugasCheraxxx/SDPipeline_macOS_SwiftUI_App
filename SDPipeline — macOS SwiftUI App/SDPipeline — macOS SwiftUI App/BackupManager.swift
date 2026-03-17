@@ -318,7 +318,7 @@ final class BackupManager: ObservableObject {
             withJSONObject: manifest,
             options: [.prettyPrinted, .sortedKeys]
         ) {
-            try? manifestData.write(to: manifestURL, options: .atomic)
+            try? manifestData.write(to: manifestURL, options: .completeFileProtection)
             return manifestURL
         }
 
@@ -382,12 +382,11 @@ final class BackupManager: ObservableObject {
             process.standardOutput = pipe
             process.standardError  = pipe
 
-            var outputData = Data()
+            nonisolated(unsafe) var outputData = Data()
             pipe.fileHandleForReading.readabilityHandler = { handle in
                 let chunk = handle.availableData
                 if !chunk.isEmpty {
                     outputData.append(chunk)
-                    // Reflejar en liveLog en el main thread
                     if let text = String(data: chunk, encoding: .utf8) {
                         Task { @MainActor [weak self] in
                             self?.liveLog += text
@@ -463,7 +462,7 @@ final class BackupManager: ObservableObject {
                 handle.write(data)
                 handle.closeFile()
             } else {
-                try? data.write(to: logFile, options: .atomic)
+                try? data.write(to: logFile, options: .completeFileProtection)
             }
         }
     }
@@ -477,7 +476,7 @@ final class BackupManager: ObservableObject {
     func saveConfig() {
         guard let url = configURL else { return }
         if let data = try? JSONEncoder.pretty.encode(config) {
-            try? data.write(to: url, options: .atomic)
+            try? data.write(to: url, options: .completeFileProtection)
         }
     }
 

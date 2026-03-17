@@ -1,8 +1,20 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import AppKit
 import Combine
 
-// MARK: - SettingsView v8
+// MARK: - SettingsView v10
+//
+// Cambios v9 → v10:
+//   ✨ ADD: case cleanup — sección "Limpieza de Artefactos" (ArtifactCleanupEngine)
+//          ROADMAP: "Limpieza automática de artefactos" ahora conectada a UI
+//   🔁 UPD: SettingsSection.group incluye cleanup en grupo "Producción"
+//
+// Cambios v8 → v9:
+//   + Sección "Pipeline" — retry policy, atomic save, autocomplete, workers
+//   + Sección "ControlNet" — gestión de unidades + presets de red
+//   + Sección "Presets" — panel ReusableSettingsManager
+//   + Grupos de sidebar actualizados para nuevas secciones
 // Añade secciones:
 //   • Cifrado (VaultCryptoEngine — rotación de clave, estado AES-256)
 //   • Compliance (PublishComplianceLogger — GDPR flags, reporte)
@@ -54,6 +66,10 @@ struct SettingsView: View {
         case integrity  = "Integridad"
         case audit      = "Auditoría"
         case wildcards  = "Wildcards"
+        case pipeline   = "Pipeline"
+        case controlnet = "ControlNet"
+        case presets    = "Presets"
+        case cleanup    = "Limpieza"   // NEW v10 — ArtifactCleanupEngine
 
         var icon: String {
             switch self {
@@ -73,6 +89,10 @@ struct SettingsView: View {
             case .integrity:  return "shield.checkered"
             case .audit:      return "lock.shield.fill"
             case .wildcards:  return "shuffle"
+            case .pipeline:   return "arrow.triangle.2.circlepath.circle.fill"
+            case .controlnet: return "network"
+            case .presets:    return "bookmark.fill"
+            case .cleanup:    return "sparkle.magnifyingglass"
             }
         }
 
@@ -81,7 +101,10 @@ struct SettingsView: View {
             case .vault, .projects, .crypto, .backup, .integrity:   return "Infraestructura"
             case .watermark, .export, .compliance, .ipAdapter, .color, .editor: return "Producción"
             case .nsfw, .license, .audit:                            return "Seguridad"
-            case .gpu, .wildcards:                                   return "Sistema"
+            case .gpu, .wildcards, .pipeline:                        return "Sistema"
+            case .controlnet:                                        return "Producción"
+            case .presets:                                           return "Producción"
+            case .cleanup:                                           return "Producción"
             }
         }
     }
@@ -126,6 +149,10 @@ struct SettingsView: View {
                     case .integrity:  integritySection
                     case .audit:      auditSection
                     case .wildcards:  wildcardsSection
+                    case .pipeline:   pipelineSection
+                    case .controlnet: controlNetSection
+                    case .presets:    presetsSection
+                    case .cleanup:    cleanupSection
                     }
                 }
                 .padding(24)
@@ -423,9 +450,9 @@ struct SettingsView: View {
             sectionTitle("Compliance y GDPR")
 
             infoCard {
-                paramRow("Publicaciones registradas", "\(compliance.totalPublications)")
+                paramRow("Publicaciones registradas", "\(compliance.totalEntries)")
                 paramRow("Archivos publicados", "\(compliance.totalFilesPublished)")
-                paramRow("Score de compliance", String(format: "%.0f%%", compliance.complianceScore * 100))
+                paramRow("Score de compliance", String(format: "%.0f%%", compliance.currentComplianceScore * 100))
                 paramRow("Watermark rate", String(format: "%.0f%%", compliance.watermarkRate * 100))
                 Divider().background(Color.white.opacity(0.06))
                 HStack {
@@ -442,9 +469,18 @@ struct SettingsView: View {
                     get: { Double(compliance.gdprFlags.retentionDays) },
                     set: { compliance.gdprFlags.retentionDays = Int($0) }
                 ), range: 7...365)
-                Toggle("Portabilidad de datos", isOn: $compliance.gdprFlags.allowsDataPortability).toggleStyle(.switch)
-                Toggle("Derecho al olvido", isOn: $compliance.gdprFlags.rightToErasure).toggleStyle(.switch)
-                Toggle("Consentimiento requerido", isOn: $compliance.gdprFlags.consentRequired).toggleStyle(.switch)
+                Toggle("Portabilidad de datos", isOn: Binding(
+                    get: { compliance.gdprFlags.allowsDataPortability },
+                    set: { compliance.gdprFlags.allowsDataPortability = $0 }
+                )).toggleStyle(.switch)
+                Toggle("Derecho al olvido", isOn: Binding(
+                    get: { compliance.gdprFlags.rightToErasure },
+                    set: { compliance.gdprFlags.rightToErasure = $0 }
+                )).toggleStyle(.switch)
+                Toggle("Consentimiento requerido", isOn: Binding(
+                    get: { compliance.gdprFlags.consentRequired },
+                    set: { compliance.gdprFlags.consentRequired = $0 }
+                )).toggleStyle(.switch)
             }
 
             HStack(spacing: 8) {
@@ -666,6 +702,266 @@ struct SettingsView: View {
         }
     }
 
+
+    // MARK: - Section: Pipeline (v9 NEW)
+
+    var pipelineSection: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            sectionTitle("Pipeline & Escalabilidad")
+
+            // Retry Policy
+            infoCard {
+                HStack {
+                    Image(systemName: "arrow.counterclockwise.circle").foregroundColor(Color(hex: "#7c6af7"))
+                    Text("Retry Policy").font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
+                }
+                Picker("Intentos máximos", selection: Binding(
+                    get: { UserDefaults.standard.integer(forKey: "gen.retryMaxAttempts").nonZero(default: 3) },
+                    set: { UserDefaults.standard.set($0, forKey: "gen.retryMaxAttempts") }
+                )) {
+                    Text("1 (sin retry)").tag(1)
+                    Text("2 intentos").tag(2)
+                    Text("3 intentos").tag(3)
+                    Text("5 intentos").tag(5)
+                }
+                .pickerStyle(.segmented).font(.system(size: 10))
+
+                Toggle("Retry en timeout", isOn: Binding(
+                    get: { UserDefaults.standard.bool(forKey: "gen.retryOnTimeout") },
+                    set: { UserDefaults.standard.set($0, forKey: "gen.retryOnTimeout") }
+                ))
+                .toggleStyle(.switch).tint(Color(hex: "#7c6af7")).font(.system(size: 11))
+                Toggle("Retry en HTTP 5xx", isOn: Binding(
+                    get: { UserDefaults.standard.bool(forKey: "gen.retryOn5xx") },
+                    set: { UserDefaults.standard.set($0, forKey: "gen.retryOn5xx") }
+                ))
+                .toggleStyle(.switch).tint(Color(hex: "#7c6af7")).font(.system(size: 11))
+
+                paramRow("Delay base", "\(UserDefaults.standard.integer(forKey: "gen.retryBaseDelayMs").nonZero(default: 1500)) ms")
+            }
+
+            // Atomic Save
+            infoCard {
+                HStack {
+                    Image(systemName: "internaldrive.fill").foregroundColor(Color(hex: "#3de3c0"))
+                    Text("Guardado Atómico").font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
+                }
+                Toggle("Usar saveToVaultAtomic (recomendado)", isOn: Binding(
+                    get: { UserDefaults.standard.bool(forKey: "gen.useAtomicSave") },
+                    set: { UserDefaults.standard.set($0, forKey: "gen.useAtomicSave") }
+                ))
+                .toggleStyle(.switch).tint(Color(hex: "#3de3c0")).font(.system(size: 11))
+                Text("Incluye esteganografía, IPTC, sidecar JSON y compliance log en cada imagen.")
+                    .font(.system(size: 10)).foregroundColor(.secondary)
+            }
+
+            // Autocomplete
+            infoCard {
+                HStack {
+                    Image(systemName: "text.magnifyingglass").foregroundColor(Color(hex: "#fbbf24"))
+                    Text("Autocompletado de Prompts").font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
+                    Spacer()
+                    if PromptAutoCompleteEngine.shared.isIndexing {
+                        ProgressView().scaleEffect(0.6)
+                    } else {
+                        Text("\(PromptAutoCompleteEngine.shared.indexSize) tokens")
+                            .font(.system(size: 10)).foregroundColor(.secondary)
+                    }
+                }
+                Toggle("Activado", isOn: Binding(
+                    get:  { PromptAutoCompleteEngine.shared.config.enabled },
+                    set:  { PromptAutoCompleteEngine.shared.config.enabled = $0 }
+                ))
+                .toggleStyle(.switch).tint(Color(hex: "#fbbf24")).font(.system(size: 11))
+
+                HStack(spacing: 12) {
+                    Toggle("LoRAs", isOn: Binding(
+                        get: { PromptAutoCompleteEngine.shared.config.includeLoRAs },
+                        set: { PromptAutoCompleteEngine.shared.config.includeLoRAs = $0 }
+                    )).toggleStyle(.switch).scaleEffect(0.8).tint(Color(hex: "#7c6af7"))
+                    Text("LoRAs")
+
+                    Toggle("Embeddings", isOn: Binding(
+                        get: { PromptAutoCompleteEngine.shared.config.includeEmbeddings },
+                        set: { PromptAutoCompleteEngine.shared.config.includeEmbeddings = $0 }
+                    )).toggleStyle(.switch).scaleEffect(0.8).tint(Color(hex: "#7c6af7"))
+                    Text("Embeddings")
+
+                    Toggle("Danbooru", isOn: Binding(
+                        get: { PromptAutoCompleteEngine.shared.config.includeDanbooru },
+                        set: { PromptAutoCompleteEngine.shared.config.includeDanbooru = $0 }
+                    )).toggleStyle(.switch).scaleEffect(0.8).tint(Color(hex: "#7c6af7"))
+                    Text("Danbooru")
+                }
+                .font(.system(size: 10)).foregroundColor(.secondary)
+
+                Button("Re-indexar ahora") {
+                    Task {
+                        _ = LoRAManager.shared.availableLoRAs.map { $0.name }
+                        _ = EmbeddingsManager.shared.loaded.map { $0.name }
+                        await PromptAutoCompleteEngine.shared.buildIndex()
+                    }
+                }
+                .buttonStyle(ActionChipStyle())
+            }
+
+            // Workers
+            infoCard {
+                HStack {
+                    Image(systemName: "cpu.fill").foregroundColor(Color(hex: "#f472b6"))
+                    Text("Workers de Cola").font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
+                    Spacer()
+                    Text("\(JobQueueManager.shared.maxConcurrent) activos")
+                        .font(.system(size: 10)).foregroundColor(.secondary)
+                }
+                Stepper("Workers simultáneos: \(JobQueueManager.shared.maxConcurrent)",
+                        value: Binding(
+                            get: { JobQueueManager.shared.maxConcurrent },
+                            set: { JobQueueManager.shared.maxConcurrent = $0 }
+                        ), in: 1...4)
+                .font(.system(size: 11)).foregroundColor(.white)
+                Text("Más workers = más RAM/GPU. Recomendado ≤2 en Apple Silicon 16GB.")
+                    .font(.system(size: 10)).foregroundColor(.secondary)
+
+                paramRow("Jobs completados", "\(JobQueueManager.shared.totalCompleted)")
+                paramRow("Tasa de éxito",    "\("N/A")")
+                paramRow("ETA restante",     JobQueueManager.shared.estimatedRemainingLabel)
+            }
+        }
+    }
+
+    // MARK: - Section: ControlNet (v9 NEW)
+
+    var controlNetSection: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            sectionTitle("ControlNet")
+            controlNetStatusCard
+            controlNetUnitsCard
+            Button("Recargar modelos desde A1111") {
+                Task { await ControlNetEngine.shared.fetchModels(baseURL: UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860") }
+            }
+            .buttonStyle(ActionChipStyle())
+        }
+    }
+
+    @ViewBuilder private var controlNetStatusCard: some View {
+        let engine = ControlNetEngine.shared
+        infoCard {
+            HStack {
+                Image(systemName: "network").foregroundColor(Color(hex: "#60a5fa"))
+                Text("Estado ControlNet").font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { engine.isEnabled },
+                    set: { engine.isEnabled = $0 }
+                ))
+                .toggleStyle(.switch).tint(Color(hex: "#60a5fa")).labelsHidden()
+            }
+            paramRow("Unidades activas",   "\(engine.activeUnits.filter { $0.enabled }.count) / \(engine.activeUnits.count)")
+            paramRow("Modelos instalados", "\(engine.availableModels.count)")
+            if engine.availableModels.isEmpty && engine.activeUnits.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11)).foregroundColor(Color(hex: "#f59e0b"))
+                    Text("sd-webui-controlnet no detectado. Instálalo en A1111 Extensions.")
+                        .font(.system(size: 10)).foregroundColor(.secondary)
+                }
+                .padding(8).background(Color(hex: "#f59e0b").opacity(0.08)).cornerRadius(6)
+            }
+            Button("Instalar sd-webui-controlnet") {
+                NSWorkspace.shared.open(URL(string: "https://github.com/Mikubill/sd-webui-controlnet")!)
+            }
+            .buttonStyle(ActionChipStyle())
+        }
+    }
+
+    @ViewBuilder private var controlNetUnitsCard: some View {
+        let engine = ControlNetEngine.shared
+        infoCard {
+            Text("UNIDADES").font(.system(size: 9, weight: .semibold)).foregroundColor(.secondary).tracking(1)
+            if engine.activeUnits.isEmpty {
+                Text("Sin unidades configuradas. Añádalas desde el panel FaceID.")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+            } else {
+                ForEach(engine.activeUnits.indices, id: \.self) { i in
+                    controlNetUnitRow(engine.activeUnits[i], index: i)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func controlNetUnitRow(_ unit: ControlNetUnit, index i: Int) -> some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(unit.enabled ? Color(hex: "#60a5fa") : Color.white.opacity(0.15))
+                .frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Unidad \(i+1) · \(unit.module.rawValue)")
+                    .font(.system(size: 11, weight: .medium)).foregroundColor(.white)
+                Text("Modelo: \(unit.model.isEmpty ? "—" : unit.model) · W:\(String(format: "%.2f", unit.weight))")
+                    .font(.system(size: 9)).foregroundColor(.secondary)
+            }
+            Spacer()
+            Text(unit.controlMode.rawValue)
+                .font(.system(size: 9)).foregroundColor(.secondary)
+        }
+        .padding(8).background(Color.white.opacity(0.04)).cornerRadius(6)
+    }
+
+    // MARK: - Section: Presets (v9 NEW)
+
+    var presetsSection: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            sectionTitle("Presets de Pipeline")
+
+            let manager = ReusableSettingsManager.shared
+
+            // Stats
+            infoCard {
+                HStack(spacing: 16) {
+                    VStack(spacing: 2) {
+                        Text("\(manager.presets.count)")
+                            .font(.system(size: 20, weight: .bold, design: .monospaced))
+                            .foregroundColor(Color(hex: "#7c6af7"))
+                        Text("Total").font(.system(size: 9)).foregroundColor(.secondary)
+                    }
+                    VStack(spacing: 2) {
+                        Text("\(manager.favoriteCount)")
+                            .font(.system(size: 20, weight: .bold, design: .monospaced))
+                            .foregroundColor(Color(hex: "#f59e0b"))
+                        Text("Favoritos").font(.system(size: 9)).foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Button("Exportar JSON") {
+                        guard let data = try? manager.exportJSON() else { return }
+                        let panel = NSSavePanel()
+                        panel.nameFieldStringValue = "presets_\(Int(Date().timeIntervalSince1970)).json"
+                        panel.allowedContentTypes  = [.json]
+                        if panel.runModal() == .OK, let url = panel.url {
+                            try? data.write(to: url)
+                        }
+                    }
+                    .buttonStyle(ActionChipStyle())
+
+                    Button("Importar JSON") {
+                        let panel = NSOpenPanel()
+                        panel.allowedContentTypes = [.json]
+                        panel.allowsMultipleSelection = false
+                        if panel.runModal() == .OK, let url = panel.urls.first,
+                           let data = try? Data(contentsOf: url) {
+                            try? manager.importJSON(data)
+                        }
+                    }
+                    .buttonStyle(ActionChipStyle())
+                }
+            }
+
+            // Lista compacta
+            ReusableSettingsPanel { _ in }
+                .frame(height: 360)
+        }
+    }
+
     // MARK: - Reusable Helpers
 
     func sectionTitle(_ text: String) -> some View {
@@ -695,7 +991,123 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 8) { content() }
             .padding(12).background(Color.white.opacity(0.04)).cornerRadius(8)
     }
-}
+
+    // MARK: - Section: Cleanup (NEW v10)
+    // ROADMAP: "Limpieza automática de artefactos" + "Inpainting de cortesía"
+
+    var cleanupSection: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            sectionTitle("Limpieza de Artefactos")
+
+            let engine = ArtifactCleanupEngine.shared
+
+            infoCard {
+                Text("Motor de detección y reparación automática de defectos post-generación.")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+                Text("Usa Vision framework + inpainting dirigido vía A1111.")
+                    .font(.system(size: 10)).foregroundColor(.secondary.opacity(0.7))
+            }
+
+            // Auto-run toggles
+            VStack(alignment: .leading, spacing: 12) {
+                sectionTitle("Activación automática").font(.system(size: 12, weight: .semibold))
+
+                Toggle("Ejecutar después de cada generación", isOn: Binding(
+                    get: { engine.config.autoRunAfterGeneration },
+                    set: { engine.config.autoRunAfterGeneration = $0; saveCleanupConfig() }
+                ))
+                .toggleStyle(.switch)
+                .font(.system(size: 12))
+
+                Toggle("Ejecutar después de ADetailer", isOn: Binding(
+                    get: { engine.config.autoRunAfterADetailer },
+                    set: { engine.config.autoRunAfterADetailer = $0; saveCleanupConfig() }
+                ))
+                .toggleStyle(.switch)
+                .font(.system(size: 12))
+
+                Toggle("Omitir si ADetailer ya procesó la imagen", isOn: Binding(
+                    get: { engine.config.skipIfADetailerRan },
+                    set: { engine.config.skipIfADetailerRan = $0; saveCleanupConfig() }
+                ))
+                .toggleStyle(.switch)
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+            }
+
+            Divider().background(Color.white.opacity(0.07))
+
+            // Repair targets
+            VStack(alignment: .leading, spacing: 12) {
+                Text("OBJETIVOS DE REPARACIÓN")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.secondary)
+
+                Toggle("Reparar manos malformadas", isOn: Binding(
+                    get: { engine.config.repairHands },
+                    set: { engine.config.repairHands = $0; saveCleanupConfig() }
+                ))
+                .toggleStyle(.switch).font(.system(size: 12))
+
+                Toggle("Reparar rostros (complemento ADetailer)", isOn: Binding(
+                    get: { engine.config.repairFaces },
+                    set: { engine.config.repairFaces = $0; saveCleanupConfig() }
+                ))
+                .toggleStyle(.switch).font(.system(size: 12))
+
+                Toggle("Reparar tangencias de ropa / inpainting cortesía", isOn: Binding(
+                    get: { engine.config.repairTangencies },
+                    set: { engine.config.repairTangencies = $0; saveCleanupConfig() }
+                ))
+                .toggleStyle(.switch).font(.system(size: 12))
+
+                Toggle("Limpiar ruido de fondo", isOn: Binding(
+                    get: { engine.config.repairBackground },
+                    set: { engine.config.repairBackground = $0; saveCleanupConfig() }
+                ))
+                .toggleStyle(.switch).font(.system(size: 12))
+            }
+
+            Divider().background(Color.white.opacity(0.07))
+
+            // Fine-tune params
+            VStack(alignment: .leading, spacing: 10) {
+                Text("PARÁMETROS DE INPAINTING")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.secondary)
+
+                sliderRow("Denoising", value: Binding(
+                    get: { engine.config.inpaintingDenoising },
+                    set: { engine.config.inpaintingDenoising = $0; saveCleanupConfig() }
+                ), range: 0.1...0.9)
+
+                HStack {
+                    Text("Pasos").font(.system(size: 10)).foregroundColor(.secondary)
+                    Spacer()
+                    Stepper("\(engine.config.inpaintingSteps)", value: Binding(
+                        get: { engine.config.inpaintingSteps },
+                        set: { engine.config.inpaintingSteps = $0; saveCleanupConfig() }
+                    ), in: 10...50)
+                    .font(.system(size: 11))
+                }
+
+                HStack {
+                    Text("Pasadas máximas").font(.system(size: 10)).foregroundColor(.secondary)
+                    Spacer()
+                    Stepper("\(engine.config.maxRepairPasses)", value: Binding(
+                        get: { engine.config.maxRepairPasses },
+                        set: { engine.config.maxRepairPasses = $0; saveCleanupConfig() }
+                    ), in: 1...5)
+                    .font(.system(size: 11))
+                }
+            }
+        }
+    }
+
+    private func saveCleanupConfig() {
+        let data = try? JSONEncoder().encode(ArtifactCleanupEngine.shared.config)
+        UserDefaults.standard.set(data, forKey: "cleanup.config")
+    }
 
 // MARK: - ActionChipStyle
 
@@ -711,6 +1123,7 @@ struct ActionChipStyle: ButtonStyle {
                 : Color(hex: "#7c6af7").opacity(configuration.isPressed ? 0.15 : 0.1))
             .cornerRadius(6)
     }
+}
 }
 
 // MARK: - Compat extensions
@@ -732,3 +1145,10 @@ extension WildcardEngine {
     var categories: [String] { allKeys }
     func entries(for category: String) -> [String] { terms(for: category) }
 }
+
+extension Int {
+    func nonZero(default value: Int) -> Int { self == 0 ? value : self }
+}
+
+
+

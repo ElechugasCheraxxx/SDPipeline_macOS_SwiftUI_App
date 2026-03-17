@@ -301,9 +301,9 @@ final class KohyaTrainingManager: ObservableObject {
     // MARK: - Launch Training
 
     func createJob(config: TrainingConfig) throws -> TrainingJob {
-        let datasetDir = try createDatasetStructure(for: config)
+        _ = try createDatasetStructure(for: config)
 
-        var job = TrainingJob(config: config)
+        let job = TrainingJob(config: config)
         jobs.insert(job, at: 0)
         try saveJobs()
 
@@ -323,7 +323,7 @@ final class KohyaTrainingManager: ObservableObject {
         let configPath = jobRoot.appendingPathComponent("config.toml").path
         let trainScript = "\(kohyaPath)/train_network.py"
 
-        guard var jobIdx = jobs.firstIndex(where: { $0.id == job.id }) else { return }
+        guard let jobIdx = jobs.firstIndex(where: { $0.id == job.id }) else { return }
         jobs[jobIdx].status     = .running
         jobs[jobIdx].startedAt  = Date()
         activeJob               = jobs[jobIdx]
@@ -345,7 +345,7 @@ final class KohyaTrainingManager: ObservableObject {
 
         task.terminationHandler = { [weak self] process in
             Task { @MainActor [weak self] in
-                guard let self = self, var idx = self.jobs.firstIndex(where: { $0.id == job.id }) else { return }
+                guard let self = self, let idx = self.jobs.firstIndex(where: { $0.id == job.id }) else { return }
                 self.jobs[idx].status      = process.terminationStatus == 0 ? .completed : .failed
                 self.jobs[idx].completedAt = Date()
 
@@ -380,7 +380,7 @@ final class KohyaTrainingManager: ObservableObject {
     }
 
     private func parseTrainingOutput(_ line: String, jobID: UUID) {
-        guard var idx = jobs.firstIndex(where: { $0.id == jobID }) else { return }
+        guard let idx = jobs.firstIndex(where: { $0.id == jobID }) else { return }
 
         // Parsear líneas como: "epoch 3/10, step 120/500, loss: 0.0234"
         if line.contains("loss:") {

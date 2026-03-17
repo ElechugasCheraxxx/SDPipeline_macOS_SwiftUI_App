@@ -1,54 +1,72 @@
 import Foundation
 import CoreData
 
-// MARK: - SD API Request (Automatic1111 full spec)
+// MARK: - Models.swift v2
+//
+// Cambios v1 → v2:
+//   ✨ ADD: SDImg2ImgRequest — soporte completo img2img con mask, resize_mode, inpainting
+//   ✨ ADD: SDRequestOverrideSettings — override checkpoint/VAE on-the-fly
+//   ✨ ADD: SDExtrasRequest + Response — /extra-single-image (ESRGAN)
+//   ✨ ADD: SDInterrogateRequest + Response — /sdapi/v1/interrogate (CLIP)
+//   ✨ ADD: SDInfoDecoded — parsed del campo `info` de SDResponse
+//   ✨ ADD: SDModelCheckpoint + SDSamplerInfo — modelos de catálogo A1111
+//   ✨ ADD: Img2ImgResizeMode enum exhaustivo
+//   ✨ ADD: InpaintFill enum exhaustivo
+//   ✨ ADD: CharacterProfile — top-level (movido desde CharacterEngine)
+//   ✨ ADD: LoRAEntry — top-level (movido desde LoRAManager)
+//   ✨ ADD: ControlNetUnit — inline engine-independent
+//   ✨ ADD: ContentSession — top-level
+//   ✨ ADD: PipelineStage casos adicionales
+//   ✨ ADD: GenerationSettings.autoRetryOnError — FIX referencia en ContentView
+//   ✨ ADD: GenerationSettings.clipSkip, karrasNoise, restoreFacesStrength,
+//          autoRunADetailer, autoRunCleanup, img2imgEnabled, img2imgDenoise
+//   🔁 UPD: GenerationSettings.samplers incluye UniPC
+//   🔁 UPD: PromptBuilder.positiveMap cubre location_interior/exterior, weather,
+//          fill_light, background_light, shot_movement
+
+// MARK: - SD API Request
 
 struct SDRequest: Codable {
-    var prompt: String
-    var negative_prompt: String
-    var seed: Int
-    var steps: Int
-    var cfg_scale: Double
-    var width: Int
-    var height: Int
-    var sampler_name: String
-    var batch_size: Int
-
-    // Hires fix
-    var enable_hr: Bool
-    var hr_upscaler: String
-    var hr_scale: Double
+    var prompt:               String
+    var negative_prompt:      String
+    var seed:                 Int
+    var steps:                Int
+    var cfg_scale:            Double
+    var width:                Int
+    var height:               Int
+    var sampler_name:         String
+    var batch_size:           Int
+    var enable_hr:            Bool
+    var hr_upscaler:          String
+    var hr_scale:             Double
     var hr_second_pass_steps: Int
-    var hr_resize_x: Int
-    var hr_resize_y: Int
-    var denoising_strength: Double
-
-    // Restore faces / tiling
-    var restore_faces: Bool
-    var tiling: Bool
-
-    // Extra metadata (ignored by A1111)
-    var override_settings: [String: String]?
+    var hr_resize_x:          Int
+    var hr_resize_y:          Int
+    var denoising_strength:   Double
+    var restore_faces:        Bool
+    var tiling:               Bool
+    var override_settings:    SDRequestOverrideSettings?
 
     init(
-        prompt: String,
-        negativePrompt: String        = "ugly, blurry, deformed, low quality, watermark, text, nsfw",
-        seed: Int                     = -1,
-        steps: Int                    = 28,
-        cfgScale: Double              = 7.0,
-        width: Int                    = 512,
-        height: Int                   = 768,
-        samplerName: String           = "DPM++ 2M Karras",
-        batchSize: Int                = 1,
-        enableHR: Bool                = false,
-        hrUpscaler: String            = "4x-UltraSharp",
-        hrScale: Double               = 2.0,
-        hrSecondPassSteps: Int        = 15,
-        hrResizeX: Int                = 0,
-        hrResizeY: Int                = 0,
-        denoisingStrength: Double     = 0.45,
-        restoreFaces: Bool            = false,
-        tiling: Bool                  = false
+        prompt:               String,
+        negativePrompt:       String  = "ugly, blurry, deformed, low quality, watermark, text",
+        seed:                 Int     = -1,
+        steps:                Int     = 28,
+        cfgScale:             Double  = 7.0,
+        width:                Int     = 512,
+        height:               Int     = 768,
+        samplerName:          String  = "DPM++ 2M Karras",
+        batchSize:            Int     = 1,
+        enableHR:             Bool    = false,
+        hrUpscaler:           String  = "4x-UltraSharp",
+        hrScale:              Double  = 2.0,
+        hrSecondPassSteps:    Int     = 15,
+        hrResizeX:            Int     = 0,
+        hrResizeY:            Int     = 0,
+        denoisingStrength:    Double  = 0.45,
+        restoreFaces:         Bool    = false,
+        tiling:               Bool    = false,
+        overrideSettings:     SDRequestOverrideSettings? = nil
     ) {
         self.prompt               = prompt
         self.negative_prompt      = negativePrompt
@@ -68,108 +86,565 @@ struct SDRequest: Codable {
         self.denoising_strength   = denoisingStrength
         self.restore_faces        = restoreFaces
         self.tiling               = tiling
+        self.override_settings    = overrideSettings
     }
+}
+
+// MARK: - Override Settings
+
+struct SDRequestOverrideSettings: Codable {
+    var sd_model_checkpoint:          String?
+    var sd_vae:                        String?
+    var CLIP_stop_at_last_layers:      Int?
+    var eta_noise_seed_delta:          Int?
+    var s_noise:                       Double?
+
+    init(
+        checkpoint: String? = nil,
+        vae:        String? = nil,
+        clipSkip:   Int?    = nil,
+        ensd:       Int?    = nil,
+        sNoise:     Double? = nil
+    ) {
+        self.sd_model_checkpoint      = checkpoint
+        self.sd_vae                   = vae
+        self.CLIP_stop_at_last_layers = clipSkip
+        self.eta_noise_seed_delta     = ensd
+        self.s_noise                  = sNoise
+    }
+}
+
+// MARK: - Img2Img Request
+
+struct SDImg2ImgRequest: Codable {
+    var init_images:              [String]
+    var mask:                     String?
+    var prompt:                   String
+    var negative_prompt:          String
+    var seed:                     Int
+    var steps:                    Int
+    var cfg_scale:                Double
+    var width:                    Int
+    var height:                   Int
+    var sampler_name:             String
+    var batch_size:               Int     = 1
+    var denoising_strength:       Double
+    var resize_mode:              Int
+    var inpainting_fill:          Int     = InpaintFill.latentNoise.rawValue
+    var inpaint_full_res:         Bool    = true
+    var inpaint_full_res_padding: Int     = 32
+    var inpainting_mask_invert:   Int     = 0
+    var mask_blur:                Int     = 4
+    var include_init_images:      Bool    = false
+    var override_settings:        SDRequestOverrideSettings?
+
+    init(
+        base64Image:       String,
+        prompt:            String,
+        negativePrompt:    String            = "ugly, blurry, deformed, low quality",
+        seed:              Int               = -1,
+        steps:             Int               = 28,
+        cfgScale:          Double            = 7.0,
+        width:             Int               = 512,
+        height:            Int               = 768,
+        samplerName:       String            = "DPM++ 2M Karras",
+        denoisingStrength: Double            = 0.55,
+        resizeMode:        Img2ImgResizeMode = .scaleToFit,
+        mask:              String?           = nil
+    ) {
+        self.init_images        = [base64Image]
+        self.mask               = mask
+        self.prompt             = prompt
+        self.negative_prompt    = negativePrompt
+        self.seed               = seed
+        self.steps              = steps
+        self.cfg_scale          = cfgScale
+        self.width              = width
+        self.height             = height
+        self.sampler_name       = samplerName
+        self.denoising_strength = denoisingStrength
+        self.resize_mode        = resizeMode.rawValue
+    }
+}
+
+// MARK: - Img2Img Resize Mode
+
+enum Img2ImgResizeMode: Int, Codable, CaseIterable {
+    case justResize    = 0
+    case cropAndResize = 1
+    case scaleToFit    = 2
+    case latentUpscale = 3
+
+    var label: String {
+        switch self {
+        case .justResize:    return "Just Resize"
+        case .cropAndResize: return "Crop & Resize"
+        case .scaleToFit:    return "Scale to Fit"
+        case .latentUpscale: return "Latent Upscale"
+        }
+    }
+}
+
+// MARK: - Inpaint Fill Mode
+
+enum InpaintFill: Int, Codable, CaseIterable {
+    case fill          = 0
+    case original      = 1
+    case latentNoise   = 2
+    case latentNothing = 3
+
+    var label: String {
+        switch self {
+        case .fill:          return "Fill"
+        case .original:      return "Original"
+        case .latentNoise:   return "Latent Noise"
+        case .latentNothing: return "Latent Nothing"
+        }
+    }
+}
+
+// MARK: - Extras / Upscale Request
+
+struct SDExtrasRequest: Codable {
+    var image:                            String
+    var resize_mode:                      Int    = 0
+    var upscaling_resize:                 Double = 2.0
+    var upscaling_resize_w:               Int    = 0
+    var upscaling_resize_h:               Int    = 0
+    var upscaler_1:                       String = "4x-UltraSharp"
+    var upscaler_2:                       String = "None"
+    var extras_upscaler_2_visibility:     Double = 0.0
+    var upscale_first:                    Bool   = false
+    var gfpgan_visibility:                Double = 0.0
+    var codeformer_visibility:            Double = 0.0
+    var codeformer_weight:                Double = 0.0
+
+    init(base64: String, scale: Double = 2.0, upscaler: String = "4x-UltraSharp") {
+        self.image            = base64
+        self.upscaling_resize = scale
+        self.upscaler_1       = upscaler
+    }
+}
+
+struct SDExtrasResponse: Codable {
+    let image:    String
+    let html_info: String?
+}
+
+// MARK: - Interrogate Request
+
+struct SDInterrogateRequest: Codable {
+    var image: String
+    var model: InterrogateModel = .clip
+
+    enum InterrogateModel: String, Codable, CaseIterable {
+        case clip         = "clip"
+        case deepdanbooru = "deepdanbooru"
+        var label: String { rawValue.capitalized }
+    }
+}
+
+struct SDInterrogateResponse: Codable {
+    let caption: String
 }
 
 // MARK: - SD API Response
 
 struct SDResponse: Codable {
-    let images: [String]
+    let images:     [String]
     let parameters: SDResponseParameters?
-    let info: String?
+    let info:        String?
+
+    var infoDecoded: SDInfoDecoded? {
+        guard let raw  = info,
+              let data = raw.data(using: .utf8),
+              let obj  = try? JSONDecoder().decode(SDInfoDecoded.self, from: data) else { return nil }
+        return obj
+    }
 }
 
 struct SDResponseParameters: Codable {
-    let prompt: String?
-    let seed: Int?
-    let steps: Int?
+    let prompt:       String?
+    let seed:         Int?
+    let steps:        Int?
+    let cfg_scale:    Double?
+    let sampler_name: String?
+    let width:        Int?
+    let height:       Int?
 }
 
-// MARK: - SD Progress Response (polling /sdapi/v1/progress)
+struct SDInfoDecoded: Codable {
+    let prompt:             String?
+    let negative_prompt:    String?
+    let seed:               Int?
+    let subseed:            Int?
+    let subseed_strength:   Double?
+    let width:              Int?
+    let height:             Int?
+    let sampler_name:       String?
+    let cfg_scale:          Double?
+    let steps:              Int?
+    let batch_size:         Int?
+    let restore_faces:      Bool?
+    let sd_model_hash:      String?
+    let sd_model_name:      String?
+    let denoising_strength: Double?
+    let all_seeds:          [Int]?
+    let all_prompts:        [String]?
+}
+
+// MARK: - SD Progress Response
 
 struct SDProgressResponse: Codable {
-    let progress: Double
-    let eta_relative: Double
-    let state: SDProgressState?
+    let progress:      Double
+    let eta_relative:  Double
+    let state:         SDProgressState?
     let current_image: String?
-    let textinfo: String?
+    let textinfo:      String?
 
     struct SDProgressState: Codable {
-        let job: String?
-        let job_count: Int?
-        let job_no: Int?
-        let sampling_step: Int?
-        let sampling_steps: Int?
+        let job:                 String?
+        let job_count:           Int?
+        let job_no:              Int?
+        let sampling_step:       Int?
+        let sampling_steps:      Int?
+        let interrupted:         Bool?
+        let stopping_generation: Bool?
     }
 
     var percentDisplay: String { "\(Int(progress * 100))%" }
 
     var etaDisplay: String {
         guard eta_relative > 0 else { return "" }
-        return String(format: "ETA %.0fs", eta_relative)
+        let secs = Int(eta_relative)
+        return secs < 60 ? "~\(secs)s" : "~\(secs / 60)m \(secs % 60)s"
     }
+
+    var isInterrupted: Bool { state?.interrupted == true }
+}
+
+// MARK: - SD Model Checkpoint
+
+struct SDModelCheckpoint: Codable, Identifiable, Hashable {
+    var title:      String
+    var model_name: String
+    var hash:       String?
+    var sha256:     String?
+    var filename:   String?
+
+    var id: String { hash ?? model_name }
+
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    static func == (lhs: SDModelCheckpoint, rhs: SDModelCheckpoint) -> Bool { lhs.id == rhs.id }
+}
+
+// MARK: - SD Sampler Info
+
+struct SDSamplerInfo: Codable, Identifiable, Hashable {
+    var name:    String
+    var aliases: [String]
+    var options: [String: String]?
+    var id:      String { name }
 }
 
 // MARK: - Pipeline Stage
 
 enum PipelineStage: String, CaseIterable {
-    case idle       = "Idle"
-    case parsing    = "Parsing JSON"
-    case building   = "Building Prompt"
-    case sending    = "Sending to SD"
-    case receiving  = "Receiving Image"
-    case postproc   = "Post-Processing"
-    case saving     = "Saving to Vault"
-    case done       = "Done"
-    case error      = "Error"
+    case idle        = "Idle"
+    case parsing     = "Parsing JSON"
+    case building    = "Building Prompt"
+    case sending     = "Sending to SD"
+    case receiving   = "Receiving Image"
+    case img2img     = "Img2Img Refinement"
+    case upscaling   = "Upscaling"
+    case adetailer   = "ADetailer"
+    case postprocess = "Post-Processing"
+    case cleanup     = "Artifact Cleanup"
+    case saving      = "Saving to Vault"
+    case exporting   = "Exporting"
+    case done        = "Done"
+    case error       = "Error"
+    case interrupted = "Interrupted"
+
+    var isActive: Bool {
+        switch self {
+        case .idle, .done, .error, .interrupted: return false
+        default: return true
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .idle:        return "wand.and.stars"
+        case .parsing:     return "doc.text.magnifyingglass"
+        case .building:    return "text.bubble"
+        case .sending:     return "arrow.up.circle"
+        case .receiving:   return "arrow.down.circle"
+        case .img2img:     return "arrow.2.squarepath"
+        case .upscaling:   return "arrow.up.backward.and.arrow.down.forward"
+        case .adetailer:   return "face.smiling"
+        case .postprocess: return "slider.horizontal.3"
+        case .cleanup:     return "sparkle.magnifyingglass"
+        case .saving:      return "externaldrive.fill"
+        case .exporting:   return "square.and.arrow.up"
+        case .done:        return "checkmark.circle.fill"
+        case .error:       return "xmark.circle.fill"
+        case .interrupted: return "stop.circle.fill"
+        }
+    }
 }
 
-// MARK: - Generation Settings (UI state)
+// MARK: - Generation Settings v2
 
 struct GenerationSettings {
-    var negativePrompt: String  = "ugly, blurry, deformed, low quality, watermark, text, nsfw, extra limbs, bad anatomy, disfigured, mutation"
-    var steps: Int              = 28
-    var cfgScale: Double        = 7.0
-    var width: Int              = 512
-    var height: Int             = 768
-    var samplerName: String     = "DPM++ 2M Karras"
-    var seed: Int               = -1
-    var checkpoint: String      = ""
-    var sdBaseURL: String       = "http://127.0.0.1:7860"
+    var prompt:               String = ""
+    var negativePrompt:       String = "ugly, blurry, deformed, low quality, watermark, text"
+    var seed:                 Int    = -1
+    var steps:                Int    = 28
+    var cfgScale:             Double = 7.0
+    var width:                Int    = 512
+    var height:               Int    = 768
+    var samplerName:          String = "DPM++ 2M Karras"
+    var batchSize:            Int    = 1
+    var checkpoint:           String = ""
+    var vaeUsed:              String = "Automatic"
 
-    // Hires fix
-    var enableHR: Bool          = false
-    var hrUpscaler: String      = "4x-UltraSharp"
-    var hrScale: Double         = 2.0
-    var hrSteps: Int            = 15
-    var denoisingStrength: Double = 0.45
+    // Hires Fix
+    var enableHR:             Bool   = false
+    var hrUpscaler:           String = "4x-UltraSharp"
+    var hrScale:              Double = 2.0
+    var hrSteps:              Int    = 15
+    var denoisingStrength:    Double = 0.45
 
-    var restoreFaces: Bool      = false
+    // Face Restoration
+    var restoreFaces:          Bool   = false
+    var restoreFacesStrength:  Double = 0.5
 
-    // Post-generation pipeline flags (new)
-    var autoRunADetailer: Bool  = false
-    var autoRunNSFWCheck: Bool  = true
-    var autoRunPostProd: Bool   = false
+    // CLIP
+    var clipSkip:              Int    = 1
 
+    // Noise schedule
+    var karrasNoise:           Bool   = true
+
+    // Auto-pipeline flags
+    var autoRunADetailer:      Bool   = false
+    var autoRunCleanup:        Bool   = false
+    var autoRunNSFWCheck:      Bool   = true
+    var autoRunPostProd:       Bool   = false
+    var autoRunICLight:        Bool   = false
+    var autoRetryOnError:      Bool   = false  // FIX: was missing, referenced in ContentView
+
+    // Img2img inline
+    var img2imgEnabled:        Bool   = false
+    var img2imgDenoise:        Double = 0.4
+
+    // API
+    var sdBaseURL:             String = "http://127.0.0.1:7860"
+
+    // Backward compat — path al webui.sh de A1111 (también en UserDefaults "a1111.webuiPath")
     var webuiScriptPath: String = {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return "\(home)/automatic1111/stable-diffusion-webui/webui.sh"
     }()
 
+    static var `default`: GenerationSettings { GenerationSettings() }
+
+    var baseURL: URL? { URL(string: sdBaseURL) }
+
+    func makeOverrideSettings() -> SDRequestOverrideSettings? {
+        guard !checkpoint.isEmpty
+           || (vaeUsed != "Automatic" && !vaeUsed.isEmpty)
+           || clipSkip > 1 else { return nil }
+        return SDRequestOverrideSettings(
+            checkpoint: checkpoint.isEmpty ? nil : checkpoint,
+            vae:        (vaeUsed.isEmpty || vaeUsed == "Automatic") ? nil : vaeUsed,
+            clipSkip:   clipSkip > 1 ? clipSkip : nil
+        )
+    }
+
+    // MARK: Static catalogs
+
     static let samplers = [
         "DPM++ 2M Karras", "DPM++ SDE Karras", "DPM++ 2M SDE Karras",
         "Euler a", "Euler", "LMS", "Heun", "DPM2", "DPM2 a",
         "DPM++ 2S a", "DPM++ 2M", "DPM++ SDE",
-        "DPM fast", "DPM adaptive", "DDIM", "PLMS"
+        "DPM fast", "DPM adaptive", "DDIM", "PLMS", "UniPC"
     ]
 
     static let hrUpscalers = [
         "4x-UltraSharp", "ESRGAN_4x", "R-ESRGAN 4x+",
         "R-ESRGAN 4x+ Anime6B", "Latent", "Latent (nearest)", "None"
     ]
+
+    static let extraUpscalers = [
+        "4x-UltraSharp", "ESRGAN_4x", "R-ESRGAN 4x+",
+        "BSRGAN", "ScuNET PSNR", "SwinIR 4x",
+        "Lanczos", "Nearest", "None"
+    ]
+
+    static let vaeOptions = [
+        "Automatic", "None",
+        "vae-ft-mse-840000-ema-pruned.safetensors",
+        "kl-f8-anime2.ckpt"
+    ]
 }
 
-// MARK: - PromptBuilder (intent-aware)
+// MARK: - CharacterProfile (top-level)
+
+struct CharacterProfile: Codable, Identifiable, Hashable {
+    var id:                  UUID     = UUID()
+    var createdAt:           Date     = Date()
+    var name:                String
+
+    var archetype:           String   = ""
+    var gender:              String   = ""
+    var bodyType:            String   = ""
+    var skinTone:            String   = ""
+    var hairColor:           String   = ""
+    var hairStyle:           String   = ""
+    var eyeColor:            String   = ""
+
+    var preferredCheckpoint: String   = ""
+    var preferredSampler:    String   = "DPM++ 2M Karras"
+    var preferredSteps:      Int      = 28
+    var preferredCFG:        Double   = 7.0
+    var preferredWidth:      Int      = 512
+    var preferredHeight:     Int      = 768
+
+    var promptCore:          String   = ""
+    var promptStyle:         String   = ""
+    var promptTrigger:       String   = ""
+    var negativeAdditions:   String   = ""
+
+    var loraWeights:         [String: Double] = [:]
+
+    var referenceImagePath:  String?  = nil
+    var consistencyStrength: Double   = 0.7
+    var ipAdapterEnabled:    Bool     = false
+    var ipAdapterStrength:   Double   = 0.6
+
+    var favoriteSeed:        Int?     = nil
+    var lockedSeed:          Bool     = false
+
+    var tags:                [String] = []
+    var notes:               String   = ""
+    var isActive:            Bool     = true
+    var sessionTag:          String?  = nil
+
+    // Extended fields (required by CharacterEngine)
+    var isFavorite:         Bool    = false
+    var lastUsedAt:         Date?   = nil
+    var totalGenerations:   Int     = 0
+    var baseImageFilename:  String? = nil
+    var updatedAt:          Date?   = nil
+    var basePromptPositive: String  = ""
+    var basePromptNegative: String  = ""
+    var linkedLoRAs:        [LinkedLoRA] = []
+    var pinnedSeeds:        [Int]   = []
+    var physicalDescription: PhysicalDescription = PhysicalDescription()
+
+    struct LinkedLoRA: Codable, Hashable {
+        var loraName:      String
+        var defaultWeight: Double = 0.8
+    }
+
+    struct PhysicalDescription: Codable, Hashable {
+        var age:          String = ""
+        var bodyType:     String = ""
+        var skinTone:     String = ""
+        var hairColor:    String = ""
+        var eyeColor:     String = ""
+        var faceFeatures: String = ""
+        var extra:        String = ""
+    }
+
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    static func == (lhs: CharacterProfile, rhs: CharacterProfile) -> Bool { lhs.id == rhs.id }
+
+    var fullPromptFragment: String {
+        [promptCore, promptStyle, promptTrigger]
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
+    }
+
+    var fullPositivePrompt: String {
+        [basePromptPositive, promptCore, promptStyle, promptTrigger, loraTokens]
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
+    }
+
+    var loraTokens: String {
+        loraWeights.sorted { $0.key < $1.key }
+            .map { "<lora:\($0.key):\(String(format: "%.2f", $0.value))>" }
+            .joined(separator: " ")
+    }
+
+    func characterDirectory(vault: VaultManager) -> URL? {
+        vault.personajesURL?.appending(path: id.uuidString)
+    }
+
+    func baseImageURL(vault: VaultManager) -> URL? {
+        guard let dir = characterDirectory(vault: vault),
+              let fn  = baseImageFilename else { return nil }
+        return dir.appending(path: fn)
+    }
+}
+
+// MARK: - LoRAEntry (top-level)
+
+struct LoRAEntry: Codable, Identifiable, Hashable {
+    var id:       UUID   = UUID()
+    var name:     String
+    var alias:    String?
+    var path:     String?
+    var metadata: LoRAMeta?
+
+    struct LoRAMeta: Codable, Hashable {
+        var description:  String?
+        var author:       String?
+        var license:      String?
+        var tags:         [String]?
+        var baseModel:    String?
+        var triggerWords: [String]?
+    }
+
+    var displayName: String { alias ?? name }
+
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    static func == (lhs: LoRAEntry, rhs: LoRAEntry) -> Bool { lhs.id == rhs.id }
+}
+
+// MARK: - SelectedLoRA
+
+struct SelectedLoRA: Identifiable {
+    var id:     UUID      = UUID()
+    var lora:   LoRAEntry
+    var weight: Double    = 0.8
+
+    var a1111Token: String {
+        "<lora:\(lora.name):\(String(format: "%.2f", weight))>"
+    }
+
+    var promptToken: String { a1111Token }
+}
+
+// MARK: - ContentSession (top-level)
+
+struct ContentSession: Identifiable, Codable, Hashable {
+    var id:         UUID     = UUID()
+    var createdAt:  Date     = Date()
+    var title:      String
+    var category:   String   = "General"
+    var tags:       [String] = []
+    var notes:      String   = ""
+    var isActive:   Bool     = false
+    var assetCount: Int      = 0
+
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    static func == (lhs: ContentSession, rhs: ContentSession) -> Bool { lhs.id == rhs.id }
+}
+
+// MARK: - PromptBuilder v2
 
 struct PromptBuilder {
 
@@ -188,42 +663,51 @@ struct PromptBuilder {
     ]
 
     private static let positiveMap: [(keys: [String], prefix: String?)] = [
-        (["subject_system", "identity", "archetype"],           nil),
-        (["subject_system", "identity", "name"],                nil),
-        (["subject_system", "identity", "gender"],              nil),
-        (["subject_system", "biometrics", "body_type"],         nil),
+        (["subject_system", "identity", "archetype"],                nil),
+        (["subject_system", "identity", "name"],                     nil),
+        (["subject_system", "identity", "gender"],                   nil),
+        (["subject_system", "biometrics", "body_type"],              nil),
+        (["subject_system", "biometrics", "skin_tone"],              nil),
+        (["subject_system", "biometrics", "hair_color"],             nil),
+        (["subject_system", "biometrics", "hair_style"],             nil),
         (["subject_system", "expression_engine", "default_expression"], nil),
-        (["subject_system", "expression_engine", "smile_type"],          nil),
-        (["subject_system", "expression_engine", "editorial_emotion"],  nil),
-        (["editorial_style_system", "style_category"],          nil),
-        (["editorial_style_system", "visual_tone"],             nil),
-        (["editorial_style_system", "target_industry"],         nil),
-        (["wardrobe_engine", "outfit_category"],                nil),
-        (["wardrobe_engine", "style_reference"],                nil),
+        (["subject_system", "expression_engine", "smile_type"],        nil),
+        (["subject_system", "expression_engine", "editorial_emotion"], nil),
+        (["editorial_style_system", "style_category"],               nil),
+        (["editorial_style_system", "visual_tone"],                  nil),
+        (["editorial_style_system", "target_industry"],              nil),
+        (["wardrobe_engine", "outfit_category"],                     nil),
+        (["wardrobe_engine", "style_reference"],                     nil),
         (["wardrobe_engine", "fabric_physics", "movement_behavior"], nil),
-        (["wardrobe_engine", "layering_system", "base_layer"],  nil),
-        (["wardrobe_engine", "layering_system", "secondary_layer"], nil),
-        (["wardrobe_engine", "layering_system", "outer_layer"], nil),
-        (["wardrobe_engine", "layering_system", "accessories"], nil),
-        (["pose_engine", "pose_name"],                          nil),
-        (["pose_engine", "pose_style"],                         nil),
-        (["pose_engine", "body_orientation"],                   nil),
-        (["pose_engine", "arm_positioning"],                    nil),
-        (["pose_engine", "editorial_action"],                   nil),
-        (["environment_system", "location_type"],               nil),
-        (["environment_system", "setting_style"],               nil),
-        (["environment_system", "time_of_day"],                 nil),
-        (["environment_system", "ambient_energy"],              nil),
-        (["environment_system", "color_grading_reference"],     nil),
-        (["environment_system", "prop_interaction"],            nil),
-        (["lighting_engine", "lighting_style"],                 nil),
-        (["lighting_engine", "key_light", "color_temperature"], nil),
-        (["camera_engine", "camera_type"],                      nil),
-        (["camera_engine", "framing_type"],                     nil),
-        (["camera_engine", "depth_of_field_strength"],          nil),
-        (["camera_engine", "camera_angle"],                     nil),
-        (["brand_projection", "editorial_voice"],               nil),
-        (["generation_engine", "primary_prompt"],               nil),
+        (["wardrobe_engine", "layering_system", "base_layer"],       nil),
+        (["wardrobe_engine", "layering_system", "secondary_layer"],  nil),
+        (["wardrobe_engine", "layering_system", "outer_layer"],      nil),
+        (["wardrobe_engine", "layering_system", "accessories"],      nil),
+        (["pose_engine", "pose_name"],                               nil),
+        (["pose_engine", "pose_style"],                              nil),
+        (["pose_engine", "body_orientation"],                        nil),
+        (["pose_engine", "arm_positioning"],                         nil),
+        (["pose_engine", "editorial_action"],                        nil),
+        (["environment_system", "location_type"],                    nil),
+        (["environment_system", "setting_style"],                    nil),
+        (["environment_system", "location_interior"],                nil),
+        (["environment_system", "location_exterior"],                nil),
+        (["environment_system", "time_of_day"],                      nil),
+        (["environment_system", "ambient_energy"],                   nil),
+        (["environment_system", "color_grading_reference"],          nil),
+        (["environment_system", "prop_interaction"],                  nil),
+        (["environment_system", "weather"],                          nil),
+        (["lighting_engine", "lighting_style"],                      nil),
+        (["lighting_engine", "key_light", "color_temperature"],      nil),
+        (["lighting_engine", "fill_light", "intensity"],             nil),
+        (["lighting_engine", "background_light"],                    nil),
+        (["camera_engine", "camera_type"],                           nil),
+        (["camera_engine", "framing_type"],                          nil),
+        (["camera_engine", "depth_of_field_strength"],               nil),
+        (["camera_engine", "camera_angle"],                          nil),
+        (["camera_engine", "shot_movement"],                         nil),
+        (["brand_projection", "editorial_voice"],                    nil),
+        (["generation_engine", "primary_prompt"],                    nil),
     ]
 
     static func buildFromEditorialSchema(_ json: Any) -> (positive: String, negative: String) {
@@ -232,7 +716,7 @@ struct PromptBuilder {
         var positiveTokens: [String] = []
 
         if let genEngine = dict["generation_engine"] as? [String: Any],
-           let primary = genEngine["primary_prompt"] as? String, !primary.isEmpty {
+           let primary   = genEngine["primary_prompt"] as? String, !primary.isEmpty {
             positiveTokens.append(primary)
             if let variations = genEngine["variation_prompts"] as? [String] {
                 positiveTokens.append(contentsOf: variations.filter { !$0.isEmpty })

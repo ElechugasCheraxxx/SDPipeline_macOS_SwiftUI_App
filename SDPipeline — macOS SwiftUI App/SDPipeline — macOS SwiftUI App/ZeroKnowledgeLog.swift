@@ -112,7 +112,7 @@ final class ZeroKnowledgeLog: ObservableObject {
     /// Leer y descifrar todas las entradas del log.
     func loadAll() {
         guard let url  = logURL,
-              let text = try? String(contentsOf: url)
+              let text = try? String(contentsOf: url, encoding: .utf8)
         else {
             isLoaded = true
             return
@@ -253,20 +253,7 @@ extension PromptSafetyFilter {
     }
 }
 
-extension NSFWDetector {
-    /// Log cifrado post-detección.
-    func logResultZK(_ result: NSFWDetectionResult) {
-        guard result.action != .none || result.finalLevel >= .moderate else { return }
-        ZeroKnowledgeLog.shared.write(
-            category: result.action == .quarantine ? .nsfwQuarantine : .nsfwDetected,
-            message:  "Level: \(result.finalLevel.label) · Action: \(result.action.rawValue)",
-            metadata: [
-                "triggers": result.triggerWords.joined(separator: ","),
-                "prompt":   String(result.prompt.prefix(60))
-            ]
-        )
-    }
-}
+// NSFWDetector.logResultZK is defined in NSFWDetector.swift
 
 // MARK: - ZeroKnowledgeLogView
 

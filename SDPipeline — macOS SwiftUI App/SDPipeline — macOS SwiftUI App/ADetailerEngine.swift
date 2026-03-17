@@ -57,7 +57,7 @@ struct ADetailerUnit: Codable, Identifiable {
     // MARK: - API Serialization
 
     var toAPIDict: [String: Any] {
-        var dict: [String: Any] = [
+        let dict: [String: Any] = [
             "ad_model":                       model.rawValue,
             "ad_prompt":                      prompt,
             "ad_negative_prompt":             negativePrompt,
@@ -699,5 +699,15 @@ struct ADetailerUnitEditor: View {
                 .foregroundColor(.secondary)
                 .frame(width: 36)
         }
+    }
+}
+
+// MARK: - Unit Factory
+
+extension ADetailerEngine {
+    /// Creates an ADetailerUnit with the given model. Used by HiResFinishEngine.
+    func createUnit(model: ADetailerModel = .faceFull,
+                    denoiseStrength: Double = 0.40) -> ADetailerUnit {
+        ADetailerUnit(model: model, denoiseStrength: denoiseStrength)
     }
 }

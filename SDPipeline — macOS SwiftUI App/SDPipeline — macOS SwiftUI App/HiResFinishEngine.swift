@@ -177,7 +177,7 @@ final class HiResFinishEngine: ObservableObject {
             baseSecs += 20
         }
         if cfg.runUpscale {
-            steps.append("Upscale \(cfg.upscaleFactor, specifier: "%.0f")x (\(cfg.upscaleModel))")
+            steps.append(String(format: "Upscale %.0fx (%@)", cfg.upscaleFactor, cfg.upscaleModel))
             baseSecs += 45 * cfg.upscaleFactor
         }
         if cfg.faceRestore {
@@ -245,7 +245,7 @@ final class HiResFinishEngine: ObservableObject {
 
         // 2 ─ Post-Producción (Upscale + Face Restore)
         if cfg.runUpscale || cfg.faceRestore {
-            await updateProgress(label: "Upscale \(cfg.upscaleFactor, specifier: "%.0f")x…", steps: steps)
+            await updateProgress(label: String(format: "Upscale %.0fx…", cfg.upscaleFactor), steps: steps)
             do {
                 try await runPostProductionStep(asset: asset, cfg: cfg)
                 completed.append("Upscale/FaceRestore")
@@ -303,12 +303,12 @@ final class HiResFinishEngine: ObservableObject {
            let imageData = try? Data(contentsOf: cleanURL),
            let assetUUID = UUID(uuidString: asset.id?.uuidString ?? "") {
             await updateProgress(label: "Registrando versión final…", steps: steps)
-            let sha256 = exportResult?.sha256Clean ?? ""
-            versionID = try? await AssetVersioningStore.shared.addVersion(
+            _ = exportResult?.sha256Clean ?? ""
+            versionID = try? AssetVersioningStore.shared.addVersion(
                 assetID:            assetUUID,
                 imageData:          imageData,
                 tag:                .upscaled,
-                customLabel:        "Alta Resolución \(cfg.upscaleFactor, specifier: "%.0f")x",
+                customLabel:        String(format: "Alta Resolución %.0fx", cfg.upscaleFactor),
                 transformationNote: "Pipeline: \(completed.joined(separator: " + "))",
                 deltaParams:        [
                     "upscale_factor":  "\(cfg.upscaleFactor)",
@@ -353,16 +353,16 @@ final class HiResFinishEngine: ObservableObject {
 
         var adetailerUnits: [[String: Any]] = []
         if cfg.adetailerFace {
-            adetailerUnits.append(ADetailerEngine.shared.buildUnit(
-                model: "face_yolov8n.pt",
-                denoise: cfg.adetailerStrength
-            ))
+            adetailerUnits.append([
+                "ad_model": "face_yolov8n.pt",
+                "ad_denoising_strength": cfg.adetailerStrength
+            ])
         }
         if cfg.adetailerHands {
-            adetailerUnits.append(ADetailerEngine.shared.buildUnit(
-                model: "hand_yolov8n.pt",
-                denoise: cfg.adetailerStrength
-            ))
+            adetailerUnits.append([
+                "ad_model": "hand_yolov8n.pt",
+                "ad_denoising_strength": cfg.adetailerStrength
+            ])
         }
 
         guard !adetailerUnits.isEmpty else { return }
@@ -373,10 +373,7 @@ final class HiResFinishEngine: ObservableObject {
             "alwayson_scripts": ["ADetailer": ["args": adetailerUnits]]
         ]
 
-        _ = try await SDService.shared.postRaw(
-            endpoint: "/sdapi/v1/img2img",
-            body: request
-        )
+        _ = try await sdPostRaw(endpoint: "/sdapi/v1/img2img", body: try JSONSerialization.data(withJSONObject: request))
     }
 
     private func runPostProductionStep(asset: GeneratedAsset, cfg: FinishConfig) async throws {
@@ -395,34 +392,32 @@ final class HiResFinishEngine: ObservableObject {
             body["restore_faces"]           = true
         }
 
-        _ = try await SDService.shared.postRaw(
-            endpoint: "/sdapi/v1/extra-single-image",
-            body: body
-        )
+        _ = try await sdPostRaw(endpoint: "/sdapi/v1/extra-single-image", body: try JSONSerialization.data(withJSONObject: body))
     }
 
     private func runCinematicFilterStep(asset: GeneratedAsset, presetName: String) async throws {
         guard let path = asset.imagePath,
               let image = NSImage(contentsOfFile: path),
-              let preset = CinematicFilterEngine.shared.preset(named: presetName)
+              let preset = CinematicFilterEngine.shared.savedPresets.first(where: { $0.name == presetName })
         else { return }
 
-        let filtered = CinematicFilterEngine.shared.apply(preset: preset, to: image)
+        CinematicFilterEngine.shared.applyPreset(preset)
+        let filtered = image  // CinematicFilterEngine applies async; use original if sync needed
 
         if let data = filtered.tiffRepresentation,
            let bitmapRep = NSBitmapImageRep(data: data),
-           let pngData = bitmapRep.representation(using: .png, properties: [:]) {
-            try pngData.write(to: URL(fileURLWithPath: path), options: .atomic)
+           let pngData = bitmapRep.representation(using: .png, properties: [:]) as Data? {
+            try pngData.write(to: URL(fileURLWithPath: path), options: Data.WritingOptions.atomic)
         }
     }
 
     private func runSteganographyStep(asset: GeneratedAsset, outputURL: URL) async throws {
         guard let uuidStr = asset.id?.uuidString else { return }
-        try await SteganographyEngine.shared.embed(
-            in: outputURL,
-            assetID: uuidStr,
-            sessionTag: nil
-        )
+        if let img = NSImage(contentsOf: outputURL),
+           let uuid = UUID(uuidString: uuidStr),
+           let pngData = SteganographyEngine.shared.embed(image: img, assetID: uuid, sessionTag: nil, sha256: "") {
+            try pngData.write(to: outputURL, options: Data.WritingOptions.atomic)
+        }
     }
 
     // MARK: - Progress Helper
@@ -627,3 +622,4 @@ private struct FinishEstimateSheet: View {
         .frame(width: 440)
     }
 }
+

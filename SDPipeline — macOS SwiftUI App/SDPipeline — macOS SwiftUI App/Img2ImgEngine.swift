@@ -106,6 +106,7 @@ struct Img2ImgSettings {
 final class Img2ImgEngine: ObservableObject {
 
     static let shared = Img2ImgEngine()
+    @Published var defaultDenoisingStrength: Double = 0.4
     private init() { loadHistory() }
 
     // MARK: - State
@@ -406,7 +407,7 @@ final class Img2ImgEngine: ObservableObject {
               let png  = bmp.representation(using: .png, properties: [:])
         else { return nil }
 
-        try? png.write(to: fileURL, options: .atomic)
+        try? png.write(to: fileURL, options: .completeFileProtection)
 
         // Sidecar JSON
         let sidecar: [String: Any] = [
@@ -426,7 +427,7 @@ final class Img2ImgEngine: ObservableObject {
         ]
         if let sidecarData = try? JSONSerialization.data(withJSONObject: sidecar, options: .prettyPrinted) {
             let sidecarURL = subdir.appending(path: filename.replacingOccurrences(of: ".png", with: ".json"))
-            try? sidecarData.write(to: sidecarURL, options: .atomic)
+            try? sidecarData.write(to: sidecarURL, options: .completeFileProtection)
         }
 
         return fileURL.path
@@ -446,7 +447,7 @@ final class Img2ImgEngine: ObservableObject {
         guard let url = historyURL,
               let data = try? JSONEncoder.pretty.encode(jobHistory)
         else { return }
-        try? data.write(to: url, options: .atomic)
+        try? data.write(to: url, options: .completeFileProtection)
     }
 
     private func loadHistory() {

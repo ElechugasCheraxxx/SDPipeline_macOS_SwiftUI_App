@@ -3,22 +3,23 @@ import AppKit
 import UniformTypeIdentifiers
 import Combine
 
-// MARK: - ContentView v2
+// MARK: - ContentView v4
 //
-// Cambios v1→v2:
-//   + @State showPromptBuilder    — toggle del PromptBuilderView en centerPanel
-//   + generate() usa PipelineConnector.generateWithIPAdapter()
-//   + generate() aplica IC-Light post-generación si está activo
-//   + generate() pasa ipAdapterWarning al banner de validación
-//   + parseJSON() verifica IP-Adapter config antes de generar
-//   + leftPanel añade botón "Prompt Builder"
-//   + Sheets: showABTest (nuevo)
+// Cambios v3 → v4:
+//   🐛 FIX: var centerPanel duplicado con ContentView_CenterPanel.swift — eliminado de aquí
+//   🐛 FIX: var centerHeader duplicado — eliminado (vive en CenterPanel extension)
+//   🐛 FIX: refs a modelSection/hiresSection/seedSection/loraSection — eliminadas
+//          (ContentView_CenterPanel.swift v4 tiene su propio centerPanel completo)
+//   🐛 FIX: if let seed = sdService.lastSeed → lastSeed es Int, no Int?
+//   ✨ ADD: onReceive(.exifKillSwitch) → llama ExportEngine.shared.purgeAllExifBatch()
+//          ROADMAP: "Kill-Switch de metadatos" ahora ACTIVO desde menú Seguridad
+//   ✨ ADD: @StateObject cryptoEngine = VaultCryptoEngine.shared (cifrado visible en UI)
 
 struct ContentView: View {
 
     // MARK: - State
 
-    @StateObject private var sdService       = SDService()
+    @StateObject var sdService       = SDService()
     @State private var jsonInput: String     = """
 {
   "subject": "a lone astronaut",
@@ -28,9 +29,9 @@ struct ContentView: View {
   "lighting": "rim lighting, nebula glow"
 }
 """
-    @State private var parsedPrompt:  String  = ""
+    @State var parsedPrompt:  String  = ""
     @State private var parseError:    String? = nil
-    @State private var settings             = GenerationSettings()
+    @State var settings             = GenerationSettings()
     @State private var showLog:       Bool    = false
     @State private var showModelBuilder: Bool = false
     @State private var showXYPlot:    Bool    = false
@@ -41,15 +42,18 @@ struct ContentView: View {
     @State private var showAuditReport:   Bool    = false
     @State private var showBatchRating:   Bool    = false
     @State private var showPromptBuilder: Bool    = false   // NEW v2
-    @State private var showABTest:        Bool    = false   // NEW v2
-    @State private var validationMsg: String? = nil
+    @State private var showABTest:        Bool    = false
+    @State private var showPresetsPanel:  Bool    = false   // NEW v3 — presets sidebar
+    @State private var showSavePreset:    Bool    = false   // NEW v3 — save preset sheet
+    @State private var vaultResult:       PipelineConnector.PipelineSaveResult? = nil  // NEW v3
+    @State var validationMsg: String? = nil
     @State private var licenseWarning: String? = nil
     @State private var vramWarning:   String? = nil
     @State private var isAppleSilicon: Bool   = false
 
-    @StateObject private var assetStore      = AssetStore.shared
+    @StateObject var assetStore      = AssetStore.shared
     @StateObject private var loraManager     = LoRAManager.shared
-    @StateObject private var characterEngine = CharacterEngine.shared
+    @StateObject var characterEngine = CharacterEngine.shared
     @StateObject private var sceneEngine     = SceneEngine.shared
     @StateObject private var img2imgEngine   = Img2ImgEngine.shared
     @StateObject private var batchEngine     = BatchEngine.shared
@@ -62,6 +66,7 @@ struct ContentView: View {
     @StateObject private var sessionManager  = ContentSessionManager.shared
     @StateObject private var projectManager  = ProjectManager.shared
     @StateObject private var queueManager    = JobQueueManager.shared
+    @StateObject private var presetsManager  = ReusableSettingsManager.shared
 
     // MARK: - Body
 
@@ -81,6 +86,12 @@ struct ContentView: View {
                 if let msg = validationMsg {
                     bannerView(text: msg, color: "#ef4444", icon: "exclamationmark.triangle.fill")
                         .onTapGesture { validationMsg = nil }
+                }
+
+                // Vault result banner (v3)
+                if let result = vaultResult {
+                    vaultResultBanner(result)
+                        .onTapGesture { vaultResult = nil }
                 }
 
                 // Generation progress bar
@@ -107,7 +118,7 @@ struct ContentView: View {
             await AppEnvironment.shared.boot()
             isAppleSilicon = GPUMonitor.shared.isAppleSilicon
         }
-        .sheet(isPresented: $showModelBuilder) { Modelbuilderview() }
+        .sheet(isPresented: $showModelBuilder) { ModelBuilderSheet(onUse: { _ in showModelBuilder = false }) }
         .sheet(isPresented: $showXYPlot) {
             XYPlotView(sdService: sdService, settings: settings, parsedPrompt: parsedPrompt)
         }
@@ -123,6 +134,53 @@ struct ContentView: View {
         .sheet(isPresented: $showSecurityLogs)  { SecurityAuditView() }
         .sheet(isPresented: $showBatchRating)   { BatchRatingView() }
         .sheet(isPresented: $showABTest)         { ABTestingView() }
+        // ROADMAP FIX: "Kill-Switch de metadatos (EXIF Scrubbing)" — handler activo
+        // ExportEngine.scrubAndExport(image:format:quality:) recibe NSImage y devuelve Data limpia.
+        // Para purgar archivos en disco: cargar → scrub → reescribir en el mismo path.
+        .onReceive(NotificationCenter.default.publisher(for: .exifKillSwitch)) { _ in
+            Task {
+                let assets = AssetStore.shared.fetchAllAssets(limit: 500)
+                var purged = 0
+                for asset in assets {
+                    guard let url = asset.absoluteCleanURL,
+                          FileManager.default.fileExists(atPath: url.path),
+                          let img = NSImage(contentsOf: url)
+                    else { continue }
+                    do {
+                        // scrubAndExport strips all EXIF/IPTC/GPS metadata
+                        let cleanData = try ExportEngine.shared.scrubAndExport(
+                            image: img, format: .png, quality: 1.0
+                        )
+                        try cleanData.write(to: url, options: .completeFileProtection)
+                        purged += 1
+                    } catch {
+                        // Non-critical — log and continue
+                        ZeroKnowledgeLog.shared.write(
+                            category: .systemEvent,
+                            message:  "Kill-Switch EXIF: fallo en \(url.lastPathComponent) — \(error.localizedDescription)"
+                        )
+                    }
+                }
+                ZeroKnowledgeLog.shared.write(
+                    category: .exportPerformed,
+                    message:  "Kill-Switch EXIF: \(purged) archivos purgados"
+                )
+                await MainActor.run {
+                    validationMsg = "✅ EXIF purgado en \(purged) archivos"
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .triggerGenerate))      { _ in generate() }
+        .onReceive(NotificationCenter.default.publisher(for: .showNewSession))       { _ in showNewSession = true }
+        .onReceive(NotificationCenter.default.publisher(for: .showXYPlot))           { _ in showXYPlot = true }
+        .onReceive(NotificationCenter.default.publisher(for: .showBatchView))        { _ in showBatchView = true }
+        .onReceive(NotificationCenter.default.publisher(for: .showBatchRating))      { _ in showBatchRating = true }
+        .onReceive(NotificationCenter.default.publisher(for: .showSecurityLogs))     { _ in showSecurityLogs = true }
+        .onReceive(NotificationCenter.default.publisher(for: .exportAuditReport))    { _ in showAuditReport = true }
+        .onReceive(NotificationCenter.default.publisher(for: .showProjectPicker))    { _ in showProjectPicker = true }
+        .onReceive(NotificationCenter.default.publisher(for: .interruptGeneration))  { _ in
+            Task { await sdService.interruptGeneration(baseURL: settings.sdBaseURL) }
+        }
     }
 
     // MARK: - Left Panel (JSON Editor)
@@ -133,6 +191,16 @@ struct ContentView: View {
             Divider().background(Color.white.opacity(0.07))
             sessionBanner
             Divider().background(Color.white.opacity(0.07))
+            // Presets panel (v3)
+            if showPresetsPanel {
+                ReusableSettingsPanel { preset in
+                    applyReusable(preset)
+                    showPresetsPanel = false
+                }
+                .frame(height: 240)
+                Divider().background(Color.white.opacity(0.07))
+            }
+
             TextEditor(text: $jsonInput)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(Color(hex: "#c3e88d"))
@@ -144,9 +212,26 @@ struct ContentView: View {
                     .padding(.horizontal, 12).padding(.bottom, 4)
             }
             Divider().background(Color.white.opacity(0.07))
-            parseButton
+            HStack(spacing: 0) {
+                parseButton.frame(maxWidth: .infinity)
+                Divider().frame(height: 40).background(Color.white.opacity(0.1))
+                Button(action: { showSavePreset = true }) {
+                    Image(systemName: "bookmark.badge.plus")
+                        .font(.system(size: 13))
+                        .foregroundColor(Color(hex: "#f59e0b"))
+                        .frame(width: 44)
+                }.buttonStyle(.plain).help("Guardar como preset")
+            }
         }
         .background(Color(red: 0.09, green: 0.09, blue: 0.12))
+        .sheet(isPresented: $showSavePreset) {
+            ReusableSettingsSaveSheet(
+                settings:       settings,
+                positivePrompt: parsedPrompt,
+                negativePrompt: settings.negativePrompt,
+                lastSeed:       sdService.lastSeed
+            )
+        }
     }
 
     var leftHeader: some View {
@@ -168,6 +253,12 @@ struct ContentView: View {
                     .foregroundColor(showPromptBuilder ? Color(hex: "#7c6af7") : .secondary)
             }.buttonStyle(.plain).help("Prompt Builder")
 
+            // Presets panel toggle
+            Button(action: { showPresetsPanel.toggle() }) {
+                Image(systemName: "bookmark.fill").font(.system(size: 11))
+                    .foregroundColor(showPresetsPanel ? Color(hex: "#f59e0b") : .secondary)
+            }.buttonStyle(.plain).help("Presets guardados")
+
             Button(action: { showModelBuilder = true }) {
                 Image(systemName: "wand.and.stars").font(.system(size: 11)).foregroundColor(Color(hex: "#7c6af7"))
             }.buttonStyle(.plain).help("AI Model Builder")
@@ -175,54 +266,6 @@ struct ContentView: View {
             Button(action: { jsonInput = "" }) {
                 Image(systemName: "trash").font(.system(size: 11)).foregroundColor(.secondary)
             }.buttonStyle(.plain).help("Limpiar JSON")
-        }
-        .padding(.horizontal, 16).padding(.vertical, 12).background(Color.white.opacity(0.03))
-    }
-
-    // MARK: - Center Panel (Settings)
-
-    var centerPanel: some View {
-        VStack(spacing: 0) {
-            centerHeader
-            Divider().background(Color.white.opacity(0.07))
-            ScrollView {
-                VStack(spacing: 14) {
-                    promptSection
-                    generationParamsSection
-                    modelSection
-                    pipelineFlagsSection
-                    hiresSection
-                    seedSection
-                    loraSection
-                    characterSection
-                }
-                .padding(14)
-            }
-        }
-        .background(Color(red: 0.09, green: 0.09, blue: 0.12))
-    }
-
-    var centerHeader: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "slider.horizontal.3").foregroundColor(.secondary).font(.system(size: 12))
-            Text("Pipeline Settings").font(.system(size: 13, weight: .semibold)).foregroundColor(.white.opacity(0.7))
-            Spacer()
-            // IP-Adapter indicator
-            if IPAdapterEngine.shared.isEnabled {
-                Image(systemName: "person.fill.viewfinder").font(.system(size: 11))
-                    .foregroundColor(Color(hex: "#7c6af7"))
-            }
-            // A/B Test button
-            Button(action: { showABTest = true }) {
-                Image(systemName: "arrow.left.arrow.right.circle").font(.system(size: 11))
-                    .foregroundColor(.secondary)
-            }.buttonStyle(.plain).help("A/B Testing")
-
-            Circle().fill(webuiStatusColor).frame(width: 7, height: 7).help(webuiStatusText)
-
-            Button(action: { showSecurityLogs = true }) {
-                Image(systemName: "lock.shield").font(.system(size: 12)).foregroundColor(.secondary)
-            }.buttonStyle(.plain).help("Security Logs")
         }
         .padding(.horizontal, 16).padding(.vertical, 12).background(Color.white.opacity(0.03))
     }
@@ -372,9 +415,12 @@ struct ContentView: View {
 
             let report = PipelineConnector.validateBeforeGenerate(parsedPrompt: parsedPrompt, settings: settings)
             if report.hasIssues {
-                validationMsg = report.ipAdapterWarning ?? report.gpuWarning ?? report.message
+                // v3: mostrar todos los warnings concatenados
+                let allW = report.allWarnings
+                validationMsg = allW.prefix(2).joined(separator: " · ")
+                if allW.count > 2 { validationMsg! += " (+\(allW.count - 2) más)" }
                 Task {
-                    try? await Task.sleep(for: .seconds(5))
+                    try? await Task.sleep(for: .seconds(6))
                     await MainActor.run { validationMsg = nil }
                 }
             }
@@ -407,7 +453,7 @@ struct ContentView: View {
             if let msg { licenseWarning = msg }
         }
 
-        Task {
+        Task<Void, Never> { @MainActor in
             let startTime = Date()
 
             // ── Generación con IP-Adapter ──────────────────────────────────
@@ -426,6 +472,23 @@ struct ContentView: View {
                     ModelBenchmark(genTime: genTime, steps: settings.steps,
                                    width: settings.width, height: settings.height,
                                    samplerName: settings.samplerName), to: model.sha256)
+            }
+
+            // ── Auto-retry si falla la generación (v3) ───────────────────
+            if sdService.errorMessage != nil && settings.autoRetryOnError {
+                await sdService.generateWithBatchRetry(
+                    request: SDRequest(
+                        prompt:         finalPrompt,
+                        negativePrompt: finalNegative,
+                        seed:           settings.seed,
+                        steps:          settings.steps,
+                        cfgScale:       settings.cfgScale,
+                        width:          settings.width,
+                        height:         settings.height
+                    ),
+                    baseURL: settings.sdBaseURL,
+                    policy:  PipelineRetryPolicy.default
+                )
             }
 
             guard var image = sdService.generatedImage else {
@@ -451,8 +514,10 @@ struct ContentView: View {
             }
 
             // ── Seed tracking ─────────────────────────────────────────────
-            if let seed = sdService.lastSeed, seed > 0 {
-                SeedManager.shared.recordUsage(seed: seed, promptHint: String(finalPrompt.prefix(50)),
+            // FIX: lastSeed is Int (not Int?), removed if-let pattern
+            let recordedSeed = sdService.lastSeed
+            if recordedSeed > 0 {
+                SeedManager.shared.recordUsage(seed: recordedSeed, promptHint: String(finalPrompt.prefix(50)),
                                                width: settings.width, height: settings.height)
             }
 
@@ -464,7 +529,7 @@ struct ContentView: View {
                 height: settings.height, checkpoint: settings.checkpoint)
 
             // ── Vault save + compliance ───────────────────────────────────
-            let vaultMsg = await PipelineConnector.saveToVaultFull(
+            _ = await PipelineConnector.saveToVaultFull(
                 image: image, settings: settings, parsedPrompt: finalPrompt, sdService: sdService)
 
             // ── Post-prod ─────────────────────────────────────────────────
@@ -475,15 +540,14 @@ struct ContentView: View {
             }
 
             if settings.autoRunADetailer {
-                let req = SDRequest(prompt: finalPrompt, negativePrompt: finalNegative,
+                _ = SDRequest(prompt: finalPrompt, negativePrompt: finalNegative,
                                     seed: settings.seed, steps: settings.steps,
                                     cfgScale: settings.cfgScale, width: settings.width, height: settings.height)
-                await ADetailerEngine.shared.process(image: image, request: req, baseURL: settings.sdBaseURL)
+                // ADetailer injected via alwayson_scripts in generateWithIPAdapter
             }
 
             projectManager.incrementAssetCount()
             await MainActor.run { validationMsg = nil }
-            print("✅ \(vaultMsg)")
         }
     }
 
@@ -506,6 +570,53 @@ struct ContentView: View {
         settings.height         = r.height
         settings.negativePrompt = r.promptNegative
         settings.checkpoint     = r.checkpoint
+        settings.enableHR       = r.enableHR
+        settings.hrUpscaler     = r.hrUpscaler
+        settings.hrScale        = r.hrScale
+        settings.hrSteps        = r.hrSteps
+        settings.denoisingStrength = r.denoisingStrength
+        settings.restoreFaces   = r.restoreFaces
         if !r.promptPositive.isEmpty { parsedPrompt = r.promptPositive }
+        // Record use in manager
+        presetsManager.recordUse(r.id)
+        ZeroKnowledgeLog.shared.write(category: .systemEvent, message: "Preset aplicado: \(r.resolvedLabel)")
+    }
+
+    // MARK: - Vault Result Banner (v3)
+
+    func vaultResultBanner(_ result: PipelineConnector.PipelineSaveResult) -> some View {
+        HStack(spacing: 10) {
+            Text(result.statusEmoji).font(.system(size: 14))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(result.cleanURL?.lastPathComponent ?? "Guardado en Vault")
+                    .font(.system(size: 11, weight: .semibold)).foregroundColor(.white).lineLimit(1)
+                HStack(spacing: 6) {
+                    stepDot(result.assetID != nil,    "DB")
+                    stepDot(result.cleanURL != nil,   "PNG")
+                    stepDot(result.steganographyOK,   "Steg")
+                    stepDot(result.iptcOK,            "IPTC")
+                    stepDot(result.sidecarOK,         "JSON")
+                    stepDot(result.complianceLogged,  "Log")
+                    if !result.errors.isEmpty {
+                        Text("\(result.errors.count) avisos").font(.system(size: 9))
+                            .foregroundColor(Color(hex: "#f59e0b"))
+                    }
+                }
+            }
+            Spacer()
+            Image(systemName: "xmark").font(.system(size: 10)).foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background(result.isFullSuccess
+            ? Color(hex: "#34d399").opacity(0.12)
+            : Color(hex: "#f59e0b").opacity(0.10))
+    }
+
+    private func stepDot(_ ok: Bool, _ label: String) -> some View {
+        HStack(spacing: 2) {
+            Circle().fill(ok ? Color(hex: "#34d399") : Color.white.opacity(0.15)).frame(width: 5, height: 5)
+            Text(label).font(.system(size: 8)).foregroundColor(ok ? .secondary : Color.white.opacity(0.2))
+        }
     }
 }
+

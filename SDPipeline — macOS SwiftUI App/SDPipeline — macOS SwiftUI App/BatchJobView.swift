@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import AppKit
 
@@ -86,11 +87,11 @@ struct BatchJobView: View {
                 switch selectedMode {
                 case .promptVariations:
                     promptVariationsConfig
-                case .seedExploration:
+                case .seedVariations:
                     seedExplorationConfig
-                case .matrix:
+                case .fullMatrix:
                     matrixConfig
-                case .characterStudy:
+                case .manual: // characterStudy mapped to manual
                     characterStudyConfig
                 }
 
@@ -393,7 +394,7 @@ struct BatchJobView: View {
                 )
                 await engine.run(job)
 
-            case .seedExploration:
+            case .seedVariations:
                 // Generar seedCount seeds secuenciales desde el seed actual
                 let baseSeed = settings.seed > 0 ? settings.seed : Int.random(in: 1...999999)
                 let seeds = (0..<seedCount).map { baseSeed + $0 }
@@ -410,7 +411,7 @@ struct BatchJobView: View {
                 )
                 await engine.run(job)
 
-            case .matrix:
+            case .fullMatrix:
                 let prompts = customPrompts.split(separator: "\n")
                     .map { String($0).trimmingCharacters(in: .whitespaces) }
                     .filter { !$0.isEmpty }
@@ -429,7 +430,7 @@ struct BatchJobView: View {
                 )
                 await engine.run(job)
 
-            case .characterStudy:
+            case .manual: // characterStudy mapped to manual
                 guard let char = CharacterEngine.shared.activeCharacter else { return }
                 let injected = CharacterEngine.shared.injectActiveCharacter(into: parsedPrompt)
                 let prompts  = Array(repeating: injected, count: variationCount)

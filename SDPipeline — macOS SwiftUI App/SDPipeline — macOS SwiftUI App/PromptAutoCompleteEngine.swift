@@ -114,7 +114,7 @@ final class PromptAutoCompleteEngine: ObservableObject {
     @Published var indexSize:      Int     = 0
     @Published var currentQuery:   String  = ""
 
-    private var tokenIndex:       [String: [Token]] = [:]  // prefix → tokens
+    var tokenIndex:       [String: [Token]] = [:]  // prefix → tokens
     private var historyIndex:     [String: Int]     = [:]  // token → use count
     private var allTokens:        [Token]           = []
     private var searchTask:       Task<Void, Never>?
@@ -587,3 +587,4 @@ struct AutoCompleteDropdown: View {
         }
     }
 }
+

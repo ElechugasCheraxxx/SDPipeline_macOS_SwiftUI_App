@@ -175,7 +175,7 @@ final class MpsOptimizer: ObservableObject {
     private func buildProfile(chip: AppleChip, ramGB: Int) -> OptimizationProfile {
         let usable      = Int(Double(ramGB) * 0.65)  // 65% para MPS (Apple reserva ~15% para sistema)
         var flags       = baseFlags(chip: chip, ramGB: ramGB)
-        var envVars     = baseMPSEnvironment(chip: chip)
+        let envVars     = baseMPSEnvironment(chip: chip)
 
         // Ajustes según RAM disponible
         let maxRes: Int
@@ -409,3 +409,4 @@ private struct SettingBadge: View {
         .cornerRadius(8)
     }
 }
+

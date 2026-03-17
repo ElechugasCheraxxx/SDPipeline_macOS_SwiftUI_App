@@ -166,3 +166,32 @@ struct SidecarJSON: Codable {
         return String(cString: machine)
     }
 }
+
+// MARK: - SidecarJSON convenience init from GeneratedAsset
+
+extension SidecarJSON {
+    init(from asset: GeneratedAsset) {
+        let imageURL = URL(fileURLWithPath: asset.imagePath ?? "unknown.png")
+        self.init(
+            baseName:    asset.baseName ?? asset.id?.uuidString ?? UUID().uuidString,
+            version:     Int(asset.version),
+            imageURL:    imageURL,
+            request:     SDRequest(
+                prompt:        asset.promptPositive ?? "",
+                negativePrompt: asset.promptNegative ?? "",
+                seed:          Int(asset.seed),
+                steps:         Int(asset.steps),
+                cfgScale:      asset.cfgScale,
+                width:         Int(asset.width),
+                height:        Int(asset.height)
+            ),
+            seed:        Int(asset.seed),
+            modelName:   asset.modelName ?? "",
+            checkpoint:  asset.checkpoint ?? "",
+            vaeUsed:     "Automatic",
+            loraWeights: [:],
+            sha256:      asset.sha256 ?? "",
+            sessionTag:  asset.sessionTag
+        )
+    }
+}

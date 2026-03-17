@@ -197,7 +197,7 @@ final class AppHardeningManager: ObservableObject {
     private func checkBundleIntegrity() -> SecurityCheckResult {
         // Verificar que Info.plist no ha sido modificado post-instalación
         let bundlePath = Bundle.main.bundlePath
-        let plistPath  = Bundle.main.path(forResource: "Info", ofType: "plist") ?? ""
+        _ = Bundle.main.path(forResource: "Info", ofType: "plist") ?? ""
 
         let exists = FileManager.default.fileExists(atPath: bundlePath)
 
@@ -529,3 +529,4 @@ private struct SecurityCheckRow: View {
         .background(result.passed ? Color.clear : icon.1.opacity(0.05))
     }
 }
+
