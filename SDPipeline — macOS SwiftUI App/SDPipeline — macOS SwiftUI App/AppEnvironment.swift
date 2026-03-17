@@ -220,7 +220,9 @@ final class AppEnvironment: ObservableObject {
     }
 
     private func bootHardware() async throws {
-        GPUMonitor.shared.startPolling()
+        // GPUMonitor detecta hardware y memoria del sistema, pero NO inicia el polling
+        // de /sdapi/v1/memory hasta que A1111 esté online (lo activa SDService al conectar).
+        _ = GPUMonitor.shared          // detectDevice() se llama en init
         // FIX: MpsOptimizer has no configure() — it self-configures; applyRecommendations(to:)
         //      is called per-generation, not at boot.
         _ = MpsOptimizer.shared

@@ -108,6 +108,8 @@ class SDService: ObservableObject {
                 if text.contains("Model loaded") || text.contains("Running on local URL") {
                     self?.webuiState = .online
                     self?.healthPollTask?.cancel()
+                    // Iniciar GPU memory polling ahora que A1111 está online
+                    GPUMonitor.shared.startPolling()
                 }
             }
         }
@@ -125,7 +127,11 @@ class SDService: ObservableObject {
             while Date() < deadline {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 if Task.isCancelled { return }
-                if await checkHealth(baseURL: baseURL) { self.webuiState = .online; return }
+                if await checkHealth(baseURL: baseURL) {
+                    self.webuiState = .online
+                    GPUMonitor.shared.startPolling()   // A1111 confirmado online
+                    return
+                }
             }
             if case .launching = self.webuiState {
                 self.webuiState = .error("Timeout esperando SD (120s)")
@@ -141,6 +147,7 @@ class SDService: ObservableObject {
         webuiProcess?.terminate()
         webuiProcess = nil
         logPipe      = nil
+        GPUMonitor.shared.stopPolling()   // A1111 ya no corre → parar polling de memoria
     }
 
     // MARK: - generate() — v5: rate limiter + GenerationProgressEngine

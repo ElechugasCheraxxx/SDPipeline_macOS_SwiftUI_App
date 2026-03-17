@@ -50,6 +50,12 @@ final class GPUMonitor: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var baseURL: String = "http://127.0.0.1:7860"
 
+    /// Número de fallos consecutivos al hacer fetch de /sdapi/v1/memory.
+    /// Al llegar a `maxConsecutiveFailures`, el polling se detiene solo para
+    /// evitar inundar el log cuando A1111 no está corriendo.
+    private var consecutiveFailures: Int = 0
+    private let maxConsecutiveFailures: Int = 5
+
     // MARK: - Types
 
     struct SDMemoryResponse: Codable {
@@ -177,10 +183,16 @@ final class GPUMonitor: ObservableObject {
     func startPolling(interval: TimeInterval = 6.0) {
         guard !isPolling else { return }
         isPolling = true
+        consecutiveFailures = 0
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.fetchSDMemory()
                 self?.refreshSystemMemory()
+                // Auto-stop si A1111 no responde tras varios intentos
+                if let self, self.consecutiveFailures >= self.maxConsecutiveFailures {
+                    await MainActor.run { self.stopPolling() }
+                    return
+                }
                 try? await Task.sleep(for: .seconds(interval))
             }
         }
@@ -190,6 +202,7 @@ final class GPUMonitor: ObservableObject {
         pollTask?.cancel()
         pollTask = nil
         isPolling = false
+        consecutiveFailures = 0
     }
 
     private func fetchSDMemory() async {
@@ -199,9 +212,10 @@ final class GPUMonitor: ObservableObject {
             let (data, _) = try await URLSession.shared.data(from: url)
             let response  = try JSONDecoder().decode(SDMemoryResponse.self, from: data)
 
-            sdMemoryRaw  = response
-            pollError    = nil
-            lastPollDate = Date()
+            sdMemoryRaw         = response
+            pollError           = nil
+            lastPollDate        = Date()
+            consecutiveFailures = 0   // reset on success
 
             // Para NVIDIA/AMD usamos stats de CUDA desde A1111
             if !isAppleSilicon, let cuda = response.cuda?.system {
@@ -213,7 +227,12 @@ final class GPUMonitor: ObservableObject {
             updatePreCheckStatus()
 
         } catch {
-            pollError = "Sin respuesta de /sdapi/v1/memory"
+            consecutiveFailures += 1
+            // Solo actualizar el error en UI si aún no se alcanzó el límite
+            // (evitar spam de publicaciones cuando SD no está corriendo)
+            if consecutiveFailures <= maxConsecutiveFailures {
+                pollError = "Sin respuesta de /sdapi/v1/memory"
+            }
         }
     }
 
