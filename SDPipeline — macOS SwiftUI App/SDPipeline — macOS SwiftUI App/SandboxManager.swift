@@ -165,7 +165,17 @@ final class SandboxManager: ObservableObject {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [scriptPath]
+
+        // Solo --api es obligatorio. NO pasar --xformers (no instalado en v1.10.1)
+        // ni --listen (innecesario para 127.0.0.1). Los flags MPS se basan en lo
+        // que funcionó en terminal: --no-half-vae (no --no-half), --upcast-sampling.
+        let isAppleSilicon = GPUMonitor.shared.isAppleSilicon
+        var launchArgs = [scriptPath, "--api"]
+        if isAppleSilicon {
+            launchArgs += ["--skip-torch-cuda-test", "--upcast-sampling",
+                           "--no-half-vae", "--use-cpu", "interrogate"]
+        }
+        process.arguments = launchArgs
 
         // ── Entorno restringido ────────────────────────────────────────────
         var restrictedEnv = buildRestrictedEnvironment()
@@ -268,35 +278,40 @@ final class SandboxManager: ObservableObject {
 
     private func buildRestrictedEnvironment() -> [String: String] {
         let fullEnv = ProcessInfo.processInfo.environment
-        var restricted: [String: String] = [:]
 
-        for key in config.allowedEnvironmentKeys {
-            if let value = fullEnv[key] {
-                restricted[key] = value
-            }
-        }
+        // Estrategia: hereda el entorno completo del proceso padre y solo
+        // elimina las variables realmente peligrosas (inyección de código).
+        // Intentar una whitelist mínima rompe webui.sh porque el script depende
+        // del venv de Python, Homebrew, TMPDIR, USER, CONDA_PREFIX, etc.
+        var restricted = fullEnv
 
-        // Verificar y registrar si se intenta pasar variables bloqueadas
+        // Bloquear variables de inyección de librerías (riesgo real de seguridad)
+        var blocked: [String] = []
         for prefix in config.blockedEnvironmentPrefixes {
-            let dangerous = fullEnv.keys.filter { $0.hasPrefix(prefix) }
-            if !dangerous.isEmpty {
-                let violation = SandboxViolation(
-                    type:   .unauthorizedEnv,
-                    detail: "Variables bloqueadas en entorno: \(dangerous.joined(separator: ", "))",
-                    pid:    nil
-                )
-                violations.insert(violation, at: 0)
-                ZeroKnowledgeLog.shared.write(
-                    category: .systemEvent,
-                    message:  "SANDBOX: Variables de entorno peligrosas bloqueadas",
-                    metadata: ["vars": dangerous.joined(separator: ",")]
-                )
-            }
+            let toRemove = restricted.keys.filter { $0.hasPrefix(prefix) }
+            toRemove.forEach { restricted.removeValue(forKey: $0) }
+            blocked.append(contentsOf: toRemove)
         }
 
-        // PATH mínimo — solo lo esencial para Python/bash
-        restricted["PATH"] = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
-        // umask 0o077 se aplica vía comando en webui.sh launch wrapper si es necesario
+        if !blocked.isEmpty {
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message:  "SANDBOX: Variables de inyección bloqueadas",
+                metadata: ["vars": blocked.joined(separator: ",")]
+            )
+        }
+
+        // Asegurar que PATH incluye Homebrew y rutas estándar además de las heredadas
+        let inheritedPath = fullEnv["PATH"] ?? ""
+        let extraPaths    = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin"
+        let mergedPaths   = (inheritedPath.isEmpty ? extraPaths
+                             : inheritedPath + ":" + extraPaths)
+            .split(separator: ":").reduce(into: [String]()) { acc, part in
+                let s = String(part)
+                if !acc.contains(s) { acc.append(s) }   // deduplicar sin perder orden
+            }.joined(separator: ":")
+        restricted["PATH"] = mergedPaths
+
         return restricted
     }
 
@@ -507,6 +522,16 @@ final class SandboxManager: ObservableObject {
     private func appendStdout(_ line: String) {
         stdoutLines.append(line.trimmingCharacters(in: .newlines))
         if stdoutLines.count > 500 { stdoutLines.removeFirst() }
+
+        // Detectar cuando A1111 está listo para recibir requests
+        if line.contains("Running on local URL") || line.contains("Model loaded") {
+            processState = .running
+            NotificationCenter.default.post(name: .sdWebUIOnline, object: nil)
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message: "SD WebUI online — detectado en stdout"
+            )
+        }
     }
 
     private func appendStderr(_ line: String) {
@@ -759,3 +784,6 @@ private struct ViolationRow: View {
     }
 }
 
+extension Notification.Name {
+    static let sdWebUIOnline = Notification.Name("sdWebUIOnline")
+}

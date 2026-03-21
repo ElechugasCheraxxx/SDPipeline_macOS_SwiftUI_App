@@ -99,6 +99,18 @@ struct ContentView: View {
                     generationProgressBar
                 }
 
+                // Banner: A1111 arrancando (auto-launch activo pero aún no online)
+                if case .launching = sdService.webuiState {
+                    HStack(spacing: 8) {
+                        ProgressView().scaleEffect(0.6).tint(.white)
+                        Text("Iniciando Stable Diffusion… espera antes de generar")
+                            .font(.system(size: 11, weight: .medium)).foregroundColor(.white)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(Color(hex: "#7c3aed").opacity(0.85))
+                }
+
                 HSplitView {
                     leftPanel.frame(minWidth: 280, idealWidth: 340, maxWidth: 440)
                     centerPanel.frame(minWidth: 260, idealWidth: 320, maxWidth: 400)
@@ -117,6 +129,43 @@ struct ContentView: View {
         .task {
             await AppEnvironment.shared.boot()
             isAppleSilicon = GPUMonitor.shared.isAppleSilicon
+
+            // Si SandboxManager lanzó A1111 durante boot, reflejar estado en SDService
+            let sandbox = SandboxManager.shared
+            guard sandbox.processState == .running || sandbox.processState == .launching else { return }
+
+            sdService.webuiState = .launching
+            let baseURL = UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860"
+
+            Task {
+                // Ruta rápida: notificación desde stdout de SandboxManager
+                let onlineStream = NotificationCenter.default.notifications(
+                    named: .sdWebUIOnline
+                )
+                // Ruta lenta: poll cada 2s hasta 120s
+                let pollTask = Task {
+                    let deadline = Date().addingTimeInterval(120)
+                    while Date() < deadline {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        if Task.isCancelled { return }
+                        if await sdService.checkHealth(baseURL: baseURL) {
+                            await MainActor.run { sdService.webuiState = .online }
+                            return
+                        }
+                    }
+                    await MainActor.run {
+                        if case .launching = sdService.webuiState {
+                            sdService.webuiState = .error("A1111 no respondió en 120s")
+                        }
+                    }
+                }
+                // Quien llegue primero gana
+                for await _ in onlineStream {
+                    pollTask.cancel()
+                    await MainActor.run { sdService.webuiState = .online }
+                    break
+                }
+            }
         }
         .sheet(isPresented: $showModelBuilder) { ModelBuilderSheet(onUse: { _ in showModelBuilder = false }) }
         .sheet(isPresented: $showXYPlot) {
@@ -216,7 +265,7 @@ struct ContentView: View {
                 parseButton.frame(maxWidth: .infinity)
                 Divider().frame(height: 40).background(Color.white.opacity(0.1))
                 Button(action: { showSavePreset = true }) {
-                    Image(systemName: "bookmark.fill")
+                    Image(systemName: "bookmark.badge.plus")
                         .font(.system(size: 13))
                         .foregroundColor(Color(hex: "#f59e0b"))
                         .frame(width: 44)
@@ -453,6 +502,8 @@ struct ContentView: View {
             if let msg { licenseWarning = msg }
         }
 
+        MpsOptimizer.shared.applyRecommendations(to: &settings)
+        
         Task<Void, Never> { @MainActor in
             let startTime = Date()
 

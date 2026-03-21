@@ -41,6 +41,8 @@ struct SettingsView: View {
     @State private var watermarkOpacity:  Double  = UserDefaults.standard.double(forKey: "watermark.opacity").nonZero(default: 0.35)
     @State private var watermarkPosition: ExportEngine.WatermarkConfig.Position = .bottomRight
     @State private var sdBaseURL:         String  = UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860"
+    @State private var webuiScriptPath:   String  = UserDefaults.standard.string(forKey: "a1111.webuiPath") ?? ""
+    @State private var autoLaunchSD:      Bool    = UserDefaults.standard.bool(forKey: "sandbox.autoLaunchSD")
     @State private var integrityResults:  [String] = []
     @State private var isVerifying:       Bool    = false
     @State private var isRotatingKey:     Bool    = false
@@ -114,6 +116,7 @@ struct SettingsView: View {
     var body: some View {
         HSplitView {
             // Sidebar
+            ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(["Infraestructura", "Producción", "Seguridad", "Sistema"], id: \.self) { group in
                     Text(group.uppercased())
@@ -126,6 +129,7 @@ struct SettingsView: View {
                 }
                 Spacer()
             }
+            } // ScrollView
             .padding(.vertical, 8).frame(minWidth: 168, maxWidth: 190)
             .background(Color(red: 0.09, green: 0.09, blue: 0.12))
 
@@ -609,14 +613,59 @@ struct SettingsView: View {
                 let vramMB = Double(gpu.isAppleSilicon ? gpu.ramFree : gpu.vramFree) / 1_048_576.0
                 paramRow("VRAM libre", String(format: "%.0f MB", vramMB))
                 paramRow("SD Base URL", sdBaseURL)
+                paramRow("webui.sh", webuiScriptPath.isEmpty ? "⚠️ No configurada" : webuiScriptPath)
+                paramRow("Auto-launch al iniciar", autoLaunchSD ? "✅ Activado" : "⬜ Desactivado")
             }
+
+            // ── SD Base URL ──────────────────────────────────────────────────
             HStack(spacing: 8) {
                 TextField("http://127.0.0.1:7860", text: $sdBaseURL)
                     .textFieldStyle(.plain).font(.system(size: 11, design: .monospaced)).foregroundColor(.white)
                     .padding(.horizontal, 8).padding(.vertical, 5)
                     .background(Color.white.opacity(0.06)).cornerRadius(6)
-                Button("Guardar") { UserDefaults.standard.set(sdBaseURL, forKey: "sd.baseURL") }
+                Button("Guardar URL") { UserDefaults.standard.set(sdBaseURL, forKey: "sd.baseURL") }
                     .buttonStyle(ActionChipStyle())
+            }
+
+            // ── Ruta webui.sh ────────────────────────────────────────────────
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Ruta a webui.sh")
+                    .font(.system(size: 11, weight: .medium)).foregroundColor(.secondary)
+                HStack(spacing: 8) {
+                    TextField("/Users/…/stable-diffusion-webui/webui.sh", text: $webuiScriptPath)
+                        .textFieldStyle(.plain).font(.system(size: 11, design: .monospaced)).foregroundColor(.white)
+                        .padding(.horizontal, 8).padding(.vertical, 5)
+                        .background(Color.white.opacity(0.06)).cornerRadius(6)
+                    Button("Explorar") {
+                        let panel = NSOpenPanel()
+                        panel.allowedContentTypes = [.shellScript, .unixExecutable]
+                        panel.allowsOtherFileTypes = true
+                        panel.message = "Selecciona webui.sh"
+                        if panel.runModal() == .OK, let url = panel.url {
+                            webuiScriptPath = url.path
+                        }
+                    }
+                    .buttonStyle(ActionChipStyle())
+                    Button("Guardar ruta") {
+                        UserDefaults.standard.set(webuiScriptPath, forKey: "a1111.webuiPath")
+                    }
+                    .buttonStyle(ActionChipStyle(accent: true))
+                    .disabled(webuiScriptPath.isEmpty)
+                }
+            }
+
+            // ── Auto-launch toggle ───────────────────────────────────────────
+            HStack {
+                Toggle("Lanzar A1111 automáticamente al iniciar la app", isOn: $autoLaunchSD)
+                    .font(.system(size: 11)).foregroundColor(.white)
+                    .onChange(of: autoLaunchSD) { val in
+                        UserDefaults.standard.set(val, forKey: "sandbox.autoLaunchSD")
+                    }
+                Spacer()
+            }
+            if autoLaunchSD && webuiScriptPath.isEmpty {
+                Text("⚠️ Auto-launch activado pero falta la ruta a webui.sh")
+                    .font(.system(size: 10)).foregroundColor(Color(hex: "#f97316"))
             }
         }
     }

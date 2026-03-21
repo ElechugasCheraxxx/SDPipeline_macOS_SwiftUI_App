@@ -118,7 +118,8 @@ actor SDAPIRateLimiter {
         tag: String = ""
     ) async throws -> Data {
         try await request(priority: priority, tag: tag) {
-            var req = URLRequest(url: url, timeoutInterval: 30)
+            let timeout: TimeInterval = (method == "POST") ? 600 : 30
+            var req = URLRequest(url: url, timeoutInterval: timeout)
             req.httpMethod = method
             req.httpBody   = body
             headers.forEach { req.setValue($1, forHTTPHeaderField: $0) }
