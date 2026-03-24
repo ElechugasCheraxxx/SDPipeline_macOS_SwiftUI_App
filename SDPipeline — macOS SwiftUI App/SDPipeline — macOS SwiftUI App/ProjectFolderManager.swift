@@ -31,7 +31,7 @@ import CryptoKit
 final class ProjectFolderManager: ObservableObject {
 
     static let shared = ProjectFolderManager()
-    private init() {}
+    private init() { loadProjects() }
 
     // MARK: - Project Structure
 
@@ -91,6 +91,9 @@ final class ProjectFolderManager: ObservableObject {
 
     func saveProjectsIndex() {
         guard let url = indexURL else { return }
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601

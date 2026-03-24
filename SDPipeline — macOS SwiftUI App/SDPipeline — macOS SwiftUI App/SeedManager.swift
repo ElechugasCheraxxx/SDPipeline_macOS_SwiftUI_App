@@ -2,6 +2,32 @@ import Foundation
 import SwiftUI
 import Combine
 
+// MARK: - Top-Level Models (Swift 6 Sendable fix)
+
+struct FavoriteSeed: Codable, Identifiable, Hashable, Sendable {
+    var id:          UUID   = UUID()
+    var seed:        Int
+    var label:       String
+    var promptHint:  String
+    var createdAt:   Date   = Date()
+    var usageCount:  Int    = 1
+    var characterID: UUID?  = nil
+    var tags:        [String] = []
+    var rating:      Int    = 0
+
+    func hash(into hasher: inout Hasher) { hasher.combine(seed) }
+    static func == (lhs: FavoriteSeed, rhs: FavoriteSeed) -> Bool { lhs.seed == rhs.seed }
+}
+
+struct SeedHistoryEntry: Codable, Identifiable, Sendable {
+    var id:         UUID   = UUID()
+    var seed:       Int
+    var usedAt:     Date   = Date()
+    var promptHint: String = ""
+    var width:      Int    = 512
+    var height:     Int    = 768
+}
+
 // MARK: - SeedManager
 //
 // Gestiona el ciclo de vida de los seeds de generación:
@@ -20,31 +46,11 @@ final class SeedManager: ObservableObject {
     static let shared = SeedManager()
     private init() { load() }
 
-    // MARK: - Models
-
-    struct FavoriteSeed: Codable, Identifiable, Hashable {
-        var id:          UUID   = UUID()
-        var seed:        Int
-        var label:       String              // Nombre amigable
-        var promptHint:  String             // Primeros 50 chars del prompt
-        var createdAt:   Date  = Date()
-        var usageCount:  Int   = 1
-        var characterID: UUID? = nil         // Si está anclado a un personaje
-        var tags:        [String] = []
-        var rating:      Int   = 0           // 0-5 — igual que los assets
-
-        func hash(into hasher: inout Hasher) { hasher.combine(seed) }
-        static func == (lhs: FavoriteSeed, rhs: FavoriteSeed) -> Bool { lhs.seed == rhs.seed }
-    }
-
-    struct SeedHistoryEntry: Codable, Identifiable {
-        var id:         UUID   = UUID()
-        var seed:       Int
-        var usedAt:     Date   = Date()
-        var promptHint: String = ""
-        var width:      Int    = 512
-        var height:     Int    = 768
-    }
+    // MARK: - Typealiases for backward compatibility
+    // Cambia "SDPipeline_macOS_SwiftUI_App" por el nombre real de tu módulo si es necesario,
+    // o elimínalo si el compilador logra resolverlo automáticamente.
+    typealias FavoriteSeed = SDPipeline.FavoriteSeed
+    typealias SeedHistoryEntry = SDPipeline.SeedHistoryEntry
 
     // MARK: - Published State
 
@@ -252,7 +258,7 @@ struct SeedPickerView: View {
     @State private var query: String = ""
     @State private var showHistory = false
 
-    var seeds: [SeedManager.FavoriteSeed] {
+    var seeds: [FavoriteSeed] {
         manager.search(query: query, characterID: characterID)
     }
 
@@ -378,7 +384,7 @@ struct SeedPickerView: View {
         }
     }
 
-    func seedRow(_ fav: SeedManager.FavoriteSeed) -> some View {
+    func seedRow(_ fav: FavoriteSeed) -> some View {
         Button(action: {
             selectedSeed = fav.seed
             SeedManager.shared.incrementUsage(seed: fav.seed)

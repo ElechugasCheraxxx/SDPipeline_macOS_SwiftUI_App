@@ -8,7 +8,7 @@ import Combine
 //
 // Motor de IP-Adapter + FaceID para consistencia facial y de estilo.
 // Implementa la integración con:
-//   • sd-webui-ipadapter (extension de A1111)
+//   • sd-webui-controlnet (como módulo de ControlNet)
 //   • IP-Adapter-FaceID (consistencia facial entre generaciones)
 //   • IP-Adapter Plus (consistencia de estilo/referencia)
 //   • IP-Adapter Full Face (para img2img con referencia facial)
@@ -17,7 +17,7 @@ import Combine
 //   1. Cargar imagen de referencia (personaje base)
 //   2. Configurar modelo IP-Adapter (FaceID, Plus, Base, etc.)
 //   3. Ajustar weight y begin/end step
-//   4. Inyectar en SDRequest via AlwaysOnScripts
+//   4. Inyectar en SDRequest via AlwaysOnScripts (bajo la key 'controlnet')
 //   5. Persistir config por personaje en CharacterEngine
 //
 // ROADMAP: "IP-Adapter y FaceID para consistencia facial" (🟡 MEDIO PLAZO)
@@ -173,9 +173,9 @@ final class IPAdapterEngine: ObservableObject {
 
     // MARK: - Inject into SDRequest
 
-    /// Produce el bloque alwayson_scripts para inyectar IP-Adapter en el request.
+    /// Produce el bloque alwayson_scripts para inyectar IP-Adapter en el request vía ControlNet.
     func buildAlwaysOnScripts() -> [String: Any]? {
-        guard config.enabled, let refPath = config.referenceImage else { return nil }
+        guard config.enabled, let refPath = config.referenceImage, referenceImage != nil else { return nil }
 
         // Convertir imagen de referencia a base64
         guard let imageData = try? Data(contentsOf: URL(fileURLWithPath: refPath)),
@@ -185,30 +185,40 @@ final class IPAdapterEngine: ObservableObject {
         let base64 = imageData.base64EncodedString()
         let model  = config.model
 
-        // Estructura para sd-webui-ipadapter
+        // Determinar el módulo correcto de ControlNet según el tipo de IP-Adapter
+        let moduleName = model.isFaceModel ? "ip-adapter-faceid" : "ip-adapter_clip_sd15"
+
+        // Estructura adaptada para la API de ControlNet
         let ipadapterArgs: [String: Any] = [
-            "enabled":    true,
-            "model":      model.rawValue,
-            "weight":     config.weight,
-            "image":      "data:image/png;base64,\(base64)",
-            "start":      config.beginStep,
-            "end":        config.endStep,
+            "enabled":        true,
+            "module":         moduleName,
+            "model":          model.rawValue,
+            "weight":         config.weight,
+            "image":          "data:image/png;base64,\(base64)",
+            "guidance_start": config.beginStep,
+            "guidance_end":   config.endStep,
+            "resize_mode":    "Crop and Resize",
+            "processor_res":  512
         ]
 
-        // Para FaceID se añade el LoRA automáticamente
-        if model.isFaceModel, let loraName = config.lora {
-            return [
-                "IP-Adapter": ["args": [ipadapterArgs]],
-                "Additional networks for generating": [
-                    "args": [
-                        true,  // enabled
-                        [loraName, config.loraWeight, config.loraWeight]
-                    ]
-                ]
-            ]
-        }
+        // Para FaceID el LoRA se inyecta en el prompt con sintaxis nativa <lora:name:weight>
+        // A1111 moderno no necesita la extensión "Additional networks for generating"
+        return ["controlnet": ["args": [ipadapterArgs]]]
+    }
 
-        return ["IP-Adapter": ["args": [ipadapterArgs]]]
+    // MARK: - LoRA Prompt Suffix (FaceID)
+
+    /// Sufijo a concatenar al prompt positivo para inyectar el LoRA de FaceID.
+    /// Ej: " <lora:ip-adapter-faceid-plus_sdv15:0.70>"
+    /// Retorna nil si no aplica (modelo no FaceID o LoRA no configurado).
+    func loraPromptSuffix() -> String? {
+        guard config.enabled,
+              config.model.isFaceModel,
+              let loraName = config.lora,
+              !loraName.isEmpty
+        else { return nil }
+        let w = String(format: "%.2f", config.loraWeight)
+        return " <lora:\(loraName):\(w)>"
     }
 
     // MARK: - Per-Character Config Persistence
@@ -307,7 +317,7 @@ struct IPAdapterPanel: View {
                     VStack(alignment: .leading, spacing: 4) {
                         paramLabel("Modelo")
                         Picker("", selection: $engine.config.model) {
-                            ForEach(IPAdapterModel.allCases, id: \.self) { m in
+                            ForEach(IPAdapterEngine.IPAdapterModel.allCases, id: \.self) { m in
                                 Text(m.displayName).tag(m)
                             }
                         }

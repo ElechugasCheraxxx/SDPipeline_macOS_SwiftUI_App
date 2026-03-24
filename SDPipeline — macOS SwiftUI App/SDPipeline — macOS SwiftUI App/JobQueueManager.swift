@@ -310,24 +310,22 @@ final class JobQueueManager: ObservableObject {
         genSettings.sdBaseURL          = job.settings.baseURL
         genSettings.autoRunNSFWCheck   = job.settings.autoNSFWCheck
         genSettings.autoRunPostProd    = job.settings.postProcessing
-        let (_, scripts) = genSettings.buildRequestWithScripts(
+        
+        let plan = genSettings.buildRequestWithScripts(
             prompt:         job.request.prompt,
             negativePrompt: job.request.negative_prompt
         )
 
-        if scripts.isEmpty {
-            await sdService.generateWithBatchRetry(
-                request: job.request,
-                baseURL: baseURL,
-                policy:  policy
-            )
-        } else {
-            await sdService.generateWithRetry(
-                request: job.request,
-                baseURL: baseURL,
-                scripts: scripts,
-                policy:  policy
-            )
+        var attempt = 0
+        while attempt < policy.maxAttempts {
+            if attempt > 0 {
+                let delay = policy.delayNS(attempt: attempt - 1)
+                try? await Task.sleep(nanoseconds: delay)
+                guard !Task.isCancelled else { break }
+            }
+            await sdService.generateWithPlan(plan, baseURL: baseURL)
+            if sdService.errorMessage == nil { break }
+            attempt += 1
         }
 
         if Task.isCancelled {

@@ -95,7 +95,7 @@ struct PipelineConnector {
         }
     }
 
-    // MARK: - Generate with IP-Adapter (v7 — usa SDRequestScriptsRegistry)
+    // MARK: - Generate with IP-Adapter (v9 — usa SDGenerationPlan + /controlnet/txt2img)
 
     @MainActor
     static func generateWithIPAdapter(
@@ -104,23 +104,24 @@ struct PipelineConnector {
         settings:       GenerationSettings,
         sdService:      SDService
     ) async {
-        let (request, scripts) = settings.buildRequestWithScripts(
+        let plan = settings.buildRequestWithScripts(
             prompt:         prompt,
             negativePrompt: negativePrompt
         )
 
-        if scripts.isEmpty {
-            await sdService.generate(request: request, baseURL: settings.sdBaseURL)
-        } else {
-            await sdService.generateWithScripts(
-                request: request,
-                scripts: scripts,
-                baseURL: settings.sdBaseURL
-            )
-            let activeEngines = scripts.keys.sorted().joined(separator: ", ")
+        // Enrutar al endpoint correcto según el plan
+        await sdService.generateWithPlan(plan, baseURL: settings.sdBaseURL)
+
+        // Log de engines activos
+        var engines: [String] = []
+        if !plan.controlNetUnits.isEmpty {
+            engines.append("ControlNet(\(plan.controlNetUnits.count)u)")
+        }
+        engines.append(contentsOf: plan.alwaysOnScripts.keys.sorted())
+        if !engines.isEmpty {
             ZeroKnowledgeLog.shared.write(
                 category: .systemEvent,
-                message:  "Generación con scripts: \(activeEngines) · steps:\(request.steps)"
+                message:  "Generación · engines: \(engines.joined(separator: ", ")) · steps:\(plan.request.steps)"
             )
         }
     }

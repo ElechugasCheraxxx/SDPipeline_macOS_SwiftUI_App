@@ -7,6 +7,14 @@ import Combine
 //
 // Motor de relight cinemático usando IC-Light (Illumination-Conditioned Light).
 // IC-Light permite re-iluminar imágenes generadas manteniendo la identidad del sujeto.
+//
+// FIXES aplicados:
+//   - checkInstallation() ahora busca los .safetensors directamente en models/ic-light/
+//     usando el path local del webUI guardado en "a1111.webuiPath".
+//   - Fallback secundario: busca también en scripts de A1111 (sd-webui-ic-light).
+//   - Se eliminó el puerto hardcodeado incorrecto (7861) y el endpoint inexistente (/iclight/ping).
+//   - relightViaICLight usa "sd.baseURL" de UserDefaults en lugar de localhost:7861.
+//   - icLightSection ahora dispara checkInstallation() automáticamente con .task { }.
 
 @MainActor
 final class ICLightEngine: ObservableObject {
@@ -36,15 +44,15 @@ final class ICLightEngine: ObservableObject {
     }
 
     enum LightingDirection: String, CaseIterable, Codable {
-        case front    = "front"
-        case back     = "back"
-        case left     = "left"
-        case right    = "right"
-        case top      = "top"
-        case dramatic = "dramatic"
+        case front     = "front"
+        case back      = "back"
+        case left      = "left"
+        case right     = "right"
+        case top       = "top"
+        case dramatic  = "dramatic"
         case rembrandt = "rembrandt"
         case butterfly = "butterfly"
-        case loop     = "loop"
+        case loop      = "loop"
 
         var displayName: String { rawValue.capitalized }
 
@@ -72,7 +80,7 @@ final class ICLightEngine: ObservableObject {
             case .dramatic:  return "moon.fill"
             case .rembrandt: return "paintpalette.fill"
             case .butterfly: return "sparkles"
-            case .loop:      return "circle.lefthalf.striped.horizontal.fill"
+            case .loop:      return "arrow.2.squarepath"
             }
         }
     }
@@ -80,33 +88,33 @@ final class ICLightEngine: ObservableObject {
     // MARK: - Configuration
 
     struct ICLightConfig: Codable {
-        var enabled:          Bool              = false
-        var mode:             ICLightMode       = .fc
-        var direction:        LightingDirection = .front
-        var lightPrompt:      String            = ""
-        var backgroundImage:  String?           = nil
-        var strength:         Double            = 0.7
-        var denoisingStrength: Double           = 0.35
-        var removeBg:         Bool              = true
-        var steps:            Int               = 28
-        var cfg:              Double            = 2.0
-        var useHighRes:       Bool              = false
-        var hiResScale:       Double            = 1.5
-        var sampler:          String            = "DPM++ 2M Karras"
-        var seed:             Int               = -1
+        var enabled:           Bool              = false
+        var mode:              ICLightMode       = .fc
+        var direction:         LightingDirection = .front
+        var lightPrompt:       String            = ""
+        var backgroundImage:   String?           = nil
+        var strength:          Double            = 0.7
+        var denoisingStrength: Double            = 0.35
+        var removeBg:          Bool              = true
+        var steps:             Int               = 28
+        var cfg:               Double            = 2.0
+        var useHighRes:        Bool              = false
+        var hiResScale:        Double            = 1.5
+        var sampler:           String            = "DPM++ 2M Karras"
+        var seed:              Int               = -1
     }
 
     // MARK: - Presets
 
     struct LightingPreset: Identifiable, Codable {
-        var id:          UUID            = UUID()
+        var id:          UUID             = UUID()
         var name:        String
         var mode:        ICLightMode
         var direction:   LightingDirection
         var lightPrompt: String
         var strength:    Double
-        var tags:        [String]        = []
-        var isBuiltIn:   Bool            = true
+        var tags:        [String]         = []
+        var isBuiltIn:   Bool             = true
 
         /// Short human-readable description shown in preset list rows.
         /// Returns the custom light prompt when set, otherwise the direction's display name.
@@ -117,14 +125,16 @@ final class ICLightEngine: ObservableObject {
 
     // MARK: - State
 
-    @Published var config:       ICLightConfig    = ICLightConfig()
-    @Published var presets:      [LightingPreset] = []
-    @Published var isProcessing: Bool             = false
-    @Published var progress:     Double           = 0
-    @Published var progressText: String           = ""
-    @Published var lastResult:   NSImage?         = nil
-    @Published var lastError:    String?          = nil
-    @Published var isInstalled:  Bool             = false
+    @Published var config:        ICLightConfig    = ICLightConfig()
+    @Published var presets:       [LightingPreset] = []
+    @Published var isProcessing:  Bool             = false
+    @Published var progress:      Double           = 0
+    @Published var progressText:  String           = ""
+    @Published var lastResult:    NSImage?         = nil
+    @Published var lastError:     String?          = nil
+    @Published var isInstalled:   Bool             = false
+    /// Modelos IC-Light encontrados en models/ic-light/ (fc y/o fbc)
+    @Published var installedModels: [String]       = []
 
     // MARK: - Process
 
@@ -142,6 +152,8 @@ final class ICLightEngine: ObservableObject {
         }
     }
 
+    // MARK: - Relight via IC-Light (sd-webui-ic-light extension)
+
     private func relightViaICLight(image: NSImage, cfg: ICLightConfig) async throws -> NSImage {
         guard let base64 = imageToBase64(image) else {
             throw ICLightError.imageConversionFailed
@@ -154,33 +166,42 @@ final class ICLightEngine: ObservableObject {
             ? cfg.direction.prompt
             : "\(cfg.direction.prompt), \(cfg.lightPrompt)"
 
+        // Selecciona el modelo correcto según el modo (FC vs FBC)
+        let modelName = selectModel(for: cfg.mode)
+
         let payload: [String: Any] = [
-            "mode":          cfg.mode.rawValue,
-            "foreground":    base64,
-            "background":    cfg.backgroundImage.flatMap { imageToBase64URL($0) } ?? NSNull(),
-            "light_prompt":  lightPrompt,
-            "strength":      cfg.strength,
-            "steps":         cfg.steps,
-            "cfg":           cfg.cfg,
-            "sampler":       cfg.sampler,
-            "seed":          cfg.seed,
-            "remove_bg":     cfg.removeBg,
+            "mode":         cfg.mode.rawValue,
+            "foreground":   base64,
+            "background":   cfg.backgroundImage.flatMap { imageToBase64URL($0) } ?? NSNull(),
+            "light_prompt": lightPrompt,
+            "strength":     cfg.strength,
+            "steps":        cfg.steps,
+            "cfg":          cfg.cfg,
+            "sampler":      cfg.sampler,
+            "seed":         cfg.seed,
+            "remove_bg":    cfg.removeBg,
+            "model":        modelName
         ]
 
         progress     = 0.4
-        progressText = "Procesando…"
+        progressText = "Procesando con IC-Light…"
 
-        let apiURL   = URL(string: "http://localhost:7861/iclight/relight")!
-        var request  = URLRequest(url: apiURL, timeoutInterval: 300)
-        request.httpMethod  = "POST"
-        request.httpBody    = try? JSONSerialization.data(withJSONObject: payload)
+        // ✅ FIX: usa sd.baseURL en vez del puerto hardcodeado 7861
+        let baseURL = UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860"
+        guard let apiURL = URL(string: "\(baseURL)/iclight/relight") else {
+            throw ICLightError.sdNotAvailable
+        }
+
+        var request = URLRequest(url: apiURL, timeoutInterval: 300)
+        request.httpMethod = "POST"
+        request.httpBody   = try? JSONSerialization.data(withJSONObject: payload)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let (data, _)   = try await URLSession.shared.data(for: request)
-        progress         = 0.85
-        progressText     = "Decodificando resultado…"
+        let (data, _) = try await URLSession.shared.data(for: request)
+        progress      = 0.85
+        progressText  = "Decodificando resultado…"
 
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let json      = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let resultB64 = json["result"] as? String,
               let imageData = Data(base64Encoded: resultB64),
               let result    = NSImage(data: imageData)
@@ -193,6 +214,8 @@ final class ICLightEngine: ObservableObject {
         lastResult   = result
         return result
     }
+
+    // MARK: - Relight via img2img (fallback cuando IC-Light no está instalado)
 
     private func relightViaImg2Img(image: NSImage, cfg: ICLightConfig) async throws -> NSImage {
         progress     = 0.1
@@ -214,14 +237,16 @@ final class ICLightEngine: ObservableObject {
             "cfg_scale":          7.5,
             "sampler_name":       "DPM++ 2M Karras",
             "seed":               cfg.seed,
-            "width":              image.size.width > 0 ? Int(image.size.width) : 512,
+            "width":              image.size.width  > 0 ? Int(image.size.width)  : 512,
             "height":             image.size.height > 0 ? Int(image.size.height) : 768,
         ]
 
         progress     = 0.4
         progressText = "Enviando a img2img…"
 
-        guard let base = URL(string: UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860") else { throw ICLightError.sdNotAvailable }
+        guard let base = URL(string: UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860") else {
+            throw ICLightError.sdNotAvailable
+        }
         var req = URLRequest(url: base.appending(path: "sdapi/v1/img2img"), timeoutInterval: 300)
         req.httpMethod = "POST"
         req.httpBody   = try? JSONSerialization.data(withJSONObject: payload)
@@ -246,15 +271,79 @@ final class ICLightEngine: ObservableObject {
     }
 
     // MARK: - Check Installation
+    //
+    // Estrategia de detección (en orden de prioridad):
+    //
+    //  1. Busca los .safetensors directamente en el filesystem:
+    //     <a1111.webuiPath>/models/ic-light/*.safetensors
+    //     → Detecta iclight_sd15_fc.safetensors y iclight_sd15_fbc.safetensors
+    //
+    //  2. Fallback: consulta /sdapi/v1/scripts para ver si sd-webui-ic-light
+    //     está registrado como script en A1111.
+    //
+    // FIXES respecto al código original:
+    //  - Eliminado endpoint inexistente /iclight/ping en puerto 7861
+    //  - Eliminada búsqueda en /sdapi/v1/sd-models (no indexa subcarpetas)
+    //  - checkInstallation() ahora se llama desde icLightSection con .task { }
 
     func checkInstallation() async {
-        guard let base = URL(string: "http://localhost:7861/iclight/ping") else { return }
-        if let (_, resp) = try? await URLSession.shared.data(from: base),
-           let http = resp as? HTTPURLResponse, http.statusCode == 200 {
-            isInstalled = true
-        } else {
-            isInstalled = false
+        // ── Opción 1: filesystem directo (más fiable) ──────────────────────────
+        let webuiPath = UserDefaults.standard.string(forKey: "a1111.webuiPath") ?? ""
+
+        if !webuiPath.isEmpty {
+            // ✅ webuiPath apunta a webui.sh — subimos un nivel para obtener el directorio raíz
+            let icLightFolder = URL(fileURLWithPath: webuiPath)
+                .deletingLastPathComponent()
+                .appendingPathComponent("models/ic-light")
+
+            if let files = try? FileManager.default.contentsOfDirectory(
+                at: icLightFolder,
+                includingPropertiesForKeys: nil
+            ) {
+                let safetensors = files.filter {
+                    $0.pathExtension == "safetensors" &&
+                    $0.lastPathComponent.lowercased().contains("iclight")
+                }
+
+                if !safetensors.isEmpty {
+                    installedModels = safetensors.map { $0.lastPathComponent }
+                    isInstalled = true
+                    return
+                }
+            }
         }
+
+        // ── Opción 2: scripts registrados en A1111 (fallback) ──────────────────
+        let baseURL = UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860"
+
+        if let scriptsURL = URL(string: "\(baseURL)/sdapi/v1/scripts"),
+           let (data, _)  = try? await URLSession.shared.data(from: scriptsURL),
+           let json        = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let scripts     = json["txt2img"] as? [String] {
+
+            let found = scripts.contains(where: {
+                $0.lowercased().contains("ic-light") || $0.lowercased().contains("iclight")
+            })
+
+            if found {
+                isInstalled = true
+                return
+            }
+        }
+
+        // ── No encontrado ──────────────────────────────────────────────────────
+        installedModels = []
+        isInstalled     = false
+    }
+
+    // MARK: - Model Selection
+
+    /// Selecciona el modelo instalado más apropiado según el modo FC / FBC
+    private func selectModel(for mode: ICLightMode) -> String {
+        let keyword = mode == .fc ? "_fc" : "_fbc"
+        return installedModels.first {
+            $0.lowercased().contains(keyword)
+        } ?? installedModels.first ?? ""
     }
 
     // MARK: - Presets
@@ -294,24 +383,24 @@ final class ICLightEngine: ObservableObject {
     }
 
     static let builtInPresets: [LightingPreset] = [
-        LightingPreset(name: "Golden Hour", mode: .fc, direction: .back,
-                       lightPrompt: "warm golden sunset, god rays, orange glow", strength: 0.75,
-                       tags: ["sunset", "warm", "outdoor"]),
-        LightingPreset(name: "Studio Portrait", mode: .fc, direction: .butterfly,
-                       lightPrompt: "studio softbox, beauty dish, clean background", strength: 0.65,
-                       tags: ["studio", "portrait", "clean"]),
-        LightingPreset(name: "Chiaroscuro", mode: .fc, direction: .dramatic,
-                       lightPrompt: "dramatic chiaroscuro, Renaissance painting light, deep black shadows", strength: 0.8,
-                       tags: ["artistic", "dramatic", "dark"]),
-        LightingPreset(name: "Neon Night", mode: .fbc, direction: .front,
-                       lightPrompt: "neon lights, cyberpunk city at night, pink and blue neon glow", strength: 0.7,
-                       tags: ["neon", "cyberpunk", "night"]),
-        LightingPreset(name: "Rembrandt", mode: .fc, direction: .rembrandt,
-                       lightPrompt: "Rembrandt lighting, old master painting, triangular face highlight", strength: 0.7,
-                       tags: ["rembrandt", "artistic", "portrait"]),
+        LightingPreset(name: "Golden Hour",     mode: .fc,  direction: .back,
+                       lightPrompt: "warm golden sunset, god rays, orange glow",
+                       strength: 0.75, tags: ["sunset", "warm", "outdoor"]),
+        LightingPreset(name: "Studio Portrait", mode: .fc,  direction: .butterfly,
+                       lightPrompt: "studio softbox, beauty dish, clean background",
+                       strength: 0.65, tags: ["studio", "portrait", "clean"]),
+        LightingPreset(name: "Chiaroscuro",     mode: .fc,  direction: .dramatic,
+                       lightPrompt: "dramatic chiaroscuro, Renaissance painting light, deep black shadows",
+                       strength: 0.8,  tags: ["artistic", "dramatic", "dark"]),
+        LightingPreset(name: "Neon Night",      mode: .fbc, direction: .front,
+                       lightPrompt: "neon lights, cyberpunk city at night, pink and blue neon glow",
+                       strength: 0.7,  tags: ["neon", "cyberpunk", "night"]),
+        LightingPreset(name: "Rembrandt",       mode: .fc,  direction: .rembrandt,
+                       lightPrompt: "Rembrandt lighting, old master painting, triangular face highlight",
+                       strength: 0.7,  tags: ["rembrandt", "artistic", "portrait"]),
         LightingPreset(name: "Natural Outdoor", mode: .fbc, direction: .front,
-                       lightPrompt: "natural sunlight, blue sky, soft outdoor shadows", strength: 0.55,
-                       tags: ["outdoor", "natural", "daylight"]),
+                       lightPrompt: "natural sunlight, blue sky, soft outdoor shadows",
+                       strength: 0.55, tags: ["outdoor", "natural", "daylight"]),
     ]
 
     // MARK: - Helpers
@@ -336,9 +425,9 @@ final class ICLightEngine: ObservableObject {
 
         var errorDescription: String? {
             switch self {
-            case .imageConversionFailed: return "No se pudo convertir la imagen."
-            case .sdNotAvailable:        return "Stable Diffusion no disponible."
-            case .invalidResponse:       return "Respuesta inválida de IC-Light."
+            case .imageConversionFailed:   return "No se pudo convertir la imagen."
+            case .sdNotAvailable:          return "Stable Diffusion no disponible."
+            case .invalidResponse:         return "Respuesta inválida de IC-Light."
             case .processingFailed(let m): return "Error de procesamiento: \(m)"
             }
         }

@@ -659,6 +659,9 @@ struct RightPanelView: View {
         }
         .padding(10).background(Color.white.opacity(0.04)).cornerRadius(8)
         .padding(.horizontal, 10)
+        .task {
+            await ICLightEngine.shared.checkInstallation()
+        }
     }
 
     @ViewBuilder
@@ -1317,6 +1320,3 @@ struct LoRAManagerTab: View {
 
 
 }
-
-
-

@@ -385,7 +385,7 @@ struct ComplianceLogView: View {
         case "IMAGE_BLOCKED":          return "xmark.shield.fill"
         case "CONSENT_SIGNED":         return "signature"
         case "COMPLIANCE_CHECK":       return "checkmark.seal"
-        case "LICENSE_VERIFIED":       return "doc.badge.checkmark"
+        case "LICENSE_VERIFIED":       return "checkmark.seal.fill"
         default:                       return "doc.text"
         }
     }
@@ -536,6 +536,7 @@ extension PublishComplianceLogger {
         return purged
     }
 }
+
 
 
 

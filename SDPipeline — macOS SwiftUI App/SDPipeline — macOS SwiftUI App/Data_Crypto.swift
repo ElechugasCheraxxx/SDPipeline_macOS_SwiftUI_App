@@ -1,40 +1,56 @@
 import Foundation
 import CryptoKit
-import Security
 
-// MARK: - Data_Crypto.swift (extended)
+// MARK: - Data + Crypto
+// Helpers criptográficos sobre Data.
+// Centralizado aquí para evitar redefinición en AssetStore y SteganographyEngine.
 //
-// El archivo ORIGINAL ya declara:
-//   Data.sha256Hex   → NO redeclarar
-//
-// IMPORTANTE: SteganographyEngine.swift declara `enum KeychainHelper`
-// con API: save(key:data:) / load(key:) / delete(key:)
-// Para no colisionar, este archivo usa el nombre `VaultKeychain`
-// con API distinta orientada a service/account.
-
-// MARK: - AES-GCM Data extensions
+// REGLA DE ORO: No reimplementar SHA-256 manualmente en ningún otro archivo.
+// Cualquier implementación hand-rolled produce hashes incorrectos y rompe
+// la integridad del vault, SteganographyEngine y AssetStore.
+// Toda la criptografía del proyecto pasa por este archivo y por CryptoKit.
 
 extension Data {
 
-    /// Cifrar con AES-GCM. Devuelve nonce (12B) + ciphertext + tag (16B) combinados.
+    // MARK: - SHA-256
+
+    /// SHA-256 del contenido como string hexadecimal lowercase (64 caracteres).
+    /// Backed by Apple CryptoKit — auditado y acelerado por hardware.
+    var sha256Hex: String {
+        SHA256.hash(data: self)
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    /// Alias de sha256Hex para compatibilidad con código legacy y tests.
+    /// Usar sha256Hex como nombre canónico en código nuevo.
+    var sha256: String { sha256Hex }
+
+    // MARK: - AES-GCM Encryption
+
+    /// Cifra el contenido con AES-GCM.
+    /// Devuelve nonce (12 bytes) + ciphertext + tag (16 bytes) combinados.
     func encryptedAESGCM(key: SymmetricKey) throws -> Data {
         let sealed = try AES.GCM.seal(self, using: key)
         guard let combined = sealed.combined else { throw CryptoVaultError.sealFailed }
         return combined
     }
 
-    /// Cifrar y devolver como base64 (para entradas del ZeroKnowledgeLog).
+    /// Cifra el contenido y devuelve el resultado como string Base64.
+    /// Útil para entradas del ZeroKnowledgeLog y metadatos del vault.
     func encryptedBase64(key: SymmetricKey) throws -> String {
         try encryptedAESGCM(key: key).base64EncodedString()
     }
 
-    /// Descifrar AES-GCM combined (nonce + ciphertext + tag).
+    // MARK: - AES-GCM Decryption
+
+    /// Descifra datos AES-GCM en formato combined (nonce + ciphertext + tag).
     func decryptedAESGCM(key: SymmetricKey) throws -> Data {
         let box = try AES.GCM.SealedBox(combined: self)
         return try AES.GCM.open(box, using: key)
     }
 
-    /// Descifrar desde base64.
+    /// Descifra un string Base64 AES-GCM.
     static func decryptedBase64(_ base64: String, key: SymmetricKey) throws -> Data {
         guard let data = Data(base64Encoded: base64) else { throw CryptoVaultError.invalidBase64 }
         return try data.decryptedAESGCM(key: key)
@@ -64,14 +80,14 @@ enum CryptoVaultError: LocalizedError {
 }
 
 // MARK: - VaultKeychain
-// Keychain helper orientado a service+account (para ZeroKnowledgeLog, BackupManager).
+// Keychain helper orientado a service+account (ZeroKnowledgeLog, BackupManager).
 // Distinto de `KeychainHelper` en SteganographyEngine que usa key: String (account-only).
 
 struct VaultKeychain {
 
     // MARK: SymmetricKey persistence
 
-    /// Cargar o generar-y-guardar una clave AES-256 para el servicio dado.
+    /// Carga o genera-y-guarda una clave AES-256 para el servicio dado.
     static func symmetricKey(service: String, account: String = "sdpipeline") throws -> SymmetricKey {
         if let data = try? load(service: service, account: account) {
             return SymmetricKey(data: data)
@@ -135,6 +151,7 @@ struct VaultKeychain {
 // MARK: - SymmetricKey HKDF derivation
 
 extension SymmetricKey {
+    /// Deriva una clave AES-256 desde una passphrase usando HKDF-SHA256.
     static func derived(from passphrase: String, salt: Data? = nil) -> SymmetricKey {
         let ikm      = SymmetricKey(data: Data(passphrase.utf8))
         let saltData = salt ?? Data("SDPipelineStudio.v1".utf8)

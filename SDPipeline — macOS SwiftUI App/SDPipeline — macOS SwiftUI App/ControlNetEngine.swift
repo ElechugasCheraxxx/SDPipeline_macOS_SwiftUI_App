@@ -566,7 +566,7 @@ final class ControlNetEngine: ObservableObject {
         let args = enabledUnits.map { $0.toAPIDict }
 
         payload["alwayson_scripts"] = [
-            "controlnet": [
+            "ControlNet": [
                 "args": args
             ]
         ]
@@ -1225,4 +1225,3 @@ struct ControlNetUnitEditor: View {
         }
     }
 }
-

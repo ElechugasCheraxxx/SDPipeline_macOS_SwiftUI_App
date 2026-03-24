@@ -1,24 +1,26 @@
 import Foundation
 import SwiftUI
 
-// MARK: - Models_Extended_Patch v3
+// MARK: - Models_Extended_Patch v7
 //
-// Cambios v2 → v3:
-//   🐛 FIX: _alwayson_scripts_storage era variable global estática — race condition en batch paralelo.
-//           Eliminada. Scripts se pasan siempre explícitamente vía buildRequestWithScripts.
-//   🐛 FIX: injectIPAdapterScripts era no-op. Reemplazada por mergeIPAdapterScripts(into:).
-//   🐛 FIX: generateWithScripts no cancelaba progressPollTask al retornar. Corregido.
-//   ✨ ADD: SDRequestScriptsRegistry actor — almacenamiento thread-safe de scripts por requestID.
-//   ✨ ADD: SDService.generateWithRetry — reintentos con backoff exponencial.
-//   ✨ ADD: SDService.cancelProgressPoll() / resetState() — métodos públicos de control.
-//   ✨ ADD: PipelineRetryPolicy — política de reintentos configurable.
-//   ✨ ADD: ControlNetEngine + ADetailerEngine .buildAlwaysOnScripts() bridges.
+// Cambios v6 → v7:
+//   🔧 FIX: SDRequestWithControlNet restaurado como struct ACTIVO (sin @deprecated).
+//           Es el único mecanismo que funciona: serializa "controlnet_units" como
+//           campo TOP-LEVEL en /sdapi/v1/txt2img.
+//   🔧 FIX: Eliminado @available(*, deprecated) que marcaba el struct erróneamente.
+//   📝 DOC: Historial de estrategias descartadas documentado en SDGenerationPlan.
+//
+// Cambios v5 → v6 (histórico):
+//   🔧 FIX: "ControlNet" clave corregida (case-sensitive) en buildAlwaysOnScripts.
+//   🗑️ DEP: SDRequestWithControlNet marcado deprecated (error — revertido en v7).
+//
+// Cambios v4 → v5 (histórico):
+//   🐛 FIX: mergeIPAdapterScripts / mergeControlNetScripts eran no-ops efectivos.
+//   ✨ ADD: SDGenerationPlan, SDRequestWithControlNet, generateWithPlan(), etc.
+//   🔧 FIX: Campo "input_image" → "image". Filtrado de units sin imagen.
 
-// MARK: - Thread-Safe Scripts Registry (reemplaza el global estático)
+// MARK: - Thread-Safe Scripts Registry
 
-/// Actor que almacena scripts alwayson de cada request de forma aislada.
-/// Reemplaza la antigua var global _alwayson_scripts_storage que causaba race conditions
-/// cuando dos jobs batch se ejecutaban en paralelo.
 actor SDRequestScriptsRegistry {
 
     static let shared = SDRequestScriptsRegistry()
@@ -38,7 +40,6 @@ actor SDRequestScriptsRegistry {
         registry.removeValue(forKey: id)
     }
 
-    /// Limita el registry a maxCount entradas para evitar leaks en sesiones largas.
     func pruneOldEntries(maxCount: Int = 200) {
         guard registry.count > maxCount else { return }
         let toRemove = Array(registry.keys.prefix(registry.count - maxCount / 2))
@@ -46,27 +47,35 @@ actor SDRequestScriptsRegistry {
     }
 }
 
-// MARK: - SDRequest: scripts helpers
+// MARK: - SDGenerationPlan
+//
+// Estrategias de ControlNet probadas y descartadas:
+//   ❌ alwayson_scripts["controlnet"] → HTTP 422 (Script 'controlnet' not found)
+//   ❌ alwayson_scripts["ControlNet"] → HTTP 422 (Script 'ControlNet' not found)
+//   ❌ POST /controlnet/txt2img       → HTTP 404 (endpoint no existe)
+//   ✅ "controlnet_units" top-level en /sdapi/v1/txt2img → SDRequestWithControlNet
+
+struct SDGenerationPlan {
+    let request:         SDRequest
+    let alwaysOnScripts: [String: Any]    // ADetailer → alwayson_scripts["ADetailer"]
+    let controlNetUnits: [[String: Any]]  // ControlNet/IP-Adapter → controlnet_units top-level
+
+    var hasControlNetUnits:     Bool { !controlNetUnits.isEmpty }
+    var hasAlwaysOnScripts:     Bool { !alwaysOnScripts.isEmpty }
+    var isPlain:                Bool { !hasControlNetUnits && !hasAlwaysOnScripts }
+    var needsControlNetEndpoint: Bool { hasControlNetUnits }  // compatibilidad
+}
+
+// MARK: - SDRequest: scripts helpers (compatibilidad BatchEngine)
 
 extension SDRequest {
 
-    /// Inyecta scripts del IP-Adapter en un dict mutable.
     @MainActor
-    func mergeIPAdapterScripts(into scripts: inout [String: Any]) {
-        guard IPAdapterEngine.shared.isEnabled else { return }
-        guard let ipScripts = IPAdapterEngine.shared.buildAlwaysOnScripts() else { return }
-        for (key, value) in ipScripts { scripts[key] = value }
-    }
+    func mergeIPAdapterScripts(into scripts: inout [String: Any]) {}
 
-    /// Inyecta scripts de ControlNet en un dict mutable.
     @MainActor
-    func mergeControlNetScripts(into scripts: inout [String: Any]) {
-        let cnScripts = ControlNetEngine.shared.buildAlwaysOnScripts()
-        guard !cnScripts.isEmpty else { return }
-        for (key, value) in cnScripts { scripts[key] = value }
-    }
+    func mergeControlNetScripts(into scripts: inout [String: Any]) {}
 
-    /// Inyecta scripts de ADetailer en un dict mutable.
     @MainActor
     func mergeADetailerScripts(into scripts: inout [String: Any]) {
         let adScripts = ADetailerEngine.shared.buildAlwaysOnScripts()
@@ -75,7 +84,8 @@ extension SDRequest {
     }
 }
 
-// MARK: - SDRequestWithScripts
+// MARK: - SDRequestWithScripts (para /sdapi/v1/txt2img + alwayson_scripts)
+// Usado para ADetailer y otros scripts registrados en A1111.
 
 struct SDRequestWithScripts: Encodable {
 
@@ -119,6 +129,70 @@ struct SDRequestWithScripts: Encodable {
     }
 }
 
+// MARK: - SDRequestWithControlNet (para /sdapi/v1/txt2img con controlnet_units top-level)
+//
+// ✅ ESTRATEGIA ACTIVA en v7.
+//
+// Serializa "controlnet_units" como campo TOP-LEVEL en el body JSON —
+// NO dentro de alwayson_scripts. Esta es la única forma que acepta
+// la extensión sd-webui-controlnet en esta instalación.
+//
+// ADetailer y otros scripts válidos siguen en alwayson_scripts normalmente.
+
+struct SDRequestWithControlNet: Encodable {
+
+    let base:            SDRequest
+    let controlNetUnits: [[String: Any]]
+    let alwaysOnScripts: [String: Any]
+
+    enum CodingKeys: String, CodingKey {
+        case prompt, negative_prompt, seed, steps, cfg_scale
+        case width, height, sampler_name, batch_size
+        case enable_hr, hr_upscaler, hr_scale, hr_second_pass_steps
+        case hr_resize_x, hr_resize_y, denoising_strength
+        case restore_faces, tiling, override_settings
+        case controlnet_units   // ✅ top-level — NO dentro de alwayson_scripts
+        case alwayson_scripts
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(base.prompt,               forKey: .prompt)
+        try c.encode(base.negative_prompt,      forKey: .negative_prompt)
+        try c.encode(base.seed,                 forKey: .seed)
+        try c.encode(base.steps,                forKey: .steps)
+        try c.encode(base.cfg_scale,            forKey: .cfg_scale)
+        try c.encode(base.width,                forKey: .width)
+        try c.encode(base.height,               forKey: .height)
+        try c.encode(base.sampler_name,         forKey: .sampler_name)
+        try c.encode(base.batch_size,           forKey: .batch_size)
+        try c.encode(base.enable_hr,            forKey: .enable_hr)
+        try c.encode(base.hr_upscaler,          forKey: .hr_upscaler)
+        try c.encode(base.hr_scale,             forKey: .hr_scale)
+        try c.encode(base.hr_second_pass_steps, forKey: .hr_second_pass_steps)
+        try c.encode(base.hr_resize_x,          forKey: .hr_resize_x)
+        try c.encode(base.hr_resize_y,          forKey: .hr_resize_y)
+        try c.encode(base.denoising_strength,   forKey: .denoising_strength)
+        try c.encode(base.restore_faces,        forKey: .restore_faces)
+        try c.encode(base.tiling,               forKey: .tiling)
+        if let ov = base.override_settings {
+            try c.encode(ov, forKey: .override_settings)
+        }
+        // ControlNet units — campo top-level, separado de alwayson_scripts
+        if !controlNetUnits.isEmpty,
+           let unitsData  = try? JSONSerialization.data(withJSONObject: controlNetUnits),
+           let unitsValue = try? JSONDecoder().decode([AnyCodable].self, from: unitsData) {
+            try c.encode(unitsValue, forKey: .controlnet_units)
+        }
+        // ADetailer u otros alwayson_scripts válidos
+        if !alwaysOnScripts.isEmpty,
+           let scriptData  = try? JSONSerialization.data(withJSONObject: alwaysOnScripts),
+           let scriptValue = try? JSONDecoder().decode(AnyCodable.self, from: scriptData) {
+            try c.encode(scriptValue, forKey: .alwayson_scripts)
+        }
+    }
+}
+
 // MARK: - AnyCodable
 
 struct AnyCodable: Codable {
@@ -127,11 +201,11 @@ struct AnyCodable: Codable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.singleValueContainer()
-        if let v = try? c.decode(Bool.self)               { value = v; return }
-        if let v = try? c.decode(Int.self)                { value = v; return }
-        if let v = try? c.decode(Double.self)             { value = v; return }
-        if let v = try? c.decode(String.self)             { value = v; return }
-        if let v = try? c.decode([AnyCodable].self)       { value = v.map(\.value); return }
+        if let v = try? c.decode(Bool.self)                 { value = v; return }
+        if let v = try? c.decode(Int.self)                  { value = v; return }
+        if let v = try? c.decode(Double.self)               { value = v; return }
+        if let v = try? c.decode(String.self)               { value = v; return }
+        if let v = try? c.decode([AnyCodable].self)         { value = v.map(\.value); return }
         if let v = try? c.decode([String: AnyCodable].self) { value = v.mapValues(\.value); return }
         value = NSNull()
     }
@@ -164,13 +238,14 @@ extension GenerationSettings {
     }
     var ipAdapterEnabled: Bool { IPAdapterEngine.shared.isEnabled }
 
-    /// Construye SDRequest base + dict de alwayson_scripts unificado de todos los engines activos.
-    /// IP-Adapter + ControlNet + ADetailer se fusionan en un único payload.
+    /// Construye un SDGenerationPlan completo:
+    ///   • alwaysOnScripts → ADetailer (via alwayson_scripts en /sdapi/v1/txt2img)
+    ///   • controlNetUnits → ControlNet + IP-Adapter (via controlnet_units top-level)
     @MainActor
     func buildRequestWithScripts(
         prompt:         String,
         negativePrompt: String
-    ) -> (request: SDRequest, scripts: [String: Any]) {
+    ) -> SDGenerationPlan {
 
         let base = SDRequest(
             prompt:            prompt,
@@ -189,12 +264,20 @@ extension GenerationSettings {
             restoreFaces:      restoreFaces
         )
 
-        var scripts: [String: Any] = [:]
-        base.mergeIPAdapterScripts(into: &scripts)
-        base.mergeControlNetScripts(into: &scripts)
-        base.mergeADetailerScripts(into: &scripts)
+        var alwaysOnScripts: [String: Any] = [:]
+        base.mergeADetailerScripts(into: &alwaysOnScripts)
 
-        return (base, scripts)
+        var controlNetUnits: [[String: Any]] = []
+        if let ipUnit = IPAdapterEngine.shared.buildControlNetAPIUnit() {
+            controlNetUnits.append(ipUnit)
+        }
+        controlNetUnits.append(contentsOf: ControlNetEngine.shared.buildControlNetAPIUnits())
+
+        return SDGenerationPlan(
+            request:         base,
+            alwaysOnScripts: alwaysOnScripts,
+            controlNetUnits: controlNetUnits
+        )
     }
 }
 
@@ -221,7 +304,6 @@ struct PipelineRetryPolicy {
         return false
     }
 
-    /// Delay en nanosegundos con jitter (evita thundering herd en batch).
     func delayNS(attempt: Int) -> UInt64 {
         let base   = Double(baseDelayMs)
         let exp    = min(base * pow(2.0, Double(attempt)), Double(maxDelayMs))
@@ -230,148 +312,54 @@ struct PipelineRetryPolicy {
     }
 }
 
-// MARK: - SDService extensions (v3)
-
-extension SDService {
-
-    var baseURL: URL? {
-        URL(string: UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860")
-    }
-
-    // MARK: generateWithScripts — v3 (cancela poll correctamente)
-
-    func generateWithScripts(
-        request: SDRequest,
-        scripts: [String: Any],
-        baseURL: String
-    ) async {
-        guard !scripts.isEmpty else {
-            await generate(request: request, baseURL: baseURL)
-            return
-        }
-
-        isGenerating       = true
-        errorMessage       = nil
-        generatedImage     = nil
-        generationProgress = 0.0
-        livePreviewImage   = nil
-        etaText            = ""
-        stage              = .sending
-        let activeKeys     = scripts.keys.sorted().joined(separator: ", ")
-        progressText       = "SD conectando · scripts: \(activeKeys)…"
-
-        guard let url = URL(string: "\(baseURL)/sdapi/v1/txt2img") else {
-            errorMessage = "URL inválida: \(baseURL)"
-            stage = .error; isGenerating = false; return
-        }
-
-        let wrapper = SDRequestWithScripts(base: request, scripts: scripts)
-        var urlRequest             = URLRequest(url: url)
-        urlRequest.httpMethod      = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlRequest.timeoutInterval = 600
-
-        do {
-            urlRequest.httpBody = try JSONEncoder().encode(wrapper)
-        } catch {
-            errorMessage = "Encode error: \(error.localizedDescription)"
-            stage = .error; isGenerating = false; return
-        }
-
-        progressText = "Generando \(request.steps) steps · \(activeKeys)…"
-        startProgressPolling(baseURL: baseURL, totalSteps: request.steps)
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: urlRequest)
-
-            // ✅ FIX v3: cancelar poll SIEMPRE antes de cualquier throw/return
-            progressPollTask?.cancel()
-            progressPollTask   = nil
-            generationProgress = 1.0
-            livePreviewImage   = nil
-
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                let body = String(data: data, encoding: .utf8) ?? "No body"
-                throw SDError.httpError(
-                    code: (response as? HTTPURLResponse)?.statusCode ?? 0,
-                    body: body
-                )
-            }
-
-            stage        = .receiving
-            progressText = "Decodificando imagen…"
-
-            let sdResponse = try JSONDecoder().decode(SDResponse.self, from: data)
-            guard let b64     = sdResponse.images.first,
-                  let imgData = Data(base64Encoded: b64),
-                  let nsImage = NSImage(data: imgData)
-            else { throw SDError.decodeFailed }
-
-            generatedImage = nsImage
-            lastSeed = sdResponse.parameters?.seed ?? extractSeedFromInfo(sdResponse.info) ?? 0
-            stage        = .done
-            progressText = "✓ Hecho (\(scripts.count) scripts activos)"
-
-        } catch {
-            // ✅ FIX v3: cancelar también en path de error
-            progressPollTask?.cancel()
-            progressPollTask = nil
-            errorMessage     = error.localizedDescription
-            stage            = .error
-            progressText     = ""
-        }
-
-        isGenerating = false
-        Task { await SDRequestScriptsRegistry.shared.pruneOldEntries() }
-    }
-
-    // MARK: generateWithRetry (NEW v3)
-
-    /// Genera con reintentos automáticos según PipelineRetryPolicy.
-    func generateWithRetry(
-        request: SDRequest,
-        baseURL: String,
-        scripts: [String: Any] = [:],
-        policy:  PipelineRetryPolicy
-    ) async {
-        var attempt = 0
-        while attempt < policy.maxAttempts {
-            if attempt > 0 {
-                let delay = policy.delayNS(attempt: attempt - 1)
-                progressText = "Reintentando (\(attempt)/\(policy.maxAttempts))…"
-                try? await Task.sleep(nanoseconds: delay)
-                guard !Task.isCancelled else { return }
-                ZeroKnowledgeLog.shared.write(
-                    category: .systemEvent,
-                    message:  "SD retry intento \(attempt)/\(policy.maxAttempts)"
-                )
-            }
-
-            if scripts.isEmpty {
-                await generate(request: request, baseURL: baseURL)
-            } else {
-                await generateWithScripts(request: request, scripts: scripts, baseURL: baseURL)
-            }
-
-            if errorMessage == nil { return }   // éxito
-
-            attempt += 1
-        }
-    }
-
-    // NOTE: cancelProgressPoll() and resetState() are defined in SDService.swift
-}
-
-// MARK: - ControlNetEngine alwayson_scripts bridge
+// MARK: - ControlNetEngine bridges (v7)
 
 extension ControlNetEngine {
+
+    /// Construye los dicts de unidades para inyectar en controlnet_units top-level.
+    @MainActor
+    func buildControlNetAPIUnits() -> [[String: Any]] {
+        guard isEnabled else { return [] }
+        let active = activeUnits.filter { $0.enabled }
+        guard !active.isEmpty else { return [] }
+
+        return active.compactMap { unit -> [String: Any]? in
+            var dict: [String: Any] = [
+                "enabled":        unit.enabled,
+                "module":         unit.module.rawValue,
+                "model":          unit.model,
+                "weight":         unit.weight,
+                "guidance_start": unit.guidanceStart,
+                "guidance_end":   unit.guidanceEnd,
+                "control_mode":   unit.controlMode.rawValue,
+                "pixel_perfect":  unit.pixelPerfect,
+                "processor_res":  unit.processorRes,
+                "threshold_a":    unit.thresholdA,
+                "threshold_b":    unit.thresholdB,
+                "resize_mode":    1
+            ]
+
+            if unit.module != .none {
+                guard let b64 = unit.imageBase64 else { return nil }
+                dict["image"] = b64
+            } else if let b64 = unit.imageBase64 {
+                dict["image"] = b64
+            }
+
+            return dict
+        }
+    }
+
+    /// Compatibilidad con BatchEngine — produce el bloque alwayson_scripts.
+    /// NOTA: en el main path de v7 esto ya no se usa para ControlNet,
+    /// pero se mantiene para BatchEngine u otros callers.
     @MainActor
     func buildAlwaysOnScripts() -> [String: Any] {
         guard isEnabled else { return [:] }
-        let activeUnits = self.activeUnits.filter { $0.enabled }
-        guard !activeUnits.isEmpty else { return [:] }
+        let active = activeUnits.filter { $0.enabled }
+        guard !active.isEmpty else { return [:] }
 
-        let unitPayloads = activeUnits.map { unit -> [String: Any] in
+        let unitPayloads = active.compactMap { unit -> [String: Any]? in
             var payload: [String: Any] = [
                 "enabled":        unit.enabled,
                 "module":         unit.module.rawValue,
@@ -385,12 +373,71 @@ extension ControlNetEngine {
                 "threshold_a":    unit.thresholdA,
                 "threshold_b":    unit.thresholdB
             ]
-            if let b64 = unit.imageBase64 {
+            if unit.module != .none {
+                guard let b64 = unit.imageBase64 else { return nil }
+                payload["image"] = b64
+            } else if let b64 = unit.imageBase64 {
                 payload["image"] = b64
             }
             return payload
         }
+
+        guard !unitPayloads.isEmpty else { return [:] }
         return ["ControlNet": ["args": unitPayloads]]
+    }
+}
+
+// MARK: - IPAdapterEngine bridges (v7)
+
+extension IPAdapterEngine {
+
+    /// Construye el dict de unidad IP-Adapter para controlnet_units top-level.
+    @MainActor
+    func buildControlNetAPIUnit() -> [String: Any]? {
+        guard config.enabled, let refPath = config.referenceImage, referenceImage != nil else { return nil }
+        guard let imageData = try? Data(contentsOf: URL(fileURLWithPath: refPath)),
+              !imageData.isEmpty
+        else { return nil }
+
+        let model      = config.model
+        let moduleName = model.isFaceModel ? "ip-adapter-faceid" : "ip-adapter_clip_sd15"
+
+        return [
+            "enabled":        true,
+            "module":         moduleName,
+            "model":          model.rawValue,
+            "weight":         config.weight,
+            "image":          imageData.base64EncodedString(),
+            "guidance_start": config.beginStep,
+            "guidance_end":   config.endStep,
+            "resize_mode":    2,
+            "processor_res":  512
+        ]
+    }
+
+    /// Legacy — no usado en v7 main path.
+    @MainActor
+    func buildAlwaysOnScriptsLegacy() -> [String: Any]? {
+        guard config.enabled, let refPath = config.referenceImage, referenceImage != nil else { return nil }
+        guard let imageData = try? Data(contentsOf: URL(fileURLWithPath: refPath)),
+              !imageData.isEmpty
+        else { return nil }
+
+        let model      = config.model
+        let moduleName = model.isFaceModel ? "ip-adapter-faceid" : "ip-adapter_clip_sd15"
+
+        let args: [String: Any] = [
+            "enabled":        true,
+            "module":         moduleName,
+            "model":          model.rawValue,
+            "weight":         config.weight,
+            "image":          "data:image/png;base64,\(imageData.base64EncodedString())",
+            "guidance_start": config.beginStep,
+            "guidance_end":   config.endStep,
+            "resize_mode":    "Crop and Resize",
+            "processor_res":  512
+        ]
+        return ["ControlNet": ["args": [args]]]
     }
 }
 

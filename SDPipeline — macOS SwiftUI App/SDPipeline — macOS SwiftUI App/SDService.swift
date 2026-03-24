@@ -14,6 +14,12 @@ import Combine
 //   🔁 UPD: startProgressPolling delega en GenerationProgressEngine (unifica polling)
 //   🔁 UPD: interruptGeneration detiene también el GenerationProgressEngine
 //   🔁 UPD: resetState detiene GenerationProgressEngine
+//   🔧 FIX: ControlNet se pasa como "controlnet_units" TOP-LEVEL en /sdapi/v1/txt2img
+//           via SDRequestWithControlNet. Estrategias descartadas:
+//           • alwayson_scripts["controlnet"] → 422 (minúsculas)
+//           • alwayson_scripts["ControlNet"] → 422 (mayúsculas)
+//           • /controlnet/txt2img           → 404 (endpoint no existe)
+//   🔧 FIX: Filtrado de controlnet units vacías para evitar rechazos en A1111
 
 @MainActor
 class SDService: ObservableObject {
@@ -23,29 +29,26 @@ class SDService: ObservableObject {
     @Published var stage:           PipelineStage = .idle
     @Published var generatedImage:  NSImage?
     @Published var errorMessage:    String?
-    @Published var lastSeed:        Int    = 0      // 0 = sin seed conocido
+    @Published var lastSeed:        Int    = 0
     @Published var isGenerating:    Bool   = false
     @Published var progressText:    String = ""
 
-    // Live progress (espejado desde GenerationProgressEngine para compatibilidad)
     @Published var generationProgress: Double  = 0.0
     @Published var livePreviewImage:   NSImage?
     @Published var etaText:            String  = ""
 
-    // WebUI process
     @Published var webuiState: WebuiState = .stopped
     @Published var webuiLog:   String     = ""
 
-    // NEW v5 — duración de la última generación
     @Published var generationDuration: Double = 0.0
 
     // MARK: - Private
 
-    private var webuiProcess:    Process?
-    private var logPipe:         Pipe?
-    private var healthPollTask:  Task<Void, Never>?
-    private var progressTask:    Task<Void, Never>?   // observer de GenerationProgressEngine
-    var progressPollTask:        Task<Void, Never>?   // compatibilidad v4
+    private var webuiProcess:   Process?
+    private var logPipe:        Pipe?
+    private var healthPollTask: Task<Void, Never>?
+    private var progressTask:   Task<Void, Never>?
+    var progressPollTask:       Task<Void, Never>?
 
     // MARK: - WebUI State
 
@@ -108,7 +111,6 @@ class SDService: ObservableObject {
                 if text.contains("Model loaded") || text.contains("Running on local URL") {
                     self?.webuiState = .online
                     self?.healthPollTask?.cancel()
-                    // Iniciar GPU memory polling ahora que A1111 está online
                     GPUMonitor.shared.startPolling()
                 }
             }
@@ -129,7 +131,7 @@ class SDService: ObservableObject {
                 if Task.isCancelled { return }
                 if await checkHealth(baseURL: baseURL) {
                     self.webuiState = .online
-                    GPUMonitor.shared.startPolling()   // A1111 confirmado online
+                    GPUMonitor.shared.startPolling()
                     return
                 }
             }
@@ -147,7 +149,7 @@ class SDService: ObservableObject {
         webuiProcess?.terminate()
         webuiProcess = nil
         logPipe      = nil
-        GPUMonitor.shared.stopPolling()   // A1111 ya no corre → parar polling de memoria
+        GPUMonitor.shared.stopPolling()
     }
 
     // MARK: - generate() — v5: rate limiter + GenerationProgressEngine
@@ -170,7 +172,6 @@ class SDService: ObservableObject {
             stage = .error; isGenerating = false; return
         }
 
-        // ── Codificar request ──────────────────────────────────────────────
         let requestData: Data
         do {
             requestData = try JSONEncoder().encode(request)
@@ -181,14 +182,10 @@ class SDService: ObservableObject {
 
         progressText = "Generando (\(request.steps) pasos)…"
 
-        // ── Iniciar GenerationProgressEngine (NEW v5) ──────────────────────
         startProgressPolling(baseURL: baseURL, totalSteps: request.steps)
-
-        // ── Observar GenerationProgressEngine para espejar estado (NEW v5) ─
         startProgressMirroring()
 
         do {
-            // ── Enviar request vía SDAPIRateLimiter (NEW v5) ────────────────
             let data: Data
             do {
                 data = try await SDAPIRateLimiter.shared.generateFetch(url: url, body: requestData)
@@ -198,11 +195,8 @@ class SDService: ObservableObject {
                 throw error
             }
 
-            // ── Detener progreso al recibir respuesta ───────────────────────
             stopProgressPolling()
 
-            // ── Validar respuesta HTTP ──────────────────────────────────────
-            // (El rate limiter ya hace URLSession; aquí parseamos el body directo)
             stage        = .receiving
             progressText = "Decodificando imagen…"
 
@@ -217,23 +211,19 @@ class SDService: ObservableObject {
                 throw SDError.decodeFailed
             }
 
-            // ── Actualizar estado ───────────────────────────────────────────
             generatedImage     = nsImage
             lastSeed           = sdResponse.parameters?.seed ?? extractSeedFromInfo(sdResponse.info) ?? 0
             generationDuration = Date().timeIntervalSince(generationStart)
             stage              = .done
             progressText       = "Listo ✓"
 
-            // Persistir duración para acceso desde ContentView_CenterPanel
             UserDefaults.standard.set(generationDuration, forKey: "sdservice.lastDuration")
 
-            // Log de generación completada (NEW v5)
             ZeroKnowledgeLog.shared.write(
                 category: .systemEvent,
                 message: "Generación completada — seed:\(lastSeed) pasos:\(request.steps) duración:\(String(format: "%.1f", generationDuration))s modelo:\(settings?.checkpoint ?? "-")"
             )
 
-            // Notificar al rate limiter del éxito (NEW v5)
             await SDAPIRateLimiter.shared.recordSuccess()
 
         } catch {
@@ -253,9 +243,8 @@ class SDService: ObservableObject {
         stopProgressMirroring()
     }
 
-    // MARK: - generateWithProgress() — wrapper público conveniente (NEW v5)
+    // MARK: - generateWithProgress()
 
-    /// Versión pública que acepta label para la UI y ajusta el engine de progreso.
     func generateWithProgress(
         request:  SDRequest,
         baseURL:  String,
@@ -263,23 +252,17 @@ class SDService: ObservableObject {
         settings: GenerationSettings? = nil
     ) async {
         self.settings = settings
-        if !label.isEmpty {
-            progressText = label
-        }
+        if !label.isEmpty { progressText = label }
         await generate(request: request, baseURL: baseURL)
     }
 
-    // Settings storage para logging
     private var settings: GenerationSettings?
 
-    // MARK: - Progress Polling (v5: delega en GenerationProgressEngine)
+    // MARK: - Progress Polling
 
     func startProgressPolling(baseURL: String, totalSteps: Int) {
-        // Detener polling propio heredado de v4
         progressPollTask?.cancel()
         progressPollTask = nil
-
-        // Delegar en GenerationProgressEngine (NEW v5)
         GenerationProgressEngine.shared.startPolling(
             baseURL:            baseURL,
             label:              progressText,
@@ -293,16 +276,14 @@ class SDService: ObservableObject {
         GenerationProgressEngine.shared.stopPolling()
     }
 
-    // MARK: - Progress Mirroring (NEW v5)
-    // Espeja el estado de GenerationProgressEngine en las propiedades de SDService
-    // para mantener compatibilidad con código que observa SDService directamente.
+    // MARK: - Progress Mirroring
 
     private func startProgressMirroring() {
         progressTask?.cancel()
         progressTask = Task { [weak self] in
             let engine = GenerationProgressEngine.shared
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 300_000_000) // 300ms
+                try? await Task.sleep(nanoseconds: 300_000_000)
                 guard let self else { return }
                 self.generationProgress = engine.progress
                 self.etaText            = engine.etaFormatted
@@ -319,11 +300,9 @@ class SDService: ObservableObject {
         progressTask = nil
     }
 
-    // MARK: - fetchProgress (v4 compat — ahora delega en GenerationProgressEngine)
+    // MARK: - fetchProgress (v4 compat)
 
     func fetchProgress(baseURL: String) async {
-        // En v5, GenerationProgressEngine maneja todo. Este método existe
-        // para compatibilidad con código que lo llamaba directamente.
         await GenerationProgressEngine.shared.fetchProgress()
     }
 
@@ -336,7 +315,6 @@ class SDService: ObservableObject {
         req.timeoutInterval = 5
         _ = try? await URLSession.shared.data(for: req)
 
-        // Detener todos los engines de progreso (NEW v5)
         stopProgressPolling()
         GenerationProgressEngine.shared.stopPolling()
 
@@ -345,14 +323,12 @@ class SDService: ObservableObject {
         stage        = .idle
     }
 
-    // MARK: - interruptAndReset
-
     func interruptAndReset(baseURL: String) async {
         await interruptGeneration(baseURL: baseURL)
         resetState()
     }
 
-    // MARK: - generateWithBatchRetry (v4 compat + v5 improvements)
+    // MARK: - generateWithBatchRetry
 
     func generateWithBatchRetry(
         request: SDRequest,
@@ -397,8 +373,6 @@ class SDService: ObservableObject {
         GenerationProgressEngine.shared.reset()
     }
 
-    // MARK: - cancelProgressPoll (v4 compat)
-
     func cancelProgressPoll() {
         progressPollTask?.cancel()
         progressPollTask = nil
@@ -410,7 +384,7 @@ class SDService: ObservableObject {
     func vramPreCheck(width: Int, height: Int, steps: Int, enableHR: Bool, hrScale: Double) -> VRAMCheckResult {
         let megapixels   = Double(width * height) / 1_000_000.0
         var estimatedGB  = megapixels * 2.5 + 1.5
-        if enableHR   { estimatedGB *= hrScale * 0.6 }
+        if enableHR  { estimatedGB *= hrScale * 0.6 }
         if steps > 50 { estimatedGB += 0.5 }
 
         let availableGB: Double
@@ -488,13 +462,12 @@ class SDService: ObservableObject {
     }
 }
 
-// MARK: - GenerationProgressEngine fetch bridge (para fetchProgress(baseURL:))
+// MARK: - GenerationProgressEngine fetch bridge
 
 extension GenerationProgressEngine {
-    /// Fetch público del progreso — usado por SDService.fetchProgress(baseURL:) en modo compat.
     func fetchProgress() async {
         // El engine maneja esto internamente via pollLoop.
-        // Este método existe como bridge público vacío para compatibilidad con v4.
+        // Existe como bridge público vacío para compatibilidad con v4.
     }
 }
 
@@ -520,10 +493,8 @@ enum SDError: LocalizedError {
     }
 }
 
-// NOTE: SDProgressResponse is defined in Models.swift — using that definition
-
 // MARK: - sdPostRaw helper (used by HiResFinishEngine)
-/// Generic POST to SD API endpoint. Returns raw Data.
+
 func sdPostRaw(endpoint: String, body: Data) async throws -> Data {
     let baseURLString = UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860"
     guard let url = URL(string: "\(baseURLString)\(endpoint)") else {
@@ -536,4 +507,262 @@ func sdPostRaw(endpoint: String, body: Data) async throws -> Data {
     req.timeoutInterval = 600
     let (data, _) = try await URLSession.shared.data(for: req)
     return data
+}
+
+extension SDService {
+
+    var baseURL: URL? {
+        URL(string: UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860")
+    }
+
+    // MARK: generateWithPlan — entry point unificado
+    //
+    // Con ControlNet activo  → generateWithControlNet()
+    //   → SDRequestWithControlNet → "controlnet_units" TOP-LEVEL en /sdapi/v1/txt2img ✅
+    // Solo ADetailer         → generateWithScripts() → alwayson_scripts["ADetailer"]
+    // Sin scripts            → generate() plano
+
+    func generateWithPlan(_ plan: SDGenerationPlan, baseURL: String) async {
+        let activeUnits = plan.controlNetUnits.filter {
+            ($0["enabled"] as? Bool) == true
+        }
+
+        if !activeUnits.isEmpty {
+            await generateWithControlNet(
+                request:         plan.request,
+                controlNetUnits: activeUnits,
+                alwaysOnScripts: plan.alwaysOnScripts,
+                baseURL:         baseURL
+            )
+        } else if !plan.alwaysOnScripts.isEmpty {
+            await generateWithScripts(
+                request: plan.request,
+                scripts:  plan.alwaysOnScripts,
+                baseURL:  baseURL
+            )
+        } else {
+            await generate(request: plan.request, baseURL: baseURL)
+        }
+    }
+
+    // MARK: generateWithControlNet
+    //
+    // Usa SDRequestWithControlNet que serializa "controlnet_units" como campo
+    // TOP-LEVEL en el body de /sdapi/v1/txt2img — separado de alwayson_scripts.
+    // ADetailer sigue en alwaysOnScripts sin cambios.
+
+    func generateWithControlNet(
+        request:         SDRequest,
+        controlNetUnits: [[String: Any]],
+        alwaysOnScripts: [String: Any] = [:],
+        baseURL:         String
+    ) async {
+
+        isGenerating       = true
+        errorMessage       = nil
+        generatedImage     = nil
+        generationProgress = 0.0
+        livePreviewImage   = nil
+        etaText            = ""
+        stage              = .sending
+
+        let activeUnits = controlNetUnits.filter { ($0["enabled"] as? Bool) == true }
+        let unitCount   = activeUnits.count
+        progressText    = "ControlNet (\(unitCount) unidad\(unitCount == 1 ? "" : "es"))…"
+
+        guard let url = URL(string: "\(baseURL)/sdapi/v1/txt2img") else {
+            errorMessage = "URL inválida: \(baseURL)/sdapi/v1/txt2img"
+            stage = .error; isGenerating = false; return
+        }
+
+        // ✅ "controlnet_units" top-level — NO en alwayson_scripts
+        let wrapper = SDRequestWithControlNet(
+            base:            request,
+            controlNetUnits: activeUnits,
+            alwaysOnScripts: alwaysOnScripts
+        )
+
+        var urlRequest             = URLRequest(url: url)
+        urlRequest.httpMethod      = "POST"
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.timeoutInterval = 600
+
+        do {
+            urlRequest.httpBody = try JSONEncoder().encode(wrapper)
+        } catch {
+            errorMessage = "Encode error: \(error.localizedDescription)"
+            stage = .error; isGenerating = false; return
+        }
+
+        progressText = "Generando \(request.steps) steps · ControlNet…"
+        startProgressPolling(baseURL: baseURL, totalSteps: request.steps)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: urlRequest)
+
+            progressPollTask?.cancel()
+            progressPollTask   = nil
+            generationProgress = 1.0
+            livePreviewImage   = nil
+
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                let body = String(data: data, encoding: .utf8) ?? "No body"
+                throw SDError.httpError(
+                    code: (response as? HTTPURLResponse)?.statusCode ?? 0,
+                    body: body
+                )
+            }
+
+            stage        = .receiving
+            progressText = "Decodificando imagen…"
+
+            let sdResponse = try JSONDecoder().decode(SDResponse.self, from: data)
+            guard let b64     = sdResponse.images.first,
+                  let imgData = Data(base64Encoded: b64),
+                  let nsImage = NSImage(data: imgData)
+            else { throw SDError.decodeFailed }
+
+            generatedImage = nsImage
+            lastSeed       = sdResponse.parameters?.seed ?? extractSeedFromInfo(sdResponse.info) ?? 0
+            stage          = .done
+            progressText   = "✓ Hecho (\(unitCount) CN unit\(unitCount == 1 ? "" : "s"))"
+
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message:  "ControlNet OK · \(unitCount) units · seed:\(lastSeed) · steps:\(request.steps)"
+            )
+
+        } catch {
+            progressPollTask?.cancel()
+            progressPollTask = nil
+            errorMessage     = error.localizedDescription
+            stage            = .error
+            progressText     = ""
+
+            ZeroKnowledgeLog.shared.write(
+                category: .systemEvent,
+                message:  "ControlNet error: \(error.localizedDescription)"
+            )
+        }
+
+        isGenerating = false
+        stopProgressMirroring()
+    }
+
+    // MARK: generateWithScripts — v3
+
+    func generateWithScripts(
+        request: SDRequest,
+        scripts: [String: Any],
+        baseURL: String
+    ) async {
+        guard !scripts.isEmpty else {
+            await generate(request: request, baseURL: baseURL)
+            return
+        }
+
+        isGenerating       = true
+        errorMessage       = nil
+        generatedImage     = nil
+        generationProgress = 0.0
+        livePreviewImage   = nil
+        etaText            = ""
+        stage              = .sending
+        let activeKeys     = scripts.keys.sorted().joined(separator: ", ")
+        progressText       = "SD conectando · scripts: \(activeKeys)…"
+
+        guard let url = URL(string: "\(baseURL)/sdapi/v1/txt2img") else {
+            errorMessage = "URL inválida: \(baseURL)"
+            stage = .error; isGenerating = false; return
+        }
+
+        let wrapper = SDRequestWithScripts(base: request, scripts: scripts)
+        var urlRequest             = URLRequest(url: url)
+        urlRequest.httpMethod      = "POST"
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.timeoutInterval = 600
+
+        do {
+            urlRequest.httpBody = try JSONEncoder().encode(wrapper)
+        } catch {
+            errorMessage = "Encode error: \(error.localizedDescription)"
+            stage = .error; isGenerating = false; return
+        }
+
+        progressText = "Generando \(request.steps) steps · \(activeKeys)…"
+        startProgressPolling(baseURL: baseURL, totalSteps: request.steps)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: urlRequest)
+
+            progressPollTask?.cancel()
+            progressPollTask   = nil
+            generationProgress = 1.0
+            livePreviewImage   = nil
+
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                let body = String(data: data, encoding: .utf8) ?? "No body"
+                throw SDError.httpError(
+                    code: (response as? HTTPURLResponse)?.statusCode ?? 0,
+                    body: body
+                )
+            }
+
+            stage        = .receiving
+            progressText = "Decodificando imagen…"
+
+            let sdResponse = try JSONDecoder().decode(SDResponse.self, from: data)
+            guard let b64     = sdResponse.images.first,
+                  let imgData = Data(base64Encoded: b64),
+                  let nsImage = NSImage(data: imgData)
+            else { throw SDError.decodeFailed }
+
+            generatedImage = nsImage
+            lastSeed       = sdResponse.parameters?.seed ?? extractSeedFromInfo(sdResponse.info) ?? 0
+            stage          = .done
+            progressText   = "✓ Hecho (\(scripts.count) scripts activos)"
+
+        } catch {
+            progressPollTask?.cancel()
+            progressPollTask = nil
+            errorMessage     = error.localizedDescription
+            stage            = .error
+            progressText     = ""
+        }
+
+        isGenerating = false
+        Task { await SDRequestScriptsRegistry.shared.pruneOldEntries() }
+    }
+
+    // MARK: generateWithRetry (v3)
+
+    func generateWithRetry(
+        request: SDRequest,
+        baseURL: String,
+        scripts: [String: Any] = [:],
+        policy:  PipelineRetryPolicy
+    ) async {
+        var attempt = 0
+        while attempt < policy.maxAttempts {
+            if attempt > 0 {
+                let delay = policy.delayNS(attempt: attempt - 1)
+                progressText = "Reintentando (\(attempt)/\(policy.maxAttempts))…"
+                try? await Task.sleep(nanoseconds: delay)
+                guard !Task.isCancelled else { return }
+                ZeroKnowledgeLog.shared.write(
+                    category: .systemEvent,
+                    message:  "SD retry intento \(attempt)/\(policy.maxAttempts)"
+                )
+            }
+
+            if scripts.isEmpty {
+                await generate(request: request, baseURL: baseURL)
+            } else {
+                await generateWithScripts(request: request, scripts: scripts, baseURL: baseURL)
+            }
+
+            if errorMessage == nil { return }
+            attempt += 1
+        }
+    }
 }

@@ -265,7 +265,7 @@ struct ContentView: View {
                 parseButton.frame(maxWidth: .infinity)
                 Divider().frame(height: 40).background(Color.white.opacity(0.1))
                 Button(action: { showSavePreset = true }) {
-                    Image(systemName: "bookmark.badge.plus")
+                    Image(systemName: "bookmark.fill")
                         .font(.system(size: 13))
                         .foregroundColor(Color(hex: "#f59e0b"))
                         .frame(width: 44)
@@ -670,4 +670,5 @@ struct ContentView: View {
         }
     }
 }
+
 

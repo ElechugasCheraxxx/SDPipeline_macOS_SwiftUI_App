@@ -33,6 +33,7 @@ struct SettingsView: View {
     @ObservedObject private var cryptoEngine  = VaultCryptoEngine.shared
     @ObservedObject private var compliance    = PublishComplianceLogger.shared
     @ObservedObject private var ipAdapter     = IPAdapterEngine.shared
+    @ObservedObject private var projectFolderMgr = ProjectFolderManager.shared
     @ObservedObject private var colorEngine   = ACEScgColorEngine.shared
     @ObservedObject private var editorBridge  = ExternalEditorBridge.shared
 
@@ -87,7 +88,7 @@ struct SettingsView: View {
             case .color:      return "wand.and.stars"
             case .editor:     return "arrow.up.forward.app.fill"
             case .gpu:        return "cpu.fill"
-            case .license:    return "doc.badge.checkmark"
+            case .license:    return "checkmark.seal.fill"
             case .integrity:  return "shield.checkered"
             case .audit:      return "lock.shield.fill"
             case .wildcards:  return "shuffle"
@@ -225,7 +226,7 @@ struct SettingsView: View {
     var projectsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             sectionTitle("Proyectos del Studio")
-            let pf = ProjectFolderManager.shared
+            let pf = projectFolderMgr
             if pf.projects.isEmpty {
                 Text("No hay proyectos creados aún. El sistema crea uno por defecto al configurar el vault.")
                     .font(.system(size: 11)).foregroundColor(.secondary)
@@ -254,7 +255,11 @@ struct SettingsView: View {
                 }
             }
             Button("Nuevo proyecto…") {
-                _ = try? pf.createProject(name: "Nuevo Proyecto \(pf.projects.count + 1)")
+                do {
+                    _ = try pf.createProject(name: "Nuevo Proyecto \(pf.projects.count + 1)")
+                } catch {
+                    print("❌ createProject error: \(error)")
+                }
             }
             .buttonStyle(ActionChipStyle(accent: true))
         }
@@ -658,8 +663,8 @@ struct SettingsView: View {
             HStack {
                 Toggle("Lanzar A1111 automáticamente al iniciar la app", isOn: $autoLaunchSD)
                     .font(.system(size: 11)).foregroundColor(.white)
-                    .onChange(of: autoLaunchSD) { val in
-                        UserDefaults.standard.set(val, forKey: "sandbox.autoLaunchSD")
+                    .onChange(of: autoLaunchSD) { _, newValue in
+                        UserDefaults.standard.set(newValue, forKey: "sandbox.autoLaunchSD")
                     }
                 Spacer()
             }
@@ -886,10 +891,21 @@ struct SettingsView: View {
             sectionTitle("ControlNet")
             controlNetStatusCard
             controlNetUnitsCard
+            
             Button("Recargar modelos desde A1111") {
-                Task { await ControlNetEngine.shared.fetchModels(baseURL: UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860") }
+                Task {
+                    await ControlNetEngine.shared.checkAvailability(
+                        baseURL: UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860"
+                    )
+                }
             }
             .buttonStyle(ActionChipStyle())
+        }
+        // ✅ Dispara el check al abrir la sección en Settings
+        .task {
+            await ControlNetEngine.shared.checkAvailability(
+                baseURL: UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860"
+            )
         }
     }
 
@@ -908,7 +924,8 @@ struct SettingsView: View {
             }
             paramRow("Unidades activas",   "\(engine.activeUnits.filter { $0.enabled }.count) / \(engine.activeUnits.count)")
             paramRow("Modelos instalados", "\(engine.availableModels.count)")
-            if engine.availableModels.isEmpty && engine.activeUnits.isEmpty {
+            
+            if !engine.isAvailable {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 11)).foregroundColor(Color(hex: "#f59e0b"))
@@ -916,11 +933,14 @@ struct SettingsView: View {
                         .font(.system(size: 10)).foregroundColor(.secondary)
                 }
                 .padding(8).background(Color(hex: "#f59e0b").opacity(0.08)).cornerRadius(6)
+                
+                Button("Instalar sd-webui-controlnet") {
+                    NSWorkspace.shared.open(URL(string: "https://github.com/Mikubill/sd-webui-controlnet")!)
+                }
+                .buttonStyle(ActionChipStyle())
+            } else {
+                paramRow("Versión detectada", engine.versionString)
             }
-            Button("Instalar sd-webui-controlnet") {
-                NSWorkspace.shared.open(URL(string: "https://github.com/Mikubill/sd-webui-controlnet")!)
-            }
-            .buttonStyle(ActionChipStyle())
         }
     }
 
@@ -1198,6 +1218,7 @@ extension WildcardEngine {
 extension Int {
     func nonZero(default value: Int) -> Int { self == 0 ? value : self }
 }
+
 
 
 

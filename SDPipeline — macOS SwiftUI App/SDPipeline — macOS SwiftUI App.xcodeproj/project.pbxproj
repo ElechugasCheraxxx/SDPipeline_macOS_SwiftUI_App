@@ -7,15 +7,54 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		29F2851D2F7191DB00C48386 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 29F2850B2F70BF5300C48386 /* XCTest.framework */; };
 		29F6E4152F5CD01C0094385D /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 29F6E4142F5CD01C0094385D /* WebKit.framework */; settings = {ATTRIBUTES = (Required, ); }; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		29F285162F71913B00C48386 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 29F6E3E92F5CC2450094385D /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 29F6E3F02F5CC2450094385D;
+			remoteInfo = "SDPipeline — macOS SwiftUI App";
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
+		29F2850B2F70BF5300C48386 /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = Platforms/MacOSX.platform/Developer/Library/Frameworks/XCTest.framework; sourceTree = DEVELOPER_DIR; };
+		29F285122F71913B00C48386 /* SDPipeline — macOS SwiftUI AppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "SDPipeline — macOS SwiftUI AppTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		29F6E3F12F5CC2450094385D /* SDPipeline — macOS SwiftUI App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "SDPipeline — macOS SwiftUI App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		29F6E4142F5CD01C0094385D /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		29F285282F71955800C48386 /* Exceptions for "SDPipeline — macOS SwiftUI AppTests" folder in "SDPipeline — macOS SwiftUI App" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				SDPipelineTests.swift,
+			);
+			target = 29F6E3F02F5CC2450094385D /* SDPipeline — macOS SwiftUI App */;
+		};
+		29F285292F71955800C48386 /* Exceptions for "SDPipeline — macOS SwiftUI AppTests" folder in "SDPipeline — macOS SwiftUI AppTests" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				SDPipelineTests.swift,
+			);
+			target = 29F285112F71913B00C48386 /* SDPipeline — macOS SwiftUI AppTests */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		29F285252F7193FA00C48386 /* SDPipeline — macOS SwiftUI AppTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				29F285282F71955800C48386 /* Exceptions for "SDPipeline — macOS SwiftUI AppTests" folder in "SDPipeline — macOS SwiftUI App" target */,
+				29F285292F71955800C48386 /* Exceptions for "SDPipeline — macOS SwiftUI AppTests" folder in "SDPipeline — macOS SwiftUI AppTests" target */,
+			);
+			path = "SDPipeline — macOS SwiftUI AppTests";
+			sourceTree = "<group>";
+		};
 		29F6E3F32F5CC2450094385D /* SDPipeline — macOS SwiftUI App */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = "SDPipeline — macOS SwiftUI App";
@@ -24,6 +63,14 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		29F2850F2F71913B00C48386 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				29F2851D2F7191DB00C48386 /* XCTest.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		29F6E3EE2F5CC2450094385D /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -41,6 +88,7 @@
 				29F6E3F32F5CC2450094385D /* SDPipeline — macOS SwiftUI App */,
 				29F6E4132F5CD01C0094385D /* Frameworks */,
 				29F6E3F22F5CC2450094385D /* Products */,
+				29F285252F7193FA00C48386 /* SDPipeline — macOS SwiftUI AppTests */,
 			);
 			sourceTree = "<group>";
 		};
@@ -48,6 +96,7 @@
 			isa = PBXGroup;
 			children = (
 				29F6E3F12F5CC2450094385D /* SDPipeline — macOS SwiftUI App.app */,
+				29F285122F71913B00C48386 /* SDPipeline — macOS SwiftUI AppTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -55,6 +104,7 @@
 		29F6E4132F5CD01C0094385D /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				29F2850B2F70BF5300C48386 /* XCTest.framework */,
 				29F6E4142F5CD01C0094385D /* WebKit.framework */,
 			);
 			name = Frameworks;
@@ -63,6 +113,26 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		29F285112F71913B00C48386 /* SDPipeline — macOS SwiftUI AppTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 29F285182F71913B00C48386 /* Build configuration list for PBXNativeTarget "SDPipeline — macOS SwiftUI AppTests" */;
+			buildPhases = (
+				29F2850E2F71913B00C48386 /* Sources */,
+				29F2850F2F71913B00C48386 /* Frameworks */,
+				29F285102F71913B00C48386 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				29F285172F71913B00C48386 /* PBXTargetDependency */,
+			);
+			name = "SDPipeline — macOS SwiftUI AppTests";
+			packageProductDependencies = (
+			);
+			productName = "SDPipeline — macOS SwiftUI AppTests";
+			productReference = 29F285122F71913B00C48386 /* SDPipeline — macOS SwiftUI AppTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		29F6E3F02F5CC2450094385D /* SDPipeline — macOS SwiftUI App */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 29F6E3FC2F5CC2460094385D /* Build configuration list for PBXNativeTarget "SDPipeline — macOS SwiftUI App" */;
@@ -76,6 +146,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
+				29F285252F7193FA00C48386 /* SDPipeline — macOS SwiftUI AppTests */,
 				29F6E3F32F5CC2450094385D /* SDPipeline — macOS SwiftUI App */,
 			);
 			name = "SDPipeline — macOS SwiftUI App";
@@ -95,6 +166,10 @@
 				LastSwiftUpdateCheck = 2620;
 				LastUpgradeCheck = 2620;
 				TargetAttributes = {
+					29F285112F71913B00C48386 = {
+						CreatedOnToolsVersion = 26.2;
+						TestTargetID = 29F6E3F02F5CC2450094385D;
+					};
 					29F6E3F02F5CC2450094385D = {
 						CreatedOnToolsVersion = 26.2;
 					};
@@ -115,11 +190,19 @@
 			projectRoot = "";
 			targets = (
 				29F6E3F02F5CC2450094385D /* SDPipeline — macOS SwiftUI App */,
+				29F285112F71913B00C48386 /* SDPipeline — macOS SwiftUI AppTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		29F285102F71913B00C48386 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		29F6E3EF2F5CC2450094385D /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -130,6 +213,13 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		29F2850E2F71913B00C48386 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		29F6E3ED2F5CC2450094385D /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -139,7 +229,55 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		29F285172F71913B00C48386 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 29F6E3F02F5CC2450094385D /* SDPipeline — macOS SwiftUI App */;
+			targetProxy = 29F285162F71913B00C48386 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		29F285192F71913B00C48386 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5Z298TPX6Y;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "cheraxxx.SDPipeline---macOS-SwiftUI-AppTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/SDPipeline — macOS SwiftUI App.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/SDPipeline — macOS SwiftUI App";
+			};
+			name = Debug;
+		};
+		29F2851A2F71913B00C48386 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5Z298TPX6Y;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "cheraxxx.SDPipeline---macOS-SwiftUI-AppTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/SDPipeline — macOS SwiftUI App.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/SDPipeline — macOS SwiftUI App";
+			};
+			name = Release;
+		};
 		29F6E3FA2F5CC2460094385D /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -198,6 +336,7 @@
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_MODULE_NAME = "$(PRODUCT_NAME:c99extidentifier)";
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
@@ -255,6 +394,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
+				PRODUCT_MODULE_NAME = "$(PRODUCT_NAME:c99extidentifier)";
 				SDKROOT = macosx;
 				SWIFT_COMPILATION_MODE = wholemodule;
 			};
@@ -265,6 +405,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -273,6 +414,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -280,6 +422,7 @@
 				);
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "cheraxxx.SDPipeline---macOS-SwiftUI-App";
+				PRODUCT_MODULE_NAME = SDPipeline;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -296,6 +439,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -304,6 +448,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -311,6 +456,7 @@
 				);
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "cheraxxx.SDPipeline---macOS-SwiftUI-App";
+				PRODUCT_MODULE_NAME = SDPipeline;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -325,6 +471,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		29F285182F71913B00C48386 /* Build configuration list for PBXNativeTarget "SDPipeline — macOS SwiftUI AppTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				29F285192F71913B00C48386 /* Debug */,
+				29F2851A2F71913B00C48386 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		29F6E3EC2F5CC2450094385D /* Build configuration list for PBXProject "SDPipeline — macOS SwiftUI App" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
