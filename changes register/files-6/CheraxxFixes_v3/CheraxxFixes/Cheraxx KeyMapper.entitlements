@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        CORRECCIÓN: Sandbox desactivado (ENABLE_APP_SANDBOX = NO en project.pbxproj).
+        Con sandbox desactivado, las claves de excepción de sandbox son ignoradas
+        y además generan una advertencia de Xcode sobre entitlements contradictorios.
+        Se eliminan todas las claves de sandbox excepto las que aplican globalmente:
+        - com.apple.security.temporary-exception.apple-events → relevante para AppleScript
+        - com.apple.developer.hardened-runtime → necesario para distribución notarizada
+        Las claves de acceso a archivos y red NO son necesarias sin sandbox.
+    -->
+
+    <!-- Hardened Runtime — necesario para notarización -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+
+    <!-- AppleEvents: necesario para enviar eventos a iPhone Mirroring -->
+    <key>com.apple.security.temporary-exception.apple-events</key>
+    <true/>
+
+    <!--
+        Nota: com.apple.security.screen-capture NO es una entitlement estándar de Apple.
+        El permiso de Screen Recording se otorga vía el diálogo del sistema (TCC),
+        no a través de entitlements. Se elimina para evitar confusión.
+
+        Nota: com.apple.security.accessibility NO es una entitlement estándar.
+        El permiso de Accesibilidad también se otorga vía TCC. Se elimina.
+
+        Las claves com.apple.security.files.* y com.apple.security.network.*
+        solo tienen efecto con sandbox activado. Con ENABLE_APP_SANDBOX = NO,
+        estas claves son irrelevantes y se eliminan.
+    -->
+</dict>
+</plist>

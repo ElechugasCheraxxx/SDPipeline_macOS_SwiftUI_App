@@ -1,0 +1,726 @@
+import SwiftUI
+import AppKit
+
+// MARK: - SettingsView v7
+// Añade secciones:
+//   • Cifrado (VaultCryptoEngine — rotación de clave, estado AES-256)
+//   • Compliance (PublishComplianceLogger — GDPR flags, reporte)
+//   • IP-Adapter (configuración por defecto, presets)
+//   • Color (ACEScgColorEngine — LUTs, grado por defecto)
+//   • Editor externo (ExternalEditorBridge)
+
+struct SettingsView: View {
+
+    @ObservedObject private var vault         = VaultManager.shared
+    @ObservedObject private var backupMgr     = BackupManager.shared
+    @ObservedObject private var nsfwDetector  = NSFWDetector.shared
+    @ObservedObject private var exportEngine  = ExportEngine.shared
+    @ObservedObject private var gpu           = GPUMonitor.shared
+    @ObservedObject private var projects      = ProjectManager.shared
+    @ObservedObject private var cryptoEngine  = VaultCryptoEngine.shared
+    @ObservedObject private var compliance    = PublishComplianceLogger.shared
+    @ObservedObject private var ipAdapter     = IPAdapterEngine.shared
+    @ObservedObject private var colorEngine   = ACEScgColorEngine.shared
+    @ObservedObject private var editorBridge  = ExternalEditorBridge.shared
+
+    @State private var activeSection: SettingsSection = .vault
+    @State private var watermarkText:     String  = UserDefaults.standard.string(forKey: "watermark.text") ?? "@tuusuario"
+    @State private var watermarkOpacity:  Double  = UserDefaults.standard.double(forKey: "watermark.opacity").nonZero(default: 0.35)
+    @State private var watermarkPosition: ExportEngine.WatermarkConfig.Position = .bottomRight
+    @State private var sdBaseURL:         String  = UserDefaults.standard.string(forKey: "sd.baseURL") ?? "http://127.0.0.1:7860"
+    @State private var integrityResults:  [String] = []
+    @State private var isVerifying:       Bool    = false
+    @State private var isRotatingKey:     Bool    = false
+    @State private var keyRotationResult: String? = nil
+    @State private var isExportingCompliance: Bool = false
+
+    // MARK: - Sections
+
+    enum SettingsSection: String, CaseIterable {
+        case vault      = "Vault"
+        case projects   = "Proyectos"
+        case crypto     = "Cifrado"
+        case watermark  = "Watermark"
+        case backup     = "Backup"
+        case nsfw       = "NSFW Policy"
+        case export     = "Export"
+        case compliance = "Compliance"
+        case ipAdapter  = "IP-Adapter"
+        case color      = "Color"
+        case editor     = "Editor externo"
+        case gpu        = "GPU / SD"
+        case license    = "Licencias"
+        case integrity  = "Integridad"
+        case audit      = "Auditoría"
+        case wildcards  = "Wildcards"
+
+        var icon: String {
+            switch self {
+            case .vault:      return "externaldrive.fill"
+            case .projects:   return "folder.badge.gearshape"
+            case .crypto:     return "lock.fill"
+            case .watermark:  return "signature"
+            case .backup:     return "externaldrive.badge.timemachine"
+            case .nsfw:       return "exclamationmark.shield.fill"
+            case .export:     return "square.and.arrow.up"
+            case .compliance: return "checkmark.seal.fill"
+            case .ipAdapter:  return "person.fill.viewfinder"
+            case .color:      return "wand.and.stars"
+            case .editor:     return "arrow.up.forward.app.fill"
+            case .gpu:        return "cpu.fill"
+            case .license:    return "doc.badge.checkmark"
+            case .integrity:  return "shield.checkered"
+            case .audit:      return "lock.shield.fill"
+            case .wildcards:  return "shuffle"
+            }
+        }
+
+        var group: String {
+            switch self {
+            case .vault, .projects, .crypto, .backup, .integrity:   return "Infraestructura"
+            case .watermark, .export, .compliance, .ipAdapter, .color, .editor: return "Producción"
+            case .nsfw, .license, .audit:                            return "Seguridad"
+            case .gpu, .wildcards:                                   return "Sistema"
+            }
+        }
+    }
+
+    // MARK: - Body
+
+    var body: some View {
+        HSplitView {
+            // Sidebar
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(["Infraestructura", "Producción", "Seguridad", "Sistema"], id: \.self) { group in
+                    Text(group.uppercased())
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 12).padding(.top, 14).padding(.bottom, 4)
+                    ForEach(SettingsSection.allCases.filter { $0.group == group }, id: \.self) {
+                        sidebarItem($0)
+                    }
+                }
+                Spacer()
+            }
+            .padding(.vertical, 8).frame(minWidth: 168, maxWidth: 190)
+            .background(Color(red: 0.09, green: 0.09, blue: 0.12))
+
+            // Content
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    switch activeSection {
+                    case .vault:      vaultSection
+                    case .projects:   projectsSection
+                    case .crypto:     cryptoSection
+                    case .watermark:  watermarkSection
+                    case .backup:     backupSection
+                    case .nsfw:       nsfwSection
+                    case .export:     exportSection
+                    case .compliance: complianceSection
+                    case .ipAdapter:  ipAdapterSection
+                    case .color:      colorSection
+                    case .editor:     editorSection
+                    case .gpu:        gpuSection
+                    case .license:    licenseSection
+                    case .integrity:  integritySection
+                    case .audit:      auditSection
+                    case .wildcards:  wildcardsSection
+                    }
+                }
+                .padding(24)
+            }
+            .frame(minWidth: 460)
+            .background(Color(red: 0.10, green: 0.10, blue: 0.13))
+        }
+        .frame(minWidth: 680, minHeight: 520)
+        .background(Color(red: 0.09, green: 0.09, blue: 0.12))
+    }
+
+    // MARK: - Sidebar Item
+
+    func sidebarItem(_ section: SettingsSection) -> some View {
+        let isActive = activeSection == section
+        return Button(action: { activeSection = section }) {
+            HStack(spacing: 7) {
+                Image(systemName: section.icon)
+                    .font(.system(size: 11))
+                    .frame(width: 16)
+                    .foregroundColor(isActive ? Color(hex: "#7c6af7") : .secondary)
+                Text(section.rawValue)
+                    .font(.system(size: 11, weight: isActive ? .semibold : .regular))
+                    .foregroundColor(isActive ? .white : .secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(isActive ? Color.white.opacity(0.07) : Color.clear)
+            .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 6)
+    }
+
+    // MARK: - Section: Vault
+
+    var vaultSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Vault del Studio")
+
+            if vault.isConfigured, let root = vault.vaultRoot {
+                infoCard {
+                    paramRow("Ruta", root.path)
+                    paramRow("Estado", "✅ Configurado")
+                    if let url = vault.generacionesURL {
+                        paramRow("Generaciones", url.lastPathComponent)
+                    }
+                }
+                HStack(spacing: 8) {
+                    Button("Abrir en Finder") { NSWorkspace.shared.open(root) }
+                        .buttonStyle(ActionChipStyle())
+                    Button("Re-configurar…") { vault.showFirstRunSheet = true }
+                        .buttonStyle(ActionChipStyle())
+                }
+            } else {
+                Text("Vault no configurado. Reinicia la app para ejecutar el asistente de configuración.")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+                Button("Configurar Vault…") { vault.showFirstRunSheet = true }
+                    .buttonStyle(ActionChipStyle(accent: true))
+            }
+        }
+    }
+
+    // MARK: - Section: Projects
+
+    var projectsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Proyectos del Studio")
+            let pf = ProjectFolderManager.shared
+            if pf.projects.isEmpty {
+                Text("No hay proyectos creados aún. El sistema crea uno por defecto al configurar el vault.")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+            } else {
+                ForEach(pf.projects) { project in
+                    HStack(spacing: 10) {
+                        Circle().fill(Color(hex: project.color)).frame(width: 10, height: 10)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(project.name)
+                                .font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
+                            Text(project.rootURL.path)
+                                .font(.system(size: 9, design: .monospaced)).foregroundColor(.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        if project.isActive {
+                            Text("Activo").font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(Color(hex: "#34d399"))
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(Color(hex: "#34d399").opacity(0.15)).cornerRadius(4)
+                        } else {
+                            Button("Activar") { pf.setActive(project) }
+                                .buttonStyle(ActionChipStyle())
+                        }
+                    }
+                    .padding(10).background(Color.white.opacity(0.04)).cornerRadius(8)
+                }
+            }
+            Button("Nuevo proyecto…") {
+                try? pf.createProject(name: "Nuevo Proyecto \(pf.projects.count + 1)")
+            }
+            .buttonStyle(ActionChipStyle(accent: true))
+        }
+    }
+
+    // MARK: - Section: Cifrado (NEW)
+
+    var cryptoSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Cifrado AES-256-GCM")
+
+            infoCard {
+                HStack {
+                    Image(systemName: cryptoEngine.isEncryptionEnabled ? "lock.fill" : "lock.open.fill")
+                        .foregroundColor(cryptoEngine.isEncryptionEnabled ? Color(hex: "#34d399") : Color(hex: "#ef4444"))
+                    Text(cryptoEngine.isEncryptionEnabled ? "Cifrado activo" : "Cifrado desactivado")
+                        .font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
+                    Spacer()
+                    Toggle("", isOn: $cryptoEngine.isEncryptionEnabled)
+                        .toggleStyle(.switch).scaleEffect(0.8)
+                }
+                Divider().background(Color.white.opacity(0.06))
+                paramRow("Algoritmo", "AES-256-GCM")
+                paramRow("Almacén de clave", "macOS Keychain")
+                paramRow("Scope", "kSecAttrAccessibleWhenUnlockedThisDeviceOnly")
+                if let lastRotation = cryptoEngine.lastKeyRotation {
+                    paramRow("Última rotación", lastRotation.shortDisplay)
+                } else {
+                    paramRow("Última rotación", "Nunca")
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Rotación de Clave").font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
+                Text("Genera una nueva clave AES-256 y re-cifra todos los archivos del vault. El proceso corre en background y puede tardar varios minutos.")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+
+                if let result = keyRotationResult {
+                    Text(result).font(.system(size: 11))
+                        .foregroundColor(result.hasPrefix("✅") ? Color(hex: "#34d399") : Color(hex: "#ef4444"))
+                }
+
+                Button(action: {
+                    isRotatingKey = true
+                    keyRotationResult = nil
+                    Task {
+                        do {
+                            let count = try await cryptoEngine.rotateVaultKey()
+                            keyRotationResult = "✅ Rotación completa — \(count) archivos re-cifrados"
+                        } catch {
+                            keyRotationResult = "❌ Error: \(error.localizedDescription)"
+                        }
+                        isRotatingKey = false
+                    }
+                }) {
+                    HStack(spacing: 6) {
+                        if isRotatingKey { ProgressView().scaleEffect(0.6).progressViewStyle(.circular) }
+                        Text(isRotatingKey ? "Rotando clave…" : "Rotar clave del vault")
+                    }
+                }
+                .buttonStyle(ActionChipStyle(accent: true))
+                .disabled(isRotatingKey)
+            }
+        }
+    }
+
+    // MARK: - Section: Watermark
+
+    var watermarkSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Watermark de Previews")
+            infoCard {
+                HStack(spacing: 8) {
+                    Text("Texto").font(.system(size: 10)).foregroundColor(.secondary).frame(width: 72, alignment: .leading)
+                    TextField("@usuario", text: $watermarkText)
+                        .textFieldStyle(.plain).font(.system(size: 11)).foregroundColor(.white)
+                        .padding(.horizontal, 8).padding(.vertical, 5)
+                        .background(Color.white.opacity(0.06)).cornerRadius(6)
+                    Button("Guardar") {
+                        exportEngine.watermarkConfig.text = watermarkText
+                        UserDefaults.standard.set(watermarkText, forKey: "watermark.text")
+                    }.buttonStyle(ActionChipStyle())
+                }
+                sliderRow("Opacidad", value: $watermarkOpacity, range: 0.1...0.9)
+                HStack(spacing: 6) {
+                    Text("Posición").font(.system(size: 10)).foregroundColor(.secondary).frame(width: 72)
+                    Picker("", selection: $watermarkPosition) {
+                        Text("↙ Inferior izquierda").tag(ExportEngine.WatermarkConfig.Position.bottomLeft)
+                        Text("↘ Inferior derecha").tag(ExportEngine.WatermarkConfig.Position.bottomRight)
+                        Text("↗ Superior derecha").tag(ExportEngine.WatermarkConfig.Position.topRight)
+                        Text("↖ Superior izquierda").tag(ExportEngine.WatermarkConfig.Position.topLeft)
+                        Text("⊙ Centro").tag(ExportEngine.WatermarkConfig.Position.center)
+                    }.pickerStyle(.menu).font(.system(size: 11))
+                }
+            }
+        }
+    }
+
+    // MARK: - Section: Backup
+
+    var backupSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Backup Automático (rclone)")
+            infoCard {
+                HStack(spacing: 8) {
+                    Image(systemName: backupMgr.config.lastBackupOK ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
+                        .foregroundColor(backupMgr.config.lastBackupOK ? Color(hex: "#34d399") : Color(hex: "#f59e0b"))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(backupMgr.config.lastBackupOK ? "Último backup exitoso" : "Sin backup reciente")
+                            .font(.system(size: 11, weight: .medium)).foregroundColor(.white)
+                        if let lastAt = backupMgr.config.lastBackupAt {
+                            Text(lastAt.shortDisplay).font(.system(size: 10)).foregroundColor(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button("Backup ahora") { Task { await backupMgr.runAllBackups() } }
+                        .buttonStyle(ActionChipStyle(accent: true))
+                        .disabled(backupMgr.isRunning)
+                }
+            }
+            if backupMgr.config.destinations.isEmpty {
+                Text("No hay destinos configurados. Añade al menos un destino rclone.")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+            } else {
+                ForEach(backupMgr.config.destinations) { dest in
+                    HStack(spacing: 8) {
+                        Image(systemName: dest.type.icon).font(.system(size: 12)).foregroundColor(Color(hex: "#7c6af7"))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(dest.name).font(.system(size: 11, weight: .medium)).foregroundColor(.white)
+                            Text(dest.rcloneRemote).font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Circle().fill(dest.isEnabled ? Color(hex: "#34d399") : .gray).frame(width: 7, height: 7)
+                    }
+                    .padding(8).background(Color.white.opacity(0.04)).cornerRadius(6)
+                }
+            }
+            Button("Abrir configuración rclone…") { backupMgr.openRcloneConfig() }
+                .buttonStyle(ActionChipStyle())
+        }
+    }
+
+    // MARK: - Section: NSFW
+
+    var nsfwSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Política NSFW")
+            infoCard {
+                paramRow("Detector activo", nsfwDetector.isEnabled ? "Sí" : "No")
+                paramRow("Threshold", String(format: "%.2f", nsfwDetector.threshold))
+                paramRow("Acción", nsfwDetector.quarantineEnabled ? "Cuarentena" : "Log solo")
+            }
+            HStack(spacing: 8) {
+                Toggle("Activar detector", isOn: $nsfwDetector.isEnabled).toggleStyle(.switch)
+                Toggle("Cuarentena automática", isOn: $nsfwDetector.quarantineEnabled).toggleStyle(.switch)
+            }
+            sliderRow("Threshold NSFW", value: $nsfwDetector.threshold, range: 0.5...0.99)
+        }
+    }
+
+    // MARK: - Section: Export
+
+    var exportSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Export y Dos Versiones")
+            Text("Cada imagen aprobada produce: (1) versión limpia sin metadatos y (2) versión preview con watermark. La versión raw del vault nunca sale.")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+            infoCard {
+                paramRow("Kill-Switch EXIF", "Disponible desde App → Vault menu")
+                paramRow("Chunks PNG eliminados", "tEXt, iTXt, zTXt, eXIf, iCCP")
+                paramRow("Proceso", "Re-render pixel a pixel vía Core Graphics")
+            }
+            Button("Ejecutar EXIF Kill-Switch global") {
+                Task { await AppEnvironment.shared.runEXIFKillSwitch() }
+            }
+            .buttonStyle(ActionChipStyle(accent: true))
+        }
+    }
+
+    // MARK: - Section: Compliance (NEW)
+
+    var complianceSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Compliance y GDPR")
+
+            infoCard {
+                paramRow("Publicaciones registradas", "\(compliance.totalPublications)")
+                paramRow("Archivos publicados", "\(compliance.totalFilesPublished)")
+                paramRow("Score de compliance", String(format: "%.0f%%", compliance.complianceScore * 100))
+                paramRow("Watermark rate", String(format: "%.0f%%", compliance.watermarkRate * 100))
+                Divider().background(Color.white.opacity(0.06))
+                HStack {
+                    Text("Plataformas").font(.system(size: 10)).foregroundColor(.secondary)
+                    Spacer()
+                    Text(compliance.platformBreakdown.map { "\($0.key): \($0.value)" }.joined(separator: " · "))
+                        .font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary).lineLimit(1)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("GDPR").font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
+                sliderRow("Retención (días)", value: Binding(
+                    get: { Double(compliance.gdprFlags.retentionDays) },
+                    set: { compliance.gdprFlags.retentionDays = Int($0) }
+                ), range: 7...365)
+                Toggle("Portabilidad de datos", isOn: $compliance.gdprFlags.allowsDataPortability).toggleStyle(.switch)
+                Toggle("Derecho al olvido", isOn: $compliance.gdprFlags.rightToErasure).toggleStyle(.switch)
+                Toggle("Consentimiento requerido", isOn: $compliance.gdprFlags.consentRequired).toggleStyle(.switch)
+            }
+
+            HStack(spacing: 8) {
+                Button("Exportar reporte JSON") {
+                    isExportingCompliance = true
+                    if let url = try? compliance.exportReportAsJSON() {
+                        NSWorkspace.shared.open(url)
+                    }
+                    isExportingCompliance = false
+                }
+                .buttonStyle(ActionChipStyle(accent: true))
+                Button("Purgar registros expirados") { _ = compliance.purgeExpiredRecords() }
+                    .buttonStyle(ActionChipStyle())
+            }
+        }
+    }
+
+    // MARK: - Section: IP-Adapter (NEW)
+
+    var ipAdapterSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("IP-Adapter / FaceID")
+            Text("Configuración por defecto de IP-Adapter para consistencia facial entre generaciones.")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+
+            infoCard {
+                paramRow("Estado A1111", ipAdapter.availableModels.isEmpty ? "Sin detectar" : "\(ipAdapter.availableModels.count) modelos")
+                paramRow("Modelo activo", ipAdapter.config.model.displayName)
+                paramRow("Peso", String(format: "%.2f", ipAdapter.config.weight))
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Modelo por defecto").font(.system(size: 11)).foregroundColor(.secondary)
+                Picker("", selection: $ipAdapter.config.model) {
+                    ForEach(IPAdapterModel.allCases, id: \.self) { m in
+                        Text(m.displayName).tag(m)
+                    }
+                }.pickerStyle(.menu).font(.system(size: 11))
+                sliderRow("Peso por defecto", value: $ipAdapter.config.weight, range: 0.1...1.0)
+                Toggle("Auto-recorte de cara", isOn: $ipAdapter.config.cropFace).toggleStyle(.switch)
+            }
+
+            Button("Verificar instalación A1111") {
+                Task { await ipAdapter.checkInstalled() }
+            }
+            .buttonStyle(ActionChipStyle())
+        }
+    }
+
+    // MARK: - Section: Color (NEW)
+
+    var colorSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Gestión de Color ACEScg")
+            Text("Pipeline de color cinematográfico. Los ajustes se aplican en post-procesamiento, no afectan la generación SD.")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+
+            infoCard {
+                paramRow("LUTs disponibles", "\(colorEngine.availableLUTs.count)")
+                paramRow("LUTs built-in", "\(ACEScgColorEngine.builtInLUTs.count)")
+                paramRow("LUTs de usuario", "\(colorEngine.availableLUTs.filter { !$0.isBuiltIn }.count)")
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("LUTs disponibles").font(.system(size: 11)).foregroundColor(.secondary)
+                ForEach(colorEngine.availableLUTs.prefix(8)) { lut in
+                    HStack {
+                        Image(systemName: lut.isBuiltIn ? "checkmark.circle.fill" : "folder.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(lut.isBuiltIn ? Color(hex: "#34d399") : Color(hex: "#7c6af7"))
+                        Text(lut.name).font(.system(size: 11)).foregroundColor(.white)
+                        Spacer()
+                        Text(lut.description).font(.system(size: 9)).foregroundColor(.secondary).lineLimit(1)
+                    }
+                    .padding(6).background(Color.white.opacity(0.03)).cornerRadius(5)
+                }
+            }
+
+            Button("Abrir carpeta LUTs…") {
+                if let url = VaultManager.shared.vaultMetaURL?.appending(path: "LUTs") {
+                    try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            .buttonStyle(ActionChipStyle())
+        }
+    }
+
+    // MARK: - Section: Editor Externo (NEW)
+
+    var editorSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Editor Externo")
+            Text("Abre assets en aplicaciones externas y re-importa las versiones editadas al vault automáticamente.")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+
+            infoCard {
+                paramRow("Editor preferido", editorBridge.preferredEditor.rawValue)
+                paramRow("Editores detectados", editorBridge.installedEditors.map { $0.rawValue }.joined(separator: ", "))
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Editor preferido").font(.system(size: 11)).foregroundColor(.secondary)
+                Picker("", selection: $editorBridge.preferredEditor) {
+                    ForEach(editorBridge.installedEditors, id: \.self) { editor in
+                        Label(editor.rawValue, systemImage: editor.icon).tag(editor)
+                    }
+                }
+                .pickerStyle(.menu).font(.system(size: 11))
+                .onChange(of: editorBridge.preferredEditor) { _, v in editorBridge.setPreferredEditor(v) }
+            }
+
+            Button("Detectar editores instalados") { editorBridge.detectInstalledEditors() }
+                .buttonStyle(ActionChipStyle())
+        }
+    }
+
+    // MARK: - Section: GPU
+
+    var gpuSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("GPU / Stable Diffusion")
+            infoCard {
+                paramRow("Dispositivo", gpu.deviceName)
+                paramRow("Apple Silicon", gpu.isAppleSilicon ? "Sí (MPS activo)" : "No")
+                let vramMB = Double(gpu.isAppleSilicon ? gpu.ramFree : gpu.vramFree) / 1_048_576.0
+                paramRow("VRAM libre", String(format: "%.0f MB", vramMB))
+                paramRow("SD Base URL", sdBaseURL)
+            }
+            HStack(spacing: 8) {
+                TextField("http://127.0.0.1:7860", text: $sdBaseURL)
+                    .textFieldStyle(.plain).font(.system(size: 11, design: .monospaced)).foregroundColor(.white)
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+                    .background(Color.white.opacity(0.06)).cornerRadius(6)
+                Button("Guardar") { UserDefaults.standard.set(sdBaseURL, forKey: "sd.baseURL") }
+                    .buttonStyle(ActionChipStyle())
+            }
+        }
+    }
+
+    // MARK: - Section: License
+
+    var licenseSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Model Cards y Licencias")
+            Text("Cada checkpoint usado debe tener su model_card registrado en Vault/Licencias/ para publicación con compliance.")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+            HStack(spacing: 8) {
+                Button("Abrir carpeta Licencias") {
+                    if let url = VaultManager.shared.licenciasURL { NSWorkspace.shared.open(url) }
+                }
+                .buttonStyle(ActionChipStyle())
+                Button("Generar plantillas") { LicenseVault.shared.generateAllTemplates() }
+                    .buttonStyle(ActionChipStyle(accent: true))
+            }
+        }
+    }
+
+    // MARK: - Section: Integrity
+
+    var integritySection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Integridad del Vault")
+            let im = IntegrityManager.shared
+            infoCard {
+                paramRow("Assets verificados", "\(im.okCount + im.corruptedCount + im.missingCount)")
+                paramRow("Íntegros", "\(im.okCount)")
+                paramRow("Corruptos", "\(im.corruptedCount)")
+                paramRow("No encontrados", "\(im.missingCount)")
+                if let lastRun = im.lastRunAt { paramRow("Último check", lastRun.shortDisplay) }
+            }
+            HStack(spacing: 8) {
+                Button("Verificar ahora") { Task { await im.runFullVerification() } }
+                    .buttonStyle(ActionChipStyle(accent: true))
+                    .disabled(isVerifying)
+                Button("Verificación programada") { Task { await im.runScheduledCheck() } }
+                    .buttonStyle(ActionChipStyle())
+            }
+        }
+    }
+
+    // MARK: - Section: Audit
+
+    var auditSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Audit Log Cifrado")
+            ZeroKnowledgeLogView().frame(height: 420)
+        }
+    }
+
+    // MARK: - Section: Wildcards
+
+    var wildcardsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("Wildcards")
+            Text("Sintaxis __nombre__ en el prompt. Se resuelven aleatoriamente en cada generación.")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+            let categories = WildcardEngine.shared.categories
+            if categories.isEmpty {
+                Text("No hay wildcards. Créalos en Vault/wildcards/").font(.system(size: 11)).foregroundColor(.secondary)
+            } else {
+                ForEach(categories, id: \.self) { cat in
+                    HStack {
+                        Text("__\(cat)__").font(.system(size: 11, design: .monospaced)).foregroundColor(Color(hex: "#7c6af7"))
+                        Spacer()
+                        Text("\(WildcardEngine.shared.entries(for: cat).count) entradas")
+                            .font(.system(size: 10)).foregroundColor(.secondary)
+                    }
+                    .padding(8).background(Color.white.opacity(0.04)).cornerRadius(5)
+                }
+            }
+            Button("Abrir carpeta Wildcards") {
+                if let url = VaultManager.shared.vaultMetaURL?.appending(path: "wildcards") {
+                    try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            .buttonStyle(ActionChipStyle())
+        }
+    }
+
+    // MARK: - Reusable Helpers
+
+    func sectionTitle(_ text: String) -> some View {
+        Text(text).font(.system(size: 15, weight: .bold)).foregroundColor(.white)
+    }
+
+    func paramRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).font(.system(size: 10)).foregroundColor(.secondary)
+            Spacer()
+            Text(value).font(.system(size: 10, design: .monospaced))
+                .foregroundColor(.white.opacity(0.7)).lineLimit(1)
+        }
+    }
+
+    func sliderRow(_ label: String, value: Binding<Double>, range: ClosedRange<Double>) -> some View {
+        HStack(spacing: 8) {
+            Text(label).font(.system(size: 10)).foregroundColor(.secondary).frame(width: 120, alignment: .leading)
+            Slider(value: value, in: range)
+            Text(String(format: range.upperBound > 10 ? "%.0f" : "%.2f", value.wrappedValue))
+                .font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary).frame(width: 40)
+        }
+    }
+
+    @ViewBuilder
+    func infoCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) { content() }
+            .padding(12).background(Color.white.opacity(0.04)).cornerRadius(8)
+    }
+}
+
+// MARK: - ActionChipStyle
+
+struct ActionChipStyle: ButtonStyle {
+    var accent: Bool = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 11))
+            .foregroundColor(accent ? .white : Color(hex: "#7c6af7"))
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(accent
+                ? Color(hex: "#7c6af7").opacity(configuration.isPressed ? 0.9 : 1.0)
+                : Color(hex: "#7c6af7").opacity(configuration.isPressed ? 0.15 : 0.1))
+            .cornerRadius(6)
+    }
+}
+
+// MARK: - Compat extensions
+
+extension Double {
+    func nonZero(default defaultValue: Double) -> Double { self == 0 ? defaultValue : self }
+}
+
+extension BackupManager {
+    func openRcloneConfig() {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-a", "Terminal", "--args", "rclone config"]
+        try? task.run()
+    }
+}
+
+extension WildcardEngine {
+    var categories: [String] { allKeys }
+    func entries(for category: String) -> [String] { terms(for: category) }
+}
+
+extension Date {
+    var shortDisplay: String {
+        formatted(date: .abbreviated, time: .shortened)
+    }
+}

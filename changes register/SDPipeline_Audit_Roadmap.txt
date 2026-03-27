@@ -1,0 +1,566 @@
+================================================================================
+  SDPIPELINE — ROADMAP DE REMEDIACIÓN PARA 11 AUDITORÍAS DE SEGURIDAD
+  Documento generado para evaluación de Licencia Exclusiva Temporal
+================================================================================
+
+RESUMEN EJECUTIVO
+─────────────────
+Archivos existentes a modificar : 22
+Archivos nuevos a crear          :  9
+Fases de implementación          :  4
+Tiempo estimado total            : 8–11 semanas
+
+Estado actual: el codebase ya tiene una base de seguridad significativa
+(NSFWDetector, PromptSafetyFilter, VaultCryptoEngine, ZeroKnowledgeLog,
+SandboxManager, AppHardeningManager, IntegrityManager, LicenseVault).
+Las brechas son mejoras sobre estructuras existentes, no reescritura total.
+
+
+================================================================================
+  FASE 1 — ELIMINACIÓN DE INVALIDACIONES AUTOMÁTICAS  (semanas 1–3)
+  Prioridad: CRÍTICA — sin esto, las demás fases no importan
+================================================================================
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 07 — Red Team / Adversarial / Offensive Black Hat Authority Audit
+Severidad: AUTO-INVALIDACIÓN
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  Superficies de ejecución arbitraria. El auditor intentará inyectar comandos
+  a través de Process(), git pull libre, pip sin sandbox, y cualquier binario
+  externo invocado sin whitelist. Es la auditoría más agresiva del lote.
+
+ARCHIVOS A MODIFICAR:
+  1. A1111UpdateManager.swift
+     → Reemplazar Process() + git por SecureProcessBroker con whitelist firmada.
+       Ningún git pull puede ejecutarse sin aprobación biométrica del usuario
+       y log atómico al vault.
+
+  2. KohyaTrainingManager.swift
+     → Mismo patrón que A1111UpdateManager. Todos los Process() de training
+       deben pasar por el broker centralizado.
+
+  3. ExternalEditorBridge.swift
+     → Eliminar ejecución directa de editores externos o encapsularla
+       completamente en el broker con whitelist de paths permitidos.
+
+  4. DockerManager.swift
+     → Sandboxear completamente. Si Docker no es funcionalidad core del
+       producto licenciado, evaluar eliminación total del archivo.
+
+ARCHIVOS NUEVOS A CREAR:
+  ★ SecureProcessBroker.swift  [ESTRATÉGICO — cubre auditorías 07 y 09]
+     → Broker único y centralizado para TODOS los Process() de la aplicación.
+       Responsabilidades:
+       - Whitelist de binarios permitidos (firmada y no modificable en runtime)
+       - Validación de paths absolutos (sin traversal)
+       - Log atómico de cada ejecución al VaultManager
+       - Requiere aprobación explícita del usuario para binarios no-core
+       - Timeout forzado en todos los procesos externos
+       - Ningún componente puede instanciar Process() directamente
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 09 — Runtime Exploitability Analysis Authority Audit
+Severidad: AUTO-INVALIDACIÓN
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  Análisis dinámico de todo lo que puede ejecutarse en runtime. Wildcards con
+  interpolación de strings, templates de prompts que alcancen el filesystem,
+  y cualquier superficie que permita ejecución arbitraria indirecta.
+
+ARCHIVOS A MODIFICAR:
+  5. SandboxManager.swift
+     → Fortalecer la allowlist: lista explícita y firmada de binarios
+       permitidos. Denegar por defecto cualquier binario no listado.
+
+  6. WildcardEngine.swift
+     → Sanitizar todas las interpolaciones. Ningún wildcard puede resolver
+       a un path del filesystem ni contener metacaracteres de shell.
+
+  7. PromptAutoCompleteEngine.swift
+     → Validar que las sugerencias de autocomplete no incluyan rutas,
+       comandos ejecutables, ni strings que puedan ser interpretados
+       como instrucciones de sistema.
+
+ARCHIVOS NUEVOS A CREAR:
+  (Compartido con Auditoría 07)
+  ★ SecureProcessBroker.swift — un solo archivo cubre ambas auditorías.
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 03 — Zero Trust Authority Audit
+Severidad: AUTO-INVALIDACIÓN
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  Ninguna conexión de red se confía implícitamente, incluyendo localhost.
+  Las calls a localhost:7860 sin whitelist formal son invalidación directa.
+  Cada request debe tener host + puerto + método verificados + token de sesión.
+
+ARCHIVOS A MODIFICAR:
+  8. SDService.swift
+     → Envolver absolutamente todas las calls a localhost:7860 con
+       NetworkWhitelistManager. Ninguna URLSession directa sin pasar
+       por el stack de zero-trust.
+
+  9. PipelineConnector.swift
+     → Añadir verificación de sesión firmada (ZeroTrustSession) antes
+       de cada request al backend de generación.
+
+  10. SDAPIRateLimiter.swift
+      → El rate limiter debe ser parte del stack de zero-trust, no un
+        componente bypasseable lateralmente.
+
+  11. CloudScheduler.swift
+      → Verificar que todas las calls externas (no solo localhost) usen
+        certificate pinning y no acepten certificados self-signed.
+
+ARCHIVOS NUEVOS A CREAR:
+  ★ NetworkWhitelistManager.swift  [ESTRATÉGICO — núcleo de auditoría 03]
+     → Whitelist formal con: host permitido, puerto, método HTTP, y
+       firma de sesión. Cualquier request fuera de la whitelist es
+       rechazado antes de salir de la aplicación.
+
+  ★ ZeroTrustSession.swift
+     → Token de sesión con TTL + rotación automática por cada conexión
+       al backend de A1111. Invalida sesión ante cualquier anomalía.
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA ZK — Tamper-Evidence del ZeroKnowledgeLog  (transversal)
+Severidad: AUTO-INVALIDACIÓN (afecta auditorías 01, 03, 04, 05)
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  El logging cifrado existe (AES-GCM) pero sin hash chain entre entradas.
+  Un atacante con acceso al archivo puede borrar entradas individuales sin
+  dejar rastro. Esto invalida simultáneamente múltiples auditorías que
+  dependen de la integridad del log como evidencia.
+
+ARCHIVOS A MODIFICAR:
+  12. ZeroKnowledgeLog.swift
+      → Añadir hash chain: cada entrada debe incluir SHA256(entrada_anterior).
+        Sin esta cadena, el log no es tamper-evident.
+
+  13. VaultCryptoEngine.swift
+      → Separar formalmente la clave de cifrado de la clave de autenticación.
+        Dos propósitos distintos requieren dos claves distintas.
+
+  14. Data+Crypto.swift
+      → Añadir rotación de claves con HKDF + TTL formal. La clave actual
+        no rota nunca (loadOrCreateKey sin TTL = fallo de auditoría).
+
+ARCHIVOS NUEVOS A CREAR:
+  ★ TamperEvidenceChain.swift  [ESTRATÉGICO — hace pasar auditorías 01 y ZK]
+     → Hash chain manager independiente. Responsabilidades:
+       - Encadenar cada entrada de log con SHA256(entrada_anterior)
+       - Verificar integridad del log completo en O(n)
+       - Detectar entradas borradas, modificadas o insertadas
+       - Exponer verifyChain() que el SecurityAuditView puede invocar
+
+
+================================================================================
+  FASE 2 — CONTROLES DE SEGURIDAD OPERACIONAL  (semanas 4–6)
+================================================================================
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 05 — Kill Switch Authority Audit
+Severidad: ALTA
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  Un kill switch real que en una sola llamada atómica: termina todos los
+  procesos activos, purga el vault, revoca la licencia localmente, y genera
+  evidencia en el log. No puede ser bypasseable ni parcial.
+
+ARCHIVOS A MODIFICAR:
+  15. AppHardeningManager.swift
+      → Conectar al KillSwitchManager como único punto de entrada al
+        mecanismo de kill. Ningún otro componente activa el kill switch.
+
+  16. VaultManager.swift
+      → Exponer purgeAll() que el KillSwitch pueda llamar atómicamente.
+        La purga debe ser irreversible y sincrónica.
+
+  17. LicenseVault.swift
+      → Añadir revoke() que invalide la licencia local Y notifique al
+        servidor de licencias en la misma transacción atómica.
+
+  18. SDPipelineApp.swift
+      → Registrar el KillSwitchManager en el ciclo de vida de la app,
+        incluyendo en el path de crash/terminate inesperado.
+
+ARCHIVOS NUEVOS A CREAR:
+  ★ KillSwitchManager.swift  [ESTRATÉGICO — núcleo de auditoría 05]
+     → Orquestador atómico. Secuencia no interrumpible:
+       1. Detener todos los Process() activos via SecureProcessBroker
+       2. Cancelar todas las URLSession activas
+       3. Purgar vault via VaultManager.purgeAll()
+       4. Revocar licencia via LicenseVault.revoke()
+       5. Escribir evento final al ZeroKnowledgeLog
+       6. Terminar proceso de la app
+       Ningún paso puede fallar silenciosamente.
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 01 — Fail Stop Authority Audit
+Severidad: ALTA
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  El sistema debe detenerse completamente (no degradarse silenciosamente)
+  ante cualquier fallo crítico de seguridad. Ningún estado intermedio
+  corrupto puede continuar ejecutándose.
+
+ARCHIVOS A MODIFICAR:
+  19. AppHardeningManager.swift
+      → Implementar fail-stop real: ante un fallo crítico, el sistema
+        debe haltar, no reintentar silenciosamente.
+
+  20. AppEnvironment.swift
+      → Definir estados terminales explícitos con transiciones de estado
+        que no permitan salir del estado de fallo sin intervención.
+
+  21. JobQueueManager.swift
+      → Si un job falla con error de seguridad, detener toda la cola.
+        El comportamiento actual de "skip y continuar" es inaceptable.
+
+  22. GenerationProgressEngine.swift
+      → Propagar errores fatales hacia arriba en la cadena de llamadas.
+        No swallow exceptions ni catches silenciosos.
+
+ARCHIVOS NUEVOS A CREAR:
+  ★ FailStopController.swift
+     → Controlador central de estados terminales. Cualquier componente
+       puede llamar FailStopController.halt(reason:) y el sistema se
+       detiene de forma controlada con evidencia en el vault.
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 02 — Non Viable Authority Audit
+Severidad: ALTA
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  El sistema debe detectar cuándo se encuentra en un estado no viable
+  (datos corruptos, vault comprometido, integridad fallida) y negarse
+  a operar. Operar en estado degradado es fallo de auditoría.
+
+ARCHIVOS A MODIFICAR:
+  (Los mismos 4 archivos de Fase 2, ya listados arriba)
+  - IntegrityManager.swift → añadir detección de estado no-viable
+  - CoreDataPersistence.swift → validar integridad del store al inicio
+  - VaultManager.swift → si vault corrupto → non-viable, no operar
+  - AppEnvironment.swift → exponer isViable: Bool consultable por engines
+
+ARCHIVOS NUEVOS A CREAR:
+  ★ NonViableStateGuard.swift
+     → Guard centralizado. Cada engine consulta isViable() antes de
+       operar. Si el sistema está en estado no-viable, todas las
+       operaciones retornan error inmediatamente sin ejecutarse.
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 04 — Zero Tolerance Authority Audit
+Severidad: ALTA
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  Cero bypass posible del NSFWDetector y PromptSafetyFilter. El auditor
+  intentará todas las rutas de evasión: unicode homoglyphs, character
+  splitting, encoding alternativo (base64, rot13, leetspeak), prompts
+  en idiomas no latinos, y combinaciones de los anteriores.
+
+ARCHIVOS A MODIFICAR:
+  (Ya existen, requieren hardening específico)
+  - NSFWDetector.swift → eliminar cualquier path de skip (flags, nil checks)
+  - PromptSafetyFilter.swift → normalización unicode ANTES de filtrar
+  - ContentSessionManager.swift → forzar paso por ambos filtros sin excepción
+  - PrivacyComplianceManager.swift → compliance checks no bypasseables en batch
+  - PublishComplianceLogger.swift → loguear TODA decisión al ZK vault
+
+
+================================================================================
+  FASE 3 — ARQUITECTURA Y CADENA DE SUMINISTRO  (semanas 6–8)
+================================================================================
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 06 — Secure Architecture Review Authority Audit
+Severidad: ALTA
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  Segregación estricta entre capa UI y motores de generación. Ningún
+  componente de UI debe poder invocar directamente un engine de generación
+  sin pasar por un contrato validado. El auditor buscará imports directos
+  de engines desde vistas SwiftUI.
+
+ARCHIVOS A MODIFICAR:
+  - ContentView.swift → UI solo habla con AppEnvironment, nunca con engines
+  - PipelineConnector.swift → único punto de entrada entre UI y motores
+  - AppEnvironment.swift → mediador exclusivo entre capas
+  - ContentView_CenterPanel.swift → auditar imports, refactor si llama engines
+  - RightPanelView.swift → mismo check, ninguna vista importa engines directo
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 08 — Supply Chain Security Authority Audit
+Severidad: ALTA
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  Control total de dependencias externas. A1111 sin version lock forzado
+  es invalidación automática. Cada modelo, LoRA y embedding descargado
+  debe tener SHA256 verificado contra un manifest firmado antes de usarse.
+
+ARCHIVOS A MODIFICAR:
+  - A1111UpdateManager.swift → version lock forzado, ninguna actualización
+    sin hash verificado contra manifest firmado
+  - ModelManager.swift → verificar SHA256 de cada modelo antes de cargar
+  - EmbeddingsManager.swift → mismo control de hash para embeddings
+  - LoRAManager.swift → verificar firma/hash de cada LoRA antes de usar
+  - PrivateModelRegistry.swift → incluir hashes y versiones pinneadas de todo
+
+ARCHIVOS NUEVOS A CREAR:
+  ★ SupplyChainVerifier.swift
+     → Verificador centralizado para todos los assets externos.
+       Responsabilidades:
+       - Verificar SHA256 de modelos, LoRAs, embeddings, extensiones
+       - Comparar contra manifest firmado (no modificable por el usuario)
+       - Rechazar cualquier asset sin firma válida
+       - Loguear cada verificación (pass/fail) al ZeroKnowledgeLog
+
+
+================================================================================
+  FASE 4 — HARDENING AVANZADO  (semanas 9–11)
+================================================================================
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 10 — Formal Verification Authority Audit
+Severidad: MEDIA
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  Pre/post-conditions documentadas en funciones críticas, invariantes de
+  estado declarados explícitamente, y evidencia de que ciertos estados
+  son matemáticamente imposibles. No requiere Coq ni Isabelle — requiere
+  disciplina de contratos formales en el código Swift.
+
+ARCHIVOS A MODIFICAR:
+  - PromptSafetyFilter.swift
+    → Añadir precondición: "input debe estar normalizado unicode"
+      Postcondición: "si score > threshold, resultado ES SIEMPRE .blocked"
+
+  - VaultCryptoEngine.swift
+    → Invariante: "clave nunca persiste en memoria fuera de su scope"
+      Invariante: "flujo de cifrado no tiene estados intermedios inseguros"
+
+  - IntegrityManager.swift
+    → Contratos formales: qué checksum garantiza qué propiedad exacta.
+      Documentar qué es imposible verificar y por qué.
+
+  - NSFWDetector.swift
+    → Postcondición formal: si score >= umbral, el resultado NO PUEDE
+      ser .allowed bajo ninguna condición de runtime.
+
+  - LicenseVault.swift
+    → Invariante crítico: "vault abierto" y "kill switch activo" son
+      estados mutuamente excluyentes — imposible que coexistan.
+
+ARCHIVOS NUEVOS A CREAR:
+  ★ ContractAnnotations.swift
+     → Enums, structs y property wrappers que representan los contratos
+       formales del sistema. Permite que el compilador Swift enforce
+       parcialmente las invariantes en tiempo de compilación.
+
+──────────────────────────────────────────────────────────────────────────────
+AUDITORÍA 11 — Hardware / Side-Channel Security Authority Audit
+Severidad: MEDIA
+──────────────────────────────────────────────────────────────────────────────
+QUÉ BUSCA EL AUDITOR:
+  Comparaciones de tiempo constante en todo el crypto stack. El auditor
+  medirá el tiempo de respuesta de: verificación de licencia, comparación
+  de HMAC, key loading desde Keychain, y seed generation. Una diferencia
+  de microsegundos entre respuestas correctas e incorrectas es un timing
+  oracle explotable.
+
+  NOTA POSITIVA: Apple CryptoKit (que ya usas para AES-GCM) ya implementa
+  tiempo constante internamente. El trabajo es asegurar que no hayas
+  introducido comparaciones inseguras POR ENCIMA de CryptoKit.
+
+ARCHIVOS A MODIFICAR:
+  - VaultCryptoEngine.swift
+    → Reemplazar cualquier == en comparaciones de claves/hashes por
+      constantTimeCompare(). Ningún cortocircuito lógico en crypto.
+
+  - LicenseVault.swift
+    → La verificación de licencia debe ejecutar en tiempo constante.
+      Sin early return cuando el primer byte no coincide.
+
+  - ZeroKnowledgeLog.swift
+    → Auditar el key loading: el acceso a Keychain no debe revelar
+      información por timing diferencial (hit vs miss).
+
+  - Data+Crypto.swift
+    → Añadir extensión Data.constantTimeCompare(_ other: Data) -> Bool
+      como método base reutilizable por todos los módulos.
+
+  - SeedManager.swift
+    → Verificar que el RNG use exclusivamente SecRandomCopyBytes.
+      arc4random() o cualquier PRNG no criptográfico es fallo.
+
+  - IntegrityManager.swift
+    → Verificación de HMAC en tiempo constante. Sin early exit cuando
+      los primeros bytes del hash no coinciden.
+
+
+================================================================================
+  RESUMEN CONSOLIDADO DE ARCHIVOS
+================================================================================
+
+── 22 ARCHIVOS EXISTENTES A MODIFICAR ──────────────────────────────────────
+
+  FASE 1 (Crítico):
+   1.  A1111UpdateManager.swift       — Process()/git → SecureProcessBroker
+   2.  KohyaTrainingManager.swift     — Process() → SecureProcessBroker
+   3.  ExternalEditorBridge.swift     — Eliminar/encapsular ejecución directa
+   4.  DockerManager.swift            — Sandbox completo o eliminar
+   5.  SandboxManager.swift           — Allowlist firmada, denegar por defecto
+   6.  WildcardEngine.swift           — Sanitizar interpolaciones de strings
+   7.  PromptAutoCompleteEngine.swift — Eliminar paths/comandos de sugerencias
+   8.  SDService.swift                — Envolver calls en NetworkWhitelistManager
+   9.  PipelineConnector.swift        — Sesión firmada en cada request
+  10.  SDAPIRateLimiter.swift         — Parte del stack zero-trust
+  11.  CloudScheduler.swift           — Certificate pinning en calls externas
+  12.  ZeroKnowledgeLog.swift         — Añadir hash chain entre entradas
+  13.  VaultCryptoEngine.swift        — Separar claves de cifrado/autenticación
+  14.  Data+Crypto.swift              — Rotación HKDF + TTL + constantTimeCompare
+
+  FASE 2 (Alta):
+  15.  AppHardeningManager.swift      — Fail-stop + conexión a KillSwitchManager
+  16.  VaultManager.swift             — purgeAll() atómico + estado non-viable
+  17.  LicenseVault.swift             — revoke() atómico + tiempo constante
+  18.  SDPipelineApp.swift            — KillSwitch en ciclo de vida de la app
+  19.  AppEnvironment.swift           — Estados terminales + isViable: Bool
+  20.  JobQueueManager.swift          — Detener cola ante error de seguridad
+  21.  GenerationProgressEngine.swift — No swallow exceptions críticas
+  22.  IntegrityManager.swift         — Estado non-viable + HMAC tiempo constante
+
+  (Los siguientes requieren hardening interno sin ser refactors mayores)
+  +   NSFWDetector.swift              — Eliminar paths de skip
+  +   PromptSafetyFilter.swift        — Normalización unicode + contratos
+  +   ContentSessionManager.swift     — Forzar paso por ambos filtros
+  +   PrivacyComplianceManager.swift  — Checks no bypasseables en batch
+  +   PublishComplianceLogger.swift   — Log toda decisión al ZK vault
+  +   CoreDataPersistence.swift       — Validar integridad al inicio
+  +   ContentView.swift               — Solo habla con AppEnvironment
+  +   ContentView_CenterPanel.swift   — Auditar imports directos a engines
+  +   RightPanelView.swift            — Mismo check
+  +   ModelManager.swift              — SHA256 antes de cargar modelos
+  +   EmbeddingsManager.swift         — Hash check en embeddings
+  +   LoRAManager.swift               — Hash/firma en LoRAs
+  +   PrivateModelRegistry.swift      — Hashes y versiones pinneadas
+  +   SeedManager.swift               — Solo SecRandomCopyBytes
+  +   NSFWDetector.swift              — Postcondición formal
+  +   LicenseVault.swift              — Invariante vault/killswitch
+
+── 9 ARCHIVOS NUEVOS A CREAR ────────────────────────────────────────────────
+
+  ★★★ MÁXIMA PRIORIDAD (crear primero — mayor cobertura de auditorías):
+
+  1.  SecureProcessBroker.swift       — Cubre auditorías 07 y 09 simultáneamente
+      Semana: 1-2
+      Auditorías cubiertas: Red Team (07), Runtime Exploitability (09)
+
+  2.  TamperEvidenceChain.swift       — Hace tamper-evident el ZK log
+      Semana: 2
+      Auditorías cubiertas: Fail Stop (01), ZK transversal
+
+  3.  NetworkWhitelistManager.swift   — Zero trust en red
+      Semana: 2-3
+      Auditorías cubiertas: Zero Trust (03)
+
+  4.  ZeroTrustSession.swift          — Tokens de sesión con TTL
+      Semana: 3
+      Auditorías cubiertas: Zero Trust (03)
+
+  ★★ ALTA PRIORIDAD:
+
+  5.  KillSwitchManager.swift         — Kill switch atómico real
+      Semana: 4
+      Auditorías cubiertas: Kill Switch (05)
+
+  6.  FailStopController.swift        — Controlador de estados terminales
+      Semana: 4-5
+      Auditorías cubiertas: Fail Stop (01)
+
+  7.  NonViableStateGuard.swift       — Guard de estado no-viable
+      Semana: 5
+      Auditorías cubiertas: Non Viable (02)
+
+  ★ PRIORIDAD NORMAL:
+
+  8.  SupplyChainVerifier.swift       — Verificador de assets externos
+      Semana: 6-7
+      Auditorías cubiertas: Supply Chain (08)
+
+  9.  ContractAnnotations.swift       — Contratos formales del sistema
+      Semana: 9-10
+      Auditorías cubiertas: Formal Verification (10)
+
+
+================================================================================
+  CRONOGRAMA SUGERIDO
+================================================================================
+
+  Semana 1-2 : SecureProcessBroker.swift + modificar A1111UpdateManager,
+               KohyaTrainingManager, ExternalEditorBridge, DockerManager
+
+  Semana 2   : TamperEvidenceChain.swift + modificar ZeroKnowledgeLog,
+               VaultCryptoEngine, Data+Crypto
+
+  Semana 2-3 : NetworkWhitelistManager.swift + ZeroTrustSession.swift
+               + modificar SDService, PipelineConnector, SDAPIRateLimiter,
+               CloudScheduler, SandboxManager, WildcardEngine,
+               PromptAutoCompleteEngine
+
+  Semana 4   : KillSwitchManager.swift + FailStopController.swift
+               + modificar AppHardeningManager, VaultManager, LicenseVault,
+               SDPipelineApp
+
+  Semana 5   : NonViableStateGuard.swift + modificar AppEnvironment,
+               JobQueueManager, GenerationProgressEngine, IntegrityManager,
+               CoreDataPersistence
+
+  Semana 5-6 : Hardening Zero Tolerance: NSFWDetector, PromptSafetyFilter,
+               ContentSessionManager, PrivacyComplianceManager,
+               PublishComplianceLogger
+
+  Semana 6-7 : SupplyChainVerifier.swift + modificar A1111UpdateManager
+               (version lock), ModelManager, EmbeddingsManager, LoRAManager,
+               PrivateModelRegistry
+
+  Semana 7-8 : Secure Architecture Review: ContentView, PipelineConnector,
+               AppEnvironment (mediador), ContentView_CenterPanel,
+               RightPanelView
+
+  Semana 9-10: ContractAnnotations.swift + añadir contratos formales a
+               PromptSafetyFilter, VaultCryptoEngine, IntegrityManager,
+               NSFWDetector, LicenseVault
+
+  Semana 10-11: Side-Channel hardening: VaultCryptoEngine, LicenseVault,
+                ZeroKnowledgeLog, Data+Crypto (constantTimeCompare),
+                SeedManager, IntegrityManager
+
+
+================================================================================
+  NOTAS FINALES
+================================================================================
+
+1. Los 9 archivos nuevos son los que mayor retorno por esfuerzo ofrecen.
+   SecureProcessBroker.swift solo elimina las dos invalidaciones automáticas
+   más críticas (auditorías 07 y 09) que un auditor atacaría primero.
+
+2. Apple CryptoKit (ya en uso) ya implementa operaciones de tiempo constante
+   internamente. El trabajo de la auditoría 11 es verificar que no se hayan
+   introducido comparaciones inseguras por encima de CryptoKit.
+
+3. El ZeroKnowledgeLog existente es una ventaja real — la mayoría de proyectos
+   no llega a ese nivel. Solo necesita el hash chain para ser tamper-evident.
+
+4. La segregación UI/engine (auditoría 06) es probablemente la que requiere
+   más revisión arquitectural, pero es la de menor riesgo de invalidación
+   automática. Puede hacerse en paralelo con las fases 1 y 2.
+
+5. Recomendación: ejecutar las fases 1 y 2 antes de presentar el producto
+   a cualquier pre-auditoría. Las fases 3 y 4 pueden estar en progreso
+   documentado al momento de la evaluación formal.
+
+================================================================================
+  FIN DEL DOCUMENTO
+================================================================================
